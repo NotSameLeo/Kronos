@@ -31,7 +31,7 @@ const memoryCache = {
 const CACHE_TTL = 30 * 60 * 1000;
 const HLS_REFRESH_TTL = 8 * 1000;
 const HLS_STALE_TTL = 5 * 60 * 1000;
-const ADDON_TYPE = "kronos";
+const ADDON_TYPE = "tv";
 const RELEASE_VERSION = "1.5.7";
 
 function decodeConfig(configKey) {
@@ -185,18 +185,21 @@ function getResolverPlaylistUrl(config, sourceUrl) {
 
 function getStreamFetchUrl(config, sourceUrl) {
     if (!config.p) return sourceUrl;
-    if (isHlsUrl(sourceUrl)) return sourceUrl;
 
-    try {
-        const source = new URL(sourceUrl);
-        const proxy = new URL(config.p);
-        const sameResolverHost = source.hostname === proxy.hostname && source.port === proxy.port;
-        if (sameResolverHost) return sourceUrl;
-    } catch (err) {
-        return sourceUrl;
+    if (isHlsUrl(sourceUrl)) {
+        try {
+            const proxy = new URL(config.p);
+            const cleanPath = proxy.pathname.replace(/\/$/, "");
+            proxy.pathname = `${cleanPath}/proxy/manifest.m3u8`;
+            proxy.search = "";
+            proxy.searchParams.set("url", sourceUrl);
+            return proxy.toString();
+        } catch (err) {
+            return sourceUrl;
+        }
     }
 
-    return getResolverPlaylistUrl(config, sourceUrl);
+    return sourceUrl;
 }
 
 function getStreamCacheMode(config, sourceUrl) {
@@ -231,7 +234,7 @@ function getConfiguredLists(config) {
 }
 
 async function fetchPlaylist(config, sourceUrl) {
-    const playlistUrl = getResolverPlaylistUrl(config, sourceUrl);
+    const playlistUrl = sourceUrl;
     console.log('[FETCH PLAYLIST] Attempting to fetch:', playlistUrl);
     
     try {
