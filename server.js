@@ -186,6 +186,12 @@ function normalizeEpgId(id) {
     return key;
 }
 
+function addEasyProxyPassword(proxy, config) {
+    if (config.pp) {
+        proxy.searchParams.set("api_password", config.pp);
+    }
+}
+
 function getResolverPlaylistUrl(config, sourceUrl) {
     if (!config.p) return sourceUrl;
 
@@ -196,9 +202,7 @@ function getResolverPlaylistUrl(config, sourceUrl) {
     proxy.search = "";
     proxy.searchParams.set("url", sourceUrl);
 
-    if (config.pp && proxy.username) {
-        proxy.password = config.pp;
-    }
+    addEasyProxyPassword(proxy, config);
 
     return proxy.toString();
 }
@@ -214,6 +218,8 @@ function getStreamFetchUrl(config, sourceUrl) {
             proxy.pathname = `${cleanPath}/proxy/manifest.m3u8`;
             proxy.search = "";
             proxy.searchParams.set("url", sourceUrl);
+
+            addEasyProxyPassword(proxy, config);
 
             return proxy.toString();
         } catch (err) {
