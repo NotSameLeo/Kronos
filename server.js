@@ -477,14 +477,12 @@ function getExtraParams(extra) {
 }
 
 function getCatalogSourceName(catalogId) {
-    if (catalogId === "kronos_all") return null;
     if (!String(catalogId || "").startsWith("kronos_list_")) return null;
 
     return Buffer.from(catalogId.replace("kronos_list_", ""), "hex").toString("utf8");
 }
 
 function toCatalogId(name) {
-    if (name === "TUTTI") return "kronos_all";
     return `kronos_list_${Buffer.from(name).toString("hex")}`;
 }
 
@@ -723,10 +721,8 @@ app.get("/:base64Config/manifest.json", async (req, res) => {
 
         console.log("[DEBUG] Public host:", host);
 
-        const catalogs = ["TUTTI", ...getConfiguredLists(config).map(list => list.name)].map(listName => {
-            const catalogChannels = listName === "TUTTI"
-                ? channels
-                : channels.filter(channel => channel.sourceName === listName);
+        const catalogs = getConfiguredLists(config).map(list => list.name).map(listName => {
+            const catalogChannels = channels.filter(channel => channel.sourceName === listName);
 
             console.log(`[DEBUG] Catalog "${listName}" has ${catalogChannels.length} channels`);
 
@@ -1063,6 +1059,11 @@ app.get("/:base64Config/debug", async (req, res) => {
             uniqueGroups: [...new Set(channels.map(c => c.group))],
             uniqueSourceNames: [...new Set(channels.map(c => c.sourceName))],
             configuredLists: getConfiguredLists(config),
+            manifestCatalogs: getConfiguredLists(config).map(list => ({
+                id: toCatalogId(list.name),
+                name: list.name,
+                type: ADDON_TYPE
+            })),
             cacheInfo: {
                 lastUpdate: memoryCache.lastUpdate[configKey],
                 isUpdating: memoryCache.isUpdating[configKey]
