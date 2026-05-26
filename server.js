@@ -38,7 +38,7 @@ const CACHE_TTL = 30 * 60 * 1000;
     - stale cache 15 minuti: se EasyProxy/upstream dà 502 temporanei, Kronos continua a servire l’ultima manifest buona.
     - retry manifest: riduce i loading failed quando EasyProxy risponde 502 una volta sola.
 */
-const HLS_REFRESH_TTL = 10 * 1000;
+const HLS_REFRESH_TTL = 14 * 1000;
 const HLS_STALE_TTL = 15 * 60 * 1000;
 const HLS_REQUEST_TIMEOUT = 20000;
 const HLS_RETRY_COUNT = 3;
