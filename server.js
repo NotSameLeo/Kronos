@@ -3,9 +3,25 @@ const axios = require("axios");
 const xml2js = require("xml2js");
 const path = require("path");
 const crypto = require("crypto");
+const http = require("http");
+const https = require("https");
 
 const app = express();
 const PORT = process.env.PORT || 7000;
+
+const httpAgent = new http.Agent({
+    keepAlive: true,
+    maxSockets: 128,
+    maxFreeSockets: 32,
+    timeout: 60000
+});
+
+const httpsAgent = new https.Agent({
+    keepAlive: true,
+    maxSockets: 128,
+    maxFreeSockets: 32,
+    timeout: 60000
+});
 
 app.set("trust proxy", true);
 
@@ -34,9 +50,10 @@ const CACHE_TTL = 30 * 60 * 1000;
 
 /*
     HLS tuning:
-    - refresh ogni 10 secondi: adatto a target duration intorno a 10/12 sec.
-    - stale cache 15 minuti: se EasyProxy/upstream dà 502 temporanei, Kronos continua a servire l’ultima manifest buona.
-    - retry manifest: riduce i loading failed quando EasyProxy risponde 502 una volta sola.
+    - Kronos ora può fare da proxy HLS completo.
+    - Se Kronos gira dentro ProtonVPN, Stremio riceve sempre URL Kronos pubblici.
+    - Manifest e segmenti vengono scaricati lato server da Kronos, quindi passano dalla rete/VPN del container.
+    - Retry + stale manifest riducono loading failed e blocchi causati da 502 temporanei.
 */
 const HLS_REFRESH_TTL = 14 * 1000;
 const HLS_STALE_TTL = 15 * 60 * 1000;
@@ -350,6 +367,8 @@ async function fetchPlaylist(config, sourceUrl) {
         const response = await axios.get(playlistUrl, {
             timeout: 60000,
             maxRedirects: 5,
+            httpAgent,
+            httpsAgent,
             headers: {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "Accept": "*/*",
@@ -383,13 +402,51 @@ function toAbsoluteUrl(value, baseUrl) {
     }
 }
 
-function rewriteHLSPlaylist(playlist, baseUrl) {
+function signProxyUrl(configKey, url) {
+    return crypto
+        .createHmac("sha256", String(configKey))
+        .update(String(url))
+        .digest("hex")
+        .slice(0, 24);
+}
+
+function verifyProxySignature(configKey, url, signature) {
+    return signProxyUrl(configKey, url) === String(signature || "");
+}
+
+function buildProxiedResourceUrl(host, configKey, channelId, absoluteUrl) {
+    const signature = signProxyUrl(configKey, absoluteUrl);
+    const encodedUrl = encodeURIComponent(absoluteUrl);
+
+    if (isHlsUrl(absoluteUrl)) {
+        return `${host}/${configKey}/hls/${channelId}/proxy.m3u8?u=${encodedUrl}&s=${signature}`;
+    }
+
+    return `${host}/${configKey}/hls/${channelId}/segment.ts?u=${encodedUrl}&s=${signature}`;
+}
+
+function rewriteUriAttributes(line, baseUrl, host, configKey, channelId) {
+    return line.replace(/URI="([^"]+)"/g, (match, uri) => {
+        const absoluteUrl = toAbsoluteUrl(uri, baseUrl);
+        const proxiedUrl = buildProxiedResourceUrl(host, configKey, channelId, absoluteUrl);
+        return `URI="${proxiedUrl}"`;
+    });
+}
+
+function rewriteHLSPlaylist(playlist, baseUrl, host, configKey, channelId) {
     return String(playlist || "")
         .split(/\r?\n/)
         .map(line => {
             const trimmed = line.trim();
-            if (!trimmed || trimmed.startsWith("#")) return line;
-            return toAbsoluteUrl(trimmed, baseUrl);
+
+            if (!trimmed) return line;
+
+            if (trimmed.startsWith("#")) {
+                return rewriteUriAttributes(line, baseUrl, host, configKey, channelId);
+            }
+
+            const absoluteUrl = toAbsoluteUrl(trimmed, baseUrl);
+            return buildProxiedResourceUrl(host, configKey, channelId, absoluteUrl);
         })
         .join("\n");
 }
@@ -441,6 +498,8 @@ async function fetchHLSManifestWithRetry(fetchUrl) {
             const response = await axios.get(fetchUrl, {
                 timeout: HLS_REQUEST_TIMEOUT,
                 maxRedirects: 5,
+                httpAgent,
+                httpsAgent,
                 headers: {
                     "User-Agent": "Kronos/1.5.7",
                     "Accept": "application/x-mpegURL, application/vnd.apple.mpegurl, audio/mpegurl, text/plain, */*",
@@ -480,7 +539,7 @@ async function fetchHLSManifestWithRetry(fetchUrl) {
     throw lastErr;
 }
 
-async function getCachedHLS(cacheKey, sourceUrl, config = {}) {
+async function getCachedHLS(cacheKey, sourceUrl, config = {}, host, configKey, channelId) {
     const cached = memoryCache.hlsData[cacheKey];
     const now = Date.now();
     const fetchUrl = getStreamFetchUrl(config, sourceUrl);
@@ -492,7 +551,7 @@ async function getCachedHLS(cacheKey, sourceUrl, config = {}) {
     try {
         const response = await fetchHLSManifestWithRetry(fetchUrl);
         const finalUrl = response.request?.res?.responseUrl || fetchUrl;
-        const playlist = rewriteHLSPlaylist(response.data, finalUrl);
+        const playlist = rewriteHLSPlaylist(response.data, finalUrl, host, configKey, channelId);
 
         memoryCache.hlsData[cacheKey] = {
             playlist,
@@ -1139,8 +1198,9 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
 
         if (!c) return res.status(404).send("#EXTM3U\n");
 
-        const cacheKey = `${configKey}:${c.id}:${getStreamCacheMode(config, c.url)}`;
-        const playlist = await getCachedHLS(cacheKey, c.url, config);
+        const host = getPublicHost(req);
+        const cacheKey = `${configKey}:${host}:${c.id}:${getStreamCacheMode(config, c.url)}`;
+        const playlist = await getCachedHLS(cacheKey, c.url, config, host, configKey, c.id);
 
         res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
         res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
@@ -1150,6 +1210,145 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
     } catch (err) {
         console.error("[ERROR HLS ROUTE]", err.message);
         res.status(502).send("#EXTM3U\n#EXT-X-ENDLIST\n");
+    }
+});
+
+app.get("/:base64Config/hls/:id/proxy.m3u8", async (req, res) => {
+    try {
+        const configKey = req.params.base64Config;
+        const sourceUrl = String(req.query.u || "");
+        const signature = String(req.query.s || "");
+
+        if (!isHttpUrl(sourceUrl)) {
+            return res.status(400).send("#EXTM3U\n#EXT-X-ENDLIST\n");
+        }
+
+        if (!verifyProxySignature(configKey, sourceUrl, signature)) {
+            return res.status(403).send("#EXTM3U\n#EXT-X-ENDLIST\n");
+        }
+
+        const host = getPublicHost(req);
+        const cacheKey = `nested:${configKey}:${host}:${req.params.id}:${sourceUrl}`;
+        const playlist = await getCachedHLS(cacheKey, sourceUrl, {}, host, configKey, req.params.id);
+
+        res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+        res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+        res.setHeader("Pragma", "no-cache");
+
+        res.send(playlist);
+    } catch (err) {
+        console.error("[ERROR HLS NESTED ROUTE]", err.message);
+        res.status(502).send("#EXTM3U\n#EXT-X-ENDLIST\n");
+    }
+});
+
+async function fetchSegmentStreamWithRetry(url, req) {
+    let lastErr = null;
+
+    for (let attempt = 1; attempt <= 4; attempt++) {
+        try {
+            console.log(`[SEGMENT FETCH] Attempt ${attempt}/4:`, sanitizeUrlForLog(url));
+
+            const headers = {
+                "User-Agent": req.get("user-agent") || "Kronos/1.5.7",
+                "Accept": req.get("accept") || "*/*",
+                "Accept-Encoding": "identity",
+                "Connection": "keep-alive"
+            };
+
+            if (req.get("range")) {
+                headers.Range = req.get("range");
+            }
+
+            return await axios.get(url, {
+                responseType: "stream",
+                timeout: 45000,
+                maxRedirects: 5,
+                httpAgent,
+                httpsAgent,
+                headers,
+                validateStatus(status) {
+                    return (status >= 200 && status < 300) || status === 206;
+                }
+            });
+        } catch (err) {
+            lastErr = err;
+
+            const status = getErrorStatus(err);
+            console.error(
+                `[SEGMENT FETCH ERROR] Attempt ${attempt}/4`,
+                status ? `status=${status}` : "",
+                err.message
+            );
+
+            if (attempt >= 4 || !shouldRetryHLS(err)) {
+                break;
+            }
+
+            await sleep(350 * attempt);
+        }
+    }
+
+    throw lastErr;
+}
+
+app.get("/:base64Config/hls/:id/segment.ts", async (req, res) => {
+    try {
+        const configKey = req.params.base64Config;
+        const sourceUrl = String(req.query.u || "");
+        const signature = String(req.query.s || "");
+
+        if (!isHttpUrl(sourceUrl)) {
+            return res.status(400).send("");
+        }
+
+        if (!verifyProxySignature(configKey, sourceUrl, signature)) {
+            return res.status(403).send("");
+        }
+
+        const response = await fetchSegmentStreamWithRetry(sourceUrl, req);
+
+        res.status(response.status);
+
+        const contentType = response.headers["content-type"] || "video/mp2t";
+        res.setHeader("Content-Type", contentType);
+        res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+        res.setHeader("Pragma", "no-cache");
+
+        if (response.headers["content-length"]) {
+            res.setHeader("Content-Length", response.headers["content-length"]);
+        }
+
+        if (response.headers["content-range"]) {
+            res.setHeader("Content-Range", response.headers["content-range"]);
+        }
+
+        if (response.headers["accept-ranges"]) {
+            res.setHeader("Accept-Ranges", response.headers["accept-ranges"]);
+        }
+
+        response.data.on("error", err => {
+            console.error("[SEGMENT STREAM ERROR]", err.message);
+            if (!res.headersSent) {
+                res.status(502).end();
+            } else {
+                res.destroy(err);
+            }
+        });
+
+        response.data.pipe(res);
+    } catch (err) {
+        const status = getErrorStatus(err);
+
+        console.error(
+            "[ERROR SEGMENT ROUTE]",
+            status ? `status=${status}` : "",
+            err.message
+        );
+
+        if (!res.headersSent) {
+            res.status(502).send("");
+        }
     }
 });
 
@@ -1206,7 +1405,10 @@ app.get("/:base64Config/debug", async (req, res) => {
                 HLS_REQUEST_TIMEOUT,
                 HLS_RETRY_COUNT,
                 HLS_RETRY_BASE_DELAY,
-                EASYPROXY_INTERNAL_URL: process.env.EASYPROXY_INTERNAL_URL || null
+                PROTON_PROXY_MODE: "kronos_hls_proxy",
+                EASYPROXY_INTERNAL_URL: process.env.EASYPROXY_INTERNAL_URL || null,
+                httpKeepAlive: true,
+                maxSockets: 128
             },
             cacheInfo: {
                 lastUpdate: memoryCache.lastUpdate[configKey],
@@ -1233,6 +1435,7 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`HLS refresh TTL: ${HLS_REFRESH_TTL}ms`);
     console.log(`HLS stale TTL: ${HLS_STALE_TTL}ms`);
     console.log(`HLS retry count: ${HLS_RETRY_COUNT}`);
+    console.log("Proxy mode: Kronos HLS proxy. If container network is ProtonVPN, TV/Firestick receives Proton-routed streams.");
     console.log(`Node version: ${process.version}`);
     console.log(`Environment: ${process.env.NODE_ENV || "development"}`);
     console.log(`Memory: ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`);
