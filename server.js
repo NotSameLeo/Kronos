@@ -33,16 +33,31 @@ const memoryCache = {
 const CACHE_TTL = 30 * 60 * 1000;
 
 /*
-    HLS tuning:
-    - refresh ogni 10 secondi: adatto a target duration intorno a 10/12 sec.
-    - stale cache 15 minuti: se EasyProxy/upstream dà 502 temporanei, Kronos continua a servire l’ultima manifest buona.
-    - retry manifest: riduce i loading failed quando EasyProxy risponde 502 una volta sola.
+    HLS tuning spinto ma ancora sicuro:
+    - refresh ogni 12 secondi: meno richieste continue a EasyProxy.
+    - stale cache 30 minuti: se EasyProxy/upstream dà 502 temporanei, Kronos continua a servire l’ultima manifest buona.
+    - 5 retry: riduce i loading failed iniziali.
+    - timeout 25 secondi: evita errori troppo rapidi su upstream lenti.
 */
-const HLS_REFRESH_TTL = 10 * 1000;
-const HLS_STALE_TTL = 15 * 60 * 1000;
-const HLS_REQUEST_TIMEOUT = 20000;
-const HLS_RETRY_COUNT = 3;
-const HLS_RETRY_BASE_DELAY = 450;
+const HLS_REFRESH_TTL = 12 * 1000;
+const HLS_STALE_TTL = 30 * 60 * 1000;
+const HLS_REQUEST_TIMEOUT = 25000;
+const HLS_RETRY_COUNT = 5;
+const HLS_RETRY_BASE_DELAY = 500;
+
+/*
+    Kronos usa EasyProxy internamente via Docker.
+    Così evita il giro:
+    Kronos -> Cloudflare -> EasyProxy
+
+    e usa invece:
+    Kronos -> easyproxy-ep:7860
+
+    Se vuoi sovrascriverlo da docker-compose:
+    environment:
+      - EASYPROXY_INTERNAL_URL=http://easyproxy-ep:7860
+*/
+const EASYPROXY_INTERNAL_DEFAULT_URL = "http://easyproxy-ep:7860";
 
 const ADDON_TYPE = "tv";
 const RELEASE_VERSION = "1.5.7";
@@ -255,17 +270,11 @@ function addEasyProxyPassword(proxy, config) {
 }
 
 function getProxyBaseUrl(config) {
-    /*
-        Normalmente usa config.p, cioè l’URL EasyProxy configurato in Kronos.
+    if (!config.p) return null;
 
-        Opzionale:
-        se un giorno vuoi evitare il giro Cloudflare tra container, puoi aggiungere nel docker-compose:
-        environment:
-          - EASYPROXY_INTERNAL_URL=http://easyproxy-ep:7860
-
-        In quel caso Kronos userà l’URL interno solo server-side.
-    */
-    return process.env.EASYPROXY_INTERNAL_URL || config.p;
+    return process.env.EASYPROXY_INTERNAL_URL ||
+        EASYPROXY_INTERNAL_DEFAULT_URL ||
+        config.p;
 }
 
 function getResolverPlaylistUrl(config, sourceUrl) {
@@ -739,7 +748,7 @@ async function fetchAndProcessChannels(configKey, config, options = {}) {
         const bucketGroup = selectedGroups[0] || "Kronos";
 
         const parsedChannelGroups = await Promise.all(configuredLists.map(async list => {
-            console.log("[DEBUG FETCH] Fetching playlist:", list.url);
+            console.log("[DEBUG FETCH] Fetching playlist:", sanitizeUrlForLog(list.url));
 
             const playlistData = await fetchPlaylist(config, list.url);
             const parsed = parseM3UChannels(playlistData, list);
@@ -852,11 +861,6 @@ app.get("/:base64Config/manifest.json", async (req, res) => {
 
         console.log("[DEBUG] Public host:", host);
 
-        /*
-            Niente catalogo TUTTI:
-            qui vengono creati solo i cataloghi reali delle liste configurate.
-            Questo evita il doppione e riduce il carico della libreria Stremio.
-        */
         const catalogs = getConfiguredLists(config).map(list => list.name).map(listName => {
             const catalogChannels = channels.filter(channel => channel.sourceName === listName);
 
@@ -1206,7 +1210,7 @@ app.get("/:base64Config/debug", async (req, res) => {
                 HLS_REQUEST_TIMEOUT,
                 HLS_RETRY_COUNT,
                 HLS_RETRY_BASE_DELAY,
-                EASYPROXY_INTERNAL_URL: process.env.EASYPROXY_INTERNAL_URL || null
+                EASYPROXY_INTERNAL_URL: process.env.EASYPROXY_INTERNAL_URL || EASYPROXY_INTERNAL_DEFAULT_URL
             },
             cacheInfo: {
                 lastUpdate: memoryCache.lastUpdate[configKey],
@@ -1230,8 +1234,10 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`${"=".repeat(60)}`);
     console.log(`Server URL: http://0.0.0.0:${PORT}`);
     console.log(`Addon type: ${ADDON_TYPE}`);
+    console.log(`EasyProxy internal URL: ${process.env.EASYPROXY_INTERNAL_URL || EASYPROXY_INTERNAL_DEFAULT_URL}`);
     console.log(`HLS refresh TTL: ${HLS_REFRESH_TTL}ms`);
     console.log(`HLS stale TTL: ${HLS_STALE_TTL}ms`);
+    console.log(`HLS request timeout: ${HLS_REQUEST_TIMEOUT}ms`);
     console.log(`HLS retry count: ${HLS_RETRY_COUNT}`);
     console.log(`Node version: ${process.version}`);
     console.log(`Environment: ${process.env.NODE_ENV || "development"}`);
