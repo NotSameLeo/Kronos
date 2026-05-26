@@ -31,11 +31,73 @@ const memoryCache = {
 };
 
 const CACHE_TTL = 30 * 60 * 1000;
-const HLS_REFRESH_TTL = 8 * 1000;
-const HLS_STALE_TTL = 5 * 60 * 1000;
+
+/*
+    HLS tuning:
+    - refresh ogni 10 secondi: adatto a target duration intorno a 10/12 sec.
+    - stale cache 15 minuti: se EasyProxy/upstream dà 502 temporanei, Kronos continua a servire l’ultima manifest buona.
+    - retry manifest: riduce i loading failed quando EasyProxy risponde 502 una volta sola.
+*/
+const HLS_REFRESH_TTL = 10 * 1000;
+const HLS_STALE_TTL = 15 * 60 * 1000;
+const HLS_REQUEST_TIMEOUT = 20000;
+const HLS_RETRY_COUNT = 3;
+const HLS_RETRY_BASE_DELAY = 450;
 
 const ADDON_TYPE = "tv";
 const RELEASE_VERSION = "1.5.7";
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function isValidHLSManifest(data) {
+    const text = String(data || "").trim();
+    return text.startsWith("#EXTM3U") && (
+        text.includes("#EXTINF") ||
+        text.includes("#EXT-X-STREAM-INF") ||
+        text.includes("#EXT-X-TARGETDURATION")
+    );
+}
+
+function getErrorStatus(err) {
+    return err?.response?.status || null;
+}
+
+function shouldRetryHLS(err) {
+    const status = getErrorStatus(err);
+
+    if (!status) return true;
+
+    return [
+        408,
+        425,
+        429,
+        500,
+        502,
+        503,
+        504
+    ].includes(status);
+}
+
+function sanitizeUrlForLog(value) {
+    try {
+        const url = new URL(value);
+        if (url.searchParams.has("api_password")) {
+            url.searchParams.set("api_password", "***");
+        }
+        return url.toString();
+    } catch (err) {
+        return String(value || "").replace(/api_password=[^&]+/g, "api_password=***");
+    }
+}
+
+function safeConfigForLog(config) {
+    return {
+        ...config,
+        pp: config?.pp ? "***" : config?.pp
+    };
+}
 
 function decodeConfig(configKey) {
     try {
@@ -192,10 +254,24 @@ function addEasyProxyPassword(proxy, config) {
     }
 }
 
+function getProxyBaseUrl(config) {
+    /*
+        Normalmente usa config.p, cioè l’URL EasyProxy configurato in Kronos.
+
+        Opzionale:
+        se un giorno vuoi evitare il giro Cloudflare tra container, puoi aggiungere nel docker-compose:
+        environment:
+          - EASYPROXY_INTERNAL_URL=http://easyproxy-ep:7860
+
+        In quel caso Kronos userà l’URL interno solo server-side.
+    */
+    return process.env.EASYPROXY_INTERNAL_URL || config.p;
+}
+
 function getResolverPlaylistUrl(config, sourceUrl) {
     if (!config.p) return sourceUrl;
 
-    const proxy = new URL(config.p);
+    const proxy = new URL(getProxyBaseUrl(config));
     const cleanPath = proxy.pathname.replace(/\/$/, "");
 
     proxy.pathname = `${cleanPath}/playlist`;
@@ -212,7 +288,7 @@ function getStreamFetchUrl(config, sourceUrl) {
 
     if (isHlsUrl(sourceUrl)) {
         try {
-            const proxy = new URL(config.p);
+            const proxy = new URL(getProxyBaseUrl(config));
             const cleanPath = proxy.pathname.replace(/\/$/, "");
 
             proxy.pathname = `${cleanPath}/proxy/manifest.m3u8`;
@@ -237,7 +313,7 @@ function getStreamCacheMode(config, sourceUrl) {
 
     try {
         const source = new URL(sourceUrl);
-        const proxy = new URL(config.p);
+        const proxy = new URL(getProxyBaseUrl(config));
 
         if (source.hostname === proxy.hostname && source.port === proxy.port) {
             return "resolved";
@@ -268,7 +344,7 @@ function getConfiguredLists(config) {
 async function fetchPlaylist(config, sourceUrl) {
     const playlistUrl = sourceUrl;
 
-    console.log("[FETCH PLAYLIST] Attempting to fetch:", playlistUrl);
+    console.log("[FETCH PLAYLIST] Attempting to fetch:", sanitizeUrlForLog(playlistUrl));
 
     try {
         const response = await axios.get(playlistUrl, {
@@ -285,10 +361,10 @@ async function fetchPlaylist(config, sourceUrl) {
             }
         });
 
-        console.log("[FETCH PLAYLIST] Success:", playlistUrl, "Size:", String(response.data || "").length);
+        console.log("[FETCH PLAYLIST] Success:", sanitizeUrlForLog(playlistUrl), "Size:", String(response.data || "").length);
         return response.data;
     } catch (err) {
-        console.error("[FETCH PLAYLIST ERROR]", playlistUrl, err.message);
+        console.error("[FETCH PLAYLIST ERROR]", sanitizeUrlForLog(playlistUrl), err.message);
 
         if (err.response) {
             console.error("[FETCH PLAYLIST ERROR] Status:", err.response.status);
@@ -355,6 +431,55 @@ async function getLogoDataUri(logoUrl) {
     }
 }
 
+async function fetchHLSManifestWithRetry(fetchUrl) {
+    let lastErr = null;
+
+    for (let attempt = 1; attempt <= HLS_RETRY_COUNT; attempt++) {
+        try {
+            console.log(`[HLS FETCH] Attempt ${attempt}/${HLS_RETRY_COUNT}:`, sanitizeUrlForLog(fetchUrl));
+
+            const response = await axios.get(fetchUrl, {
+                timeout: HLS_REQUEST_TIMEOUT,
+                maxRedirects: 5,
+                headers: {
+                    "User-Agent": "Kronos/1.5.7",
+                    "Accept": "application/x-mpegURL, application/vnd.apple.mpegurl, audio/mpegurl, text/plain, */*",
+                    "Accept-Encoding": "gzip, deflate",
+                    "Connection": "keep-alive"
+                },
+                validateStatus(status) {
+                    return status >= 200 && status < 300;
+                }
+            });
+
+            if (!isValidHLSManifest(response.data)) {
+                const invalidErr = new Error("Invalid HLS manifest returned by upstream/proxy");
+                invalidErr.response = response;
+                throw invalidErr;
+            }
+
+            return response;
+        } catch (err) {
+            lastErr = err;
+
+            const status = getErrorStatus(err);
+            console.error(
+                `[HLS FETCH ERROR] Attempt ${attempt}/${HLS_RETRY_COUNT}`,
+                status ? `status=${status}` : "",
+                err.message
+            );
+
+            if (attempt >= HLS_RETRY_COUNT || !shouldRetryHLS(err)) {
+                break;
+            }
+
+            await sleep(HLS_RETRY_BASE_DELAY * attempt);
+        }
+    }
+
+    throw lastErr;
+}
+
 async function getCachedHLS(cacheKey, sourceUrl, config = {}) {
     const cached = memoryCache.hlsData[cacheKey];
     const now = Date.now();
@@ -365,27 +490,27 @@ async function getCachedHLS(cacheKey, sourceUrl, config = {}) {
     }
 
     try {
-        console.log("[HLS FETCH] Fetching:", fetchUrl);
-
-        const response = await axios.get(fetchUrl, {
-            timeout: 15000,
-            headers: {
-                "User-Agent": "Kronos/1.5.7",
-                "Accept": "application/x-mpegURL, audio/mpegurl, text/plain, */*"
-            }
-        });
-
+        const response = await fetchHLSManifestWithRetry(fetchUrl);
         const finalUrl = response.request?.res?.responseUrl || fetchUrl;
         const playlist = rewriteHLSPlaylist(response.data, finalUrl);
 
         memoryCache.hlsData[cacheKey] = {
             playlist,
-            updatedAt: now
+            updatedAt: now,
+            lastGoodAt: now,
+            sourceUrl,
+            fetchUrl
         };
 
         return playlist;
     } catch (err) {
-        console.error("[HLS FETCH ERROR]", err.message);
+        const status = getErrorStatus(err);
+
+        console.error(
+            "[HLS FETCH FINAL ERROR]",
+            status ? `status=${status}` : "",
+            err.message
+        );
 
         if (cached && now - cached.updatedAt < HLS_STALE_TTL) {
             console.log("[HLS FETCH] Returning stale cached playlist");
@@ -710,7 +835,7 @@ app.get("/:base64Config/manifest.json", async (req, res) => {
         const configKey = req.params.base64Config;
         const config = decodeConfig(configKey);
 
-        console.log("[DEBUG] Config decoded:", JSON.stringify(config, null, 2));
+        console.log("[DEBUG] Config decoded:", JSON.stringify(safeConfigForLog(config), null, 2));
 
         const channels = await getChannelsFromCache(configKey, config);
 
@@ -727,6 +852,11 @@ app.get("/:base64Config/manifest.json", async (req, res) => {
 
         console.log("[DEBUG] Public host:", host);
 
+        /*
+            Niente catalogo TUTTI:
+            qui vengono creati solo i cataloghi reali delle liste configurate.
+            Questo evita il doppione e riduce il carico della libreria Stremio.
+        */
         const catalogs = getConfiguredLists(config).map(list => list.name).map(listName => {
             const catalogChannels = channels.filter(channel => channel.sourceName === listName);
 
@@ -1058,7 +1188,7 @@ app.get("/:base64Config/debug", async (req, res) => {
         const channels = await getChannelsFromCache(configKey, config);
 
         const debugInfo = {
-            config,
+            config: safeConfigForLog(config),
             addonType: ADDON_TYPE,
             totalChannels: channels.length,
             sampleChannels: channels.slice(0, 3),
@@ -1070,9 +1200,18 @@ app.get("/:base64Config/debug", async (req, res) => {
                 name: list.name,
                 type: ADDON_TYPE
             })),
+            hlsSettings: {
+                HLS_REFRESH_TTL,
+                HLS_STALE_TTL,
+                HLS_REQUEST_TIMEOUT,
+                HLS_RETRY_COUNT,
+                HLS_RETRY_BASE_DELAY,
+                EASYPROXY_INTERNAL_URL: process.env.EASYPROXY_INTERNAL_URL || null
+            },
             cacheInfo: {
                 lastUpdate: memoryCache.lastUpdate[configKey],
-                isUpdating: memoryCache.isUpdating[configKey]
+                isUpdating: memoryCache.isUpdating[configKey],
+                hlsCacheKeys: Object.keys(memoryCache.hlsData).length
             }
         };
 
@@ -1091,6 +1230,9 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`${"=".repeat(60)}`);
     console.log(`Server URL: http://0.0.0.0:${PORT}`);
     console.log(`Addon type: ${ADDON_TYPE}`);
+    console.log(`HLS refresh TTL: ${HLS_REFRESH_TTL}ms`);
+    console.log(`HLS stale TTL: ${HLS_STALE_TTL}ms`);
+    console.log(`HLS retry count: ${HLS_RETRY_COUNT}`);
     console.log(`Node version: ${process.version}`);
     console.log(`Environment: ${process.env.NODE_ENV || "development"}`);
     console.log(`Memory: ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`);
