@@ -26,23 +26,49 @@ const memoryCache = {
     channelIndex: {},
     epgData: {},
     hlsData: {},
+    hlsInflight: {},
     logoData: {},
     lastUpdate: {},
-    isUpdating: {}
+    isUpdating: {},
+    stats: {
+        startedAt: new Date().toISOString(),
+        hls: {
+            totalFetches: 0,
+            okFetches: 0,
+            failedFetches: 0,
+            cacheHits: 0,
+            staleHits: 0,
+            coalescedFetches: 0,
+            backgroundRefreshes: 0
+        },
+        seg: {
+            total: 0,
+            ok: 0,
+            error: 0,
+            aborted: 0,
+            active: 0,
+            bytes: 0
+        }
+    }
 };
 
 const CACHE_TTL = 30 * 60 * 1000;
 
 // HLS self-relay tuning
-const HLS_REFRESH_TTL = 4 * 1000;
-const HLS_STALE_TTL = 60 * 1000;
-const HLS_REQUEST_TIMEOUT = 15000;
-const HLS_RETRY_COUNT = 3;
-const HLS_RETRY_BASE_DELAY = 400;
-const SEG_REQUEST_TIMEOUT = 30000;
+// Live playlist cache must stay short: tokenized IPTV streams can expire quickly.
+const HLS_REFRESH_TTL = Number(process.env.HLS_REFRESH_TTL || 2000);
+const HLS_MASTER_REFRESH_TTL = Number(process.env.HLS_MASTER_REFRESH_TTL || 15000);
+const HLS_STALE_TTL = Number(process.env.HLS_STALE_TTL || 15000);
+const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 15000);
+const HLS_RETRY_COUNT = Number(process.env.HLS_RETRY_COUNT || 3);
+const HLS_RETRY_BASE_DELAY = Number(process.env.HLS_RETRY_BASE_DELAY || 400);
+const SEG_REQUEST_TIMEOUT = Number(process.env.SEG_REQUEST_TIMEOUT || 30000);
+
+// Segment logs: 1 = log every successful segment, 5 = one every 5, 0 = only errors.
+const SEG_LOG_EVERY = Number(process.env.SEG_LOG_EVERY || 1);
 
 const ADDON_TYPE = "tv";
-const RELEASE_VERSION = "1.6.0";
+const RELEASE_VERSION = "1.6.1";
 
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
@@ -69,13 +95,56 @@ function safeConfigForLog(config) {
 function sanitizeUrlForLog(value) {
     try {
         const url = new URL(value);
-        ["api_password", "password", "u"].forEach(k => {
+        ["api_password", "password", "pass", "pwd", "u"].forEach(k => {
             if (url.searchParams.has(k)) url.searchParams.set(k, "***");
         });
+
+        // Mask common Xtream-style credentials in paths: /live/user/pass/id.m3u8
+        url.pathname = url.pathname.replace(/\/(live|movie|series)\/([^/]+)\/([^/]+)/i, "/$1/***/***");
         return url.toString();
     } catch (err) {
-        return String(value || "").replace(/(?:api_password|password)=[^&]+/g, "$&=***");
+        return String(value || "")
+            .replace(/((?:api_password|password|pass|pwd)=)[^&]+/gi, "$1***")
+            .replace(/\/(live|movie|series)\/([^/]+)\/([^/]+)/i, "/$1/***/***");
     }
+}
+
+function formatBytes(bytes) {
+    const value = Number(bytes || 0);
+    if (value < 1024) return `${value}B`;
+    if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)}KB`;
+    if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(2)}MB`;
+    return `${(value / 1024 / 1024 / 1024).toFixed(2)}GB`;
+}
+
+function analyzeHLSPlaylist(data) {
+    const text = String(data || "");
+    const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+    const segmentCount = lines.filter(line => !line.startsWith("#")).length;
+    const mediaSequenceLine = lines.find(line => line.startsWith("#EXT-X-MEDIA-SEQUENCE:"));
+    const targetDurationLine = lines.find(line => line.startsWith("#EXT-X-TARGETDURATION:"));
+
+    return {
+        isMaster: lines.some(line => line.startsWith("#EXT-X-STREAM-INF")),
+        isLive: !lines.some(line => line.startsWith("#EXT-X-ENDLIST")),
+        segmentCount,
+        mediaSequence: mediaSequenceLine ? Number(mediaSequenceLine.split(":")[1]) : null,
+        targetDuration: targetDurationLine ? Number(targetDurationLine.split(":")[1]) : null,
+        bytes: Buffer.byteLength(text)
+    };
+}
+
+function getHLSRefreshTTL(info) {
+    if (info?.isMaster) return HLS_MASTER_REFRESH_TTL;
+    if (info?.isLive && info?.targetDuration) {
+        return Math.max(1000, Math.min(HLS_REFRESH_TTL, Math.floor(info.targetDuration * 500)));
+    }
+    return HLS_REFRESH_TTL;
+}
+
+function shouldLogSegment(segmentNumber, ok = true) {
+    if (!ok) return true;
+    return SEG_LOG_EVERY > 0 && segmentNumber % SEG_LOG_EVERY === 0;
 }
 
 function isValidHLSManifest(data) {
@@ -116,7 +185,9 @@ async function fetchHLSManifest(sourceUrl) {
     let lastErr = null;
 
     for (let attempt = 1; attempt <= HLS_RETRY_COUNT; attempt++) {
+        const started = Date.now();
         try {
+            memoryCache.stats.hls.totalFetches += 1;
             console.log(`[HLS FETCH] Attempt ${attempt}/${HLS_RETRY_COUNT}:`, sanitizeUrlForLog(sourceUrl));
 
             const response = await axios.get(sourceUrl, {
@@ -138,9 +209,19 @@ async function fetchHLSManifest(sourceUrl) {
                 throw invalidErr;
             }
 
+            const info = analyzeHLSPlaylist(response.data);
+            memoryCache.stats.hls.okFetches += 1;
+            console.log(
+                `[HLS OK] ${info.isMaster ? "master" : "media"} live=${info.isLive} segs=${info.segmentCount}` +
+                `${info.mediaSequence !== null ? ` seq=${info.mediaSequence}` : ""}` +
+                `${info.targetDuration !== null ? ` target=${info.targetDuration}s` : ""}` +
+                ` size=${formatBytes(info.bytes)} time=${Date.now() - started}ms`
+            );
+
             return response;
         } catch (err) {
             lastErr = err;
+            memoryCache.stats.hls.failedFetches += 1;
             const status = getErrorStatus(err);
             console.error(`[HLS FETCH ERROR] Attempt ${attempt}/${HLS_RETRY_COUNT}`, status ? `status=${status}` : "", err.message);
             if (attempt >= HLS_RETRY_COUNT || !shouldRetryHLS(err)) break;
@@ -151,21 +232,47 @@ async function fetchHLSManifest(sourceUrl) {
     throw lastErr;
 }
 
-async function refreshHLSInBackground(cacheKey, sourceUrl) {
-    const cached = memoryCache.hlsData[cacheKey];
-    if (cached?.refreshing) return;
+async function fetchAndStoreHLSRaw(cacheKey, sourceUrl, reason = "request") {
+    const inflight = memoryCache.hlsInflight[cacheKey];
+    if (inflight) {
+        memoryCache.stats.hls.coalescedFetches += 1;
+        console.log(`[HLS WAIT] Reusing in-flight fetch reason=${reason} key=${cacheKey}`);
+        const result = await inflight;
+        return { ...result, cacheStatus: "coalesced" };
+    }
 
-    memoryCache.hlsData[cacheKey] = { ...(cached || {}), refreshing: true };
-
-    try {
+    const promise = (async () => {
         const response = await fetchHLSManifest(sourceUrl);
         const finalUrl = response.request?.res?.responseUrl || sourceUrl;
-        memoryCache.hlsData[cacheKey] = {
+        const info = analyzeHLSPlaylist(response.data);
+        const result = {
             playlist: response.data,
             baseUrl: finalUrl,
             updatedAt: Date.now(),
+            info,
             refreshing: false
         };
+        memoryCache.hlsData[cacheKey] = result;
+        return { ...result, cacheStatus: "fetched" };
+    })();
+
+    memoryCache.hlsInflight[cacheKey] = promise;
+    try {
+        return await promise;
+    } finally {
+        delete memoryCache.hlsInflight[cacheKey];
+    }
+}
+
+async function refreshHLSInBackground(cacheKey, sourceUrl) {
+    const cached = memoryCache.hlsData[cacheKey];
+    if (cached?.refreshing || memoryCache.hlsInflight[cacheKey]) return;
+
+    memoryCache.stats.hls.backgroundRefreshes += 1;
+    memoryCache.hlsData[cacheKey] = { ...(cached || {}), refreshing: true };
+
+    try {
+        await fetchAndStoreHLSRaw(cacheKey, sourceUrl, "background");
     } catch (err) {
         console.error("[HLS BACKGROUND REFRESH ERROR]", err.message);
         if (memoryCache.hlsData[cacheKey]) {
@@ -180,29 +287,30 @@ async function getCachedHLSRaw(sourceUrl) {
     const now = Date.now();
 
     if (cached?.playlist) {
-        if (now - cached.updatedAt > HLS_REFRESH_TTL && !cached.refreshing) {
-            refreshHLSInBackground(cacheKey, sourceUrl);
+        const age = now - cached.updatedAt;
+        const refreshTtl = getHLSRefreshTTL(cached.info || analyzeHLSPlaylist(cached.playlist));
+
+        if (age <= refreshTtl) {
+            memoryCache.stats.hls.cacheHits += 1;
+            return { playlist: cached.playlist, baseUrl: cached.baseUrl, info: cached.info, cacheStatus: "hit", age };
         }
-        return { playlist: cached.playlist, baseUrl: cached.baseUrl };
+
+        if (age <= HLS_STALE_TTL) {
+            memoryCache.stats.hls.staleHits += 1;
+            refreshHLSInBackground(cacheKey, sourceUrl);
+            return { playlist: cached.playlist, baseUrl: cached.baseUrl, info: cached.info, cacheStatus: "stale-refresh", age };
+        }
+
+        try {
+            return await fetchAndStoreHLSRaw(cacheKey, sourceUrl, "expired-cache");
+        } catch (err) {
+            memoryCache.stats.hls.staleHits += 1;
+            console.error("[HLS] Upstream failed; returning last cached playlist", err.message);
+            return { playlist: cached.playlist, baseUrl: cached.baseUrl, info: cached.info, cacheStatus: "stale-fallback", age };
+        }
     }
 
-    try {
-        const response = await fetchHLSManifest(sourceUrl);
-        const finalUrl = response.request?.res?.responseUrl || sourceUrl;
-        memoryCache.hlsData[cacheKey] = {
-            playlist: response.data,
-            baseUrl: finalUrl,
-            updatedAt: now,
-            refreshing: false
-        };
-        return { playlist: response.data, baseUrl: finalUrl };
-    } catch (err) {
-        if (cached?.playlist && now - cached.updatedAt < HLS_STALE_TTL) {
-            console.log("[HLS] Returning stale cached playlist");
-            return { playlist: cached.playlist, baseUrl: cached.baseUrl };
-        }
-        throw err;
-    }
+    return fetchAndStoreHLSRaw(cacheKey, sourceUrl, "miss");
 }
 
 function toAbsoluteUrl(value, baseUrl) {
@@ -231,9 +339,12 @@ function rewriteHLSPlaylistThroughKronos(playlist, baseUrl, hostBase, configKey)
         if (!trimmed) return line;
 
         if (trimmed.startsWith("#")) {
-            return line.replace(/URI="([^"]+)"/g, (match, uri) => {
+            // Handles URI="..." and URI='...' in tags such as EXT-X-KEY, EXT-X-MAP, EXT-X-MEDIA.
+            return line.replace(/URI=("([^\"]+)"|'([^']+)')/g, (match, quoted, doubleUri, singleUri) => {
+                const uri = doubleUri || singleUri;
+                const quote = quoted.startsWith("'") ? "'" : '"';
                 const absUrl = toAbsoluteUrl(uri, baseUrl);
-                return `URI="${proxyForUrl(absUrl)}"`;
+                return `URI=${quote}${proxyForUrl(absUrl)}${quote}`;
             });
         }
 
@@ -366,7 +477,7 @@ function getConfiguredLists(config) {
     }].filter(list => list.url);
 }
 
-async function fetchPlaylist(config, sourceUrl) {
+async function fetchPlaylist(sourceUrl) {
     console.log("[FETCH PLAYLIST] Attempting to fetch:", sanitizeUrlForLog(sourceUrl));
     try {
         const response = await axios.get(sourceUrl, {
@@ -527,16 +638,27 @@ function toMeta(channel, host, configKey = "", config = {}) {
     const logo = channel.logo || fallbackLogo;
     const stream = configKey ? buildStream(channel, host, configKey) : null;
     return {
-        id: channel.id, type: ADDON_TYPE, name: channel.name,
-        poster, logo, description: channel.description,
-        posterShape: "square", background: poster,
+        id: channel.id,
+        type: ADDON_TYPE,
+        name: channel.name,
+        poster,
+        logo,
+        description: channel.description,
+        posterShape: "square",
+        background: poster,
         genres: channel.group ? [channel.group] : undefined,
-        behaviorHints: { defaultVideoId: channel.id, hasScheduledVideos: false },
+        behaviorHints: {
+            defaultVideoId: channel.id,
+            hasScheduledVideos: false
+        },
         videos: [{
-            id: channel.id, title: channel.name,
+            id: channel.id,
+            title: channel.name,
             released: new Date(0).toISOString(),
-            thumbnail: poster, overview: channel.description,
-            available: true, streams: stream ? [stream] : undefined
+            thumbnail: poster,
+            overview: channel.description,
+            available: true,
+            streams: stream ? [stream] : undefined
         }]
     };
 }
@@ -552,7 +674,7 @@ async function fetchAndProcessChannels(configKey, config, options = {}) {
         const bucketGroup = selectedGroups[0] || "Kronos";
 
         const parsedChannelGroups = await Promise.all(configuredLists.map(async list => {
-            const playlistData = await fetchPlaylist(config, list.url);
+            const playlistData = await fetchPlaylist(list.url);
             return parseM3UChannels(playlistData, list);
         }));
 
@@ -622,7 +744,12 @@ app.get("/:base64Config/manifest.json", async (req, res) => {
                 extras.push({ name: "genre", options: catalogGroups, isRequired: false });
             }
 
-            return { id: toCatalogId(list.name), type: ADDON_TYPE, name: list.name, extra: extras };
+            return {
+                id: toCatalogId(list.name),
+                type: ADDON_TYPE,
+                name: list.name,
+                extra: extras
+            };
         });
 
         res.json({
@@ -634,7 +761,10 @@ app.get("/:base64Config/manifest.json", async (req, res) => {
             resources: ["catalog", "meta", "stream"],
             types: [ADDON_TYPE],
             idPrefixes: ["channel_"],
-            behaviorHints: { configurable: true, configurationRequired: false },
+            behaviorHints: {
+                configurable: true,
+                configurationRequired: false
+            },
             catalogs
         });
     } catch (err) {
@@ -645,13 +775,21 @@ app.get("/:base64Config/manifest.json", async (req, res) => {
 
 app.post("/api/analyze-link", async (req, res) => {
     try {
-        const config = { p: req.body.proxyUrl || null, pp: req.body.proxyPassword || null };
-        const playlistData = await fetchPlaylist(config, req.body.url);
-        const channels = parseM3UChannels(playlistData, { name: req.body.name || "Lista", url: req.body.url });
+        const playlistData = await fetchPlaylist(req.body.url);
+        const channels = parseM3UChannels(playlistData, {
+            name: req.body.name || "Lista",
+            url: req.body.url
+        });
         const groupMap = new Map();
-        channels.forEach(channel => { groupMap.set(channel.group, (groupMap.get(channel.group) || 0) + 1); });
-        const groups = [...groupMap.entries()].map(([name, count]) => ({ name, count }))
+
+        channels.forEach(channel => {
+            groupMap.set(channel.group, (groupMap.get(channel.group) || 0) + 1);
+        });
+
+        const groups = [...groupMap.entries()]
+            .map(([name, count]) => ({ name, count }))
             .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+
         res.json({ totalChannels: channels.length, groups });
     } catch (err) {
         res.status(400).json({ error: "Impossibile analizzare la lista M3U" });
@@ -660,23 +798,39 @@ app.post("/api/analyze-link", async (req, res) => {
 
 app.post("/api/analyze-lists", async (req, res) => {
     try {
-        const config = { p: req.body.proxyUrl || null, pp: req.body.proxyPassword || null };
         const lists = getConfiguredLists({ l: req.body.lists || [] });
         const parsedChannelGroups = await Promise.all(lists.map(async list => {
-            const playlistData = await fetchPlaylist(config, list.url);
+            const playlistData = await fetchPlaylist(list.url);
             return parseM3UChannels(playlistData, list);
         }));
+
         const channels = parsedChannelGroups.flat();
         const groupMap = new Map();
+
         channels.forEach(channel => {
-            const current = groupMap.get(channel.group) || { name: channel.group, count: 0, sources: new Set() };
+            const current = groupMap.get(channel.group) || {
+                name: channel.group,
+                count: 0,
+                sources: new Set()
+            };
             current.count += 1;
             current.sources.add(channel.sourceName);
             groupMap.set(channel.group, current);
         });
-        const groups = [...groupMap.values()].map(group => ({ name: group.name, count: group.count, sources: [...group.sources] }))
+
+        const groups = [...groupMap.values()]
+            .map(group => ({
+                name: group.name,
+                count: group.count,
+                sources: [...group.sources]
+            }))
             .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
-        res.json({ totalChannels: channels.length, totalLists: lists.length, groups });
+
+        res.json({
+            totalChannels: channels.length,
+            totalLists: lists.length,
+            groups
+        });
     } catch (err) {
         res.status(400).json({ error: "Impossibile analizzare le liste M3U" });
     }
@@ -696,7 +850,10 @@ async function catalogResponse(req, res) {
         const filteredChannels = sortChannelsByName(channels.filter(channel => {
             const matchesSource = targetSource ? channel.sourceName === targetSource : true;
             const matchesGroup = targetGroup ? normalizeGroupName(channel.group) === normalizeGroupName(targetGroup) : true;
-            const haystack = [channel.name, channel.group, channel.sourceName, channel.description].filter(Boolean).join(" ").toLowerCase();
+            const haystack = [channel.name, channel.group, channel.sourceName, channel.description]
+                .filter(Boolean)
+                .join(" ")
+                .toLowerCase();
             const matchesSearch = searchQuery ? haystack.includes(searchQuery) : true;
             return matchesSource && matchesGroup && matchesSearch;
         }));
@@ -734,7 +891,15 @@ app.get("/:base64Config/poster/:id.svg", async (req, res) => {
         const logoUrl = c?.logo || `${host}/logo.svg`;
         const logoDataUri = await getLogoDataUri(logoUrl);
         const name = c?.name || "Kronos";
-        const initials = name.replace(/\([^)]*\)/g, "").split(/\s+/).filter(Boolean).slice(0, 2).map(part => part[0]).join("").toUpperCase() || "TV";
+        const initials = name
+            .replace(/\([^)]*\)/g, "")
+            .split(/\s+/)
+            .filter(Boolean)
+            .slice(0, 2)
+            .map(part => part[0])
+            .join("")
+            .toUpperCase() || "TV";
+
         const logoMarkup = logoDataUri
             ? `<image href="${escapeXml(logoDataUri)}" x="58" y="74" width="396" height="286" preserveAspectRatio="xMidYMid meet"/>`
             : `<text x="256" y="274" text-anchor="middle" fill="#111827" font-family="Arial, sans-serif" font-size="86" font-weight="800">${escapeXml(initials)}</text>`;
@@ -743,7 +908,12 @@ app.get("/:base64Config/poster/:id.svg", async (req, res) => {
         res.setHeader("Cache-Control", "public, max-age=604800");
         res.send(`
             <svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
-                <defs><linearGradient id="bg" x1="0" x2="1" y1="0" y2="1"><stop offset="0" stop-color="#111827"/><stop offset="1" stop-color="#050814"/></linearGradient></defs>
+                <defs>
+                    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+                        <stop offset="0" stop-color="#111827"/>
+                        <stop offset="1" stop-color="#050814"/>
+                    </linearGradient>
+                </defs>
                 <rect width="512" height="512" rx="56" fill="url(#bg)"/>
                 <rect x="28" y="28" width="456" height="456" rx="44" fill="rgba(255,255,255,0.05)" stroke="rgba(255,255,255,0.16)"/>
                 <rect x="46" y="58" width="420" height="318" rx="32" fill="#f8fafc"/>
@@ -767,11 +937,19 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         if (!c) return res.status(404).send("#EXTM3U\n");
 
         const host = getPublicHost(req);
-        const { playlist, baseUrl } = await getCachedHLSRaw(c.url);
+        const { playlist, baseUrl, info, cacheStatus, age } = await getCachedHLSRaw(c.url);
         const rewritten = rewriteHLSPlaylistThroughKronos(playlist, baseUrl, host, configKey);
 
+        const playlistInfo = info || analyzeHLSPlaylist(playlist);
+        console.log(
+            `[HLS ROUTE] channel="${c.name}" cache=${cacheStatus}` +
+            `${typeof age === "number" ? ` age=${age}ms` : ""}` +
+            ` type=${playlistInfo.isMaster ? "master" : "media"} segs=${playlistInfo.segmentCount}` +
+            `${playlistInfo.mediaSequence !== null ? ` seq=${playlistInfo.mediaSequence}` : ""}`
+        );
+
         res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-        res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+        res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate, no-transform");
         res.setHeader("Pragma", "no-cache");
         res.send(rewritten);
     } catch (err) {
@@ -780,7 +958,7 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
     }
 });
 
-// Nested playlist relay (variant playlists in master playlists, etc.)
+// Nested playlist relay: variant playlists in master playlists, etc.
 app.get("/:base64Config/pl", async (req, res) => {
     try {
         const configKey = req.params.base64Config;
@@ -789,11 +967,19 @@ app.get("/:base64Config/pl", async (req, res) => {
 
         const sourceUrl = decodeProxyUrl(req.query.u);
         const host = getPublicHost(req);
-        const { playlist, baseUrl } = await getCachedHLSRaw(sourceUrl);
+        const { playlist, baseUrl, info, cacheStatus, age } = await getCachedHLSRaw(sourceUrl);
         const rewritten = rewriteHLSPlaylistThroughKronos(playlist, baseUrl, host, configKey);
 
+        const playlistInfo = info || analyzeHLSPlaylist(playlist);
+        console.log(
+            `[PL ROUTE] cache=${cacheStatus}` +
+            `${typeof age === "number" ? ` age=${age}ms` : ""}` +
+            ` type=${playlistInfo.isMaster ? "master" : "media"} segs=${playlistInfo.segmentCount}` +
+            `${playlistInfo.mediaSequence !== null ? ` seq=${playlistInfo.mediaSequence}` : ""}`
+        );
+
         res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-        res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+        res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, no-transform");
         res.send(rewritten);
     } catch (err) {
         console.error("[ERROR PL ROUTE]", err.message);
@@ -801,20 +987,58 @@ app.get("/:base64Config/pl", async (req, res) => {
     }
 });
 
-// Segment relay: streams .ts (or any non-playlist resource) from upstream to client
+// Segment relay: streams .ts or any non-playlist resource from upstream to client
 app.get("/:base64Config/seg", async (req, res) => {
     let upstream = null;
+    let segmentNo = null;
+    let sourceUrl = null;
+    let started = Date.now();
+    let bytes = 0;
+    let finalized = false;
+
+    function finalizeSegment(result, err = null) {
+        if (finalized || segmentNo === null) return;
+        finalized = true;
+
+        memoryCache.stats.seg.active = Math.max(0, memoryCache.stats.seg.active - 1);
+
+        if (result === "ok") memoryCache.stats.seg.ok += 1;
+        else if (result === "aborted") memoryCache.stats.seg.aborted += 1;
+        else memoryCache.stats.seg.error += 1;
+
+        memoryCache.stats.seg.bytes += bytes;
+
+        const ok = result === "ok";
+        if (shouldLogSegment(segmentNo, ok)) {
+            const duration = Date.now() - started;
+            const range = req.headers.range ? ` range=${req.headers.range}` : "";
+            const status = res.statusCode || "?";
+            const label = ok ? "SEG OK" : result === "aborted" ? "SEG ABORT" : "SEG ERROR";
+
+            console.log(
+                `[${label} #${segmentNo}] status=${status} bytes=${formatBytes(bytes)} time=${duration}ms active=${memoryCache.stats.seg.active}${range}` +
+                `${sourceUrl ? ` url=${sanitizeUrlForLog(sourceUrl)}` : ""}` +
+                `${err ? ` err=${err.message}` : ""}`
+            );
+        }
+    }
+
     try {
         const configKey = req.params.base64Config;
         decodeConfig(configKey);
         if (!req.query.u) return res.status(400).end();
 
-        const sourceUrl = decodeProxyUrl(req.query.u);
+        sourceUrl = decodeProxyUrl(req.query.u);
+        segmentNo = ++memoryCache.stats.seg.total;
+        memoryCache.stats.seg.active += 1;
 
         const headers = {
             "User-Agent": UPSTREAM_UA,
-            "Accept": "*/*"
+            "Accept": "*/*",
+            "Accept-Encoding": "identity",
+            "Connection": "keep-alive"
         };
+
         if (req.headers.range) headers.Range = req.headers.range;
 
         const response = await axios.get(sourceUrl, {
@@ -822,21 +1046,45 @@ app.get("/:base64Config/seg", async (req, res) => {
             timeout: SEG_REQUEST_TIMEOUT,
             maxRedirects: 5,
             headers,
+            decompress: false,
+            maxBodyLength: Infinity,
+            maxContentLength: Infinity,
             validateStatus(status) { return status >= 200 && status < 400; }
         });
 
         upstream = response.data;
 
-        const headersToForward = ["content-type", "content-length", "content-range", "accept-ranges", "last-modified", "etag"];
+        const headersToForward = [
+            "content-type",
+            "content-length",
+            "content-range",
+            "accept-ranges",
+            "last-modified",
+            "etag",
+            "cache-control",
+            "expires"
+        ];
+
         headersToForward.forEach(h => {
             if (response.headers[h]) res.setHeader(h, response.headers[h]);
         });
 
+        res.setHeader("X-Kronos-Relay", "1");
         res.status(response.status);
-        upstream.pipe(res);
+
+        upstream.on("data", chunk => {
+            bytes += chunk.length;
+        });
+
+        res.on("finish", () => finalizeSegment("ok"));
+
+        res.on("close", () => {
+            if (!res.writableEnded) finalizeSegment("aborted");
+        });
 
         upstream.on("error", err => {
             console.error("[SEG STREAM ERROR]", err.message);
+            finalizeSegment("error", err);
             if (!res.headersSent) res.status(502);
             res.end();
         });
@@ -844,12 +1092,16 @@ app.get("/:base64Config/seg", async (req, res) => {
         req.on("close", () => {
             if (upstream && !upstream.destroyed) upstream.destroy();
         });
+
+        upstream.pipe(res);
     } catch (err) {
-        console.error("[ERROR SEG ROUTE]", err.message);
         const status = err.response?.status || 502;
         if (!res.headersSent) res.status(status);
         res.end();
+
         if (upstream && !upstream.destroyed) upstream.destroy();
+
+        finalizeSegment("error", err);
     }
 });
 
@@ -859,6 +1111,7 @@ app.get("/:base64Config/stream/:type/:id.json", async (req, res) => {
         const config = decodeConfig(configKey);
         const c = await getChannelById(configKey, config, req.params.id);
         if (!c) return res.json({ streams: [] });
+
         const host = getPublicHost(req);
         res.json({ streams: [buildStream(c, host, configKey)] });
     } catch (err) {
@@ -867,13 +1120,28 @@ app.get("/:base64Config/stream/:type/:id.json", async (req, res) => {
 });
 
 app.get("/configure", (req, res) => res.redirect("/"));
-app.get("/:base64Config/configure", (req, res) => res.redirect(`/?config=${encodeURIComponent(req.params.base64Config)}`));
+
+app.get("/:base64Config/configure", (req, res) => {
+    res.redirect(`/?config=${encodeURIComponent(req.params.base64Config)}`);
+});
+
+app.get("/stats", (req, res) => {
+    res.json({
+        version: RELEASE_VERSION,
+        uptime: process.uptime(),
+        memory: process.memoryUsage(),
+        stats: memoryCache.stats,
+        hlsCacheKeys: Object.keys(memoryCache.hlsData).length,
+        hlsInflightKeys: Object.keys(memoryCache.hlsInflight).length
+    });
+});
 
 app.get("/:base64Config/debug", async (req, res) => {
     try {
         const configKey = req.params.base64Config;
         const config = decodeConfig(configKey);
         const channels = await getChannelsFromCache(configKey, config);
+
         res.json({
             config: safeConfigForLog(config),
             mode: "self-relay",
@@ -883,12 +1151,22 @@ app.get("/:base64Config/debug", async (req, res) => {
             uniqueGroups: [...new Set(channels.map(c => c.group))],
             uniqueSourceNames: [...new Set(channels.map(c => c.sourceName))],
             configuredLists: getConfiguredLists(config),
-            hlsSettings: { HLS_REFRESH_TTL, HLS_STALE_TTL, HLS_REQUEST_TIMEOUT, HLS_RETRY_COUNT, SEG_REQUEST_TIMEOUT },
+            hlsSettings: {
+                HLS_REFRESH_TTL,
+                HLS_MASTER_REFRESH_TTL,
+                HLS_STALE_TTL,
+                HLS_REQUEST_TIMEOUT,
+                HLS_RETRY_COUNT,
+                SEG_REQUEST_TIMEOUT,
+                SEG_LOG_EVERY
+            },
             cacheInfo: {
                 lastUpdate: memoryCache.lastUpdate[configKey],
                 isUpdating: memoryCache.isUpdating[configKey],
-                hlsCacheKeys: Object.keys(memoryCache.hlsData).length
-            }
+                hlsCacheKeys: Object.keys(memoryCache.hlsData).length,
+                hlsInflightKeys: Object.keys(memoryCache.hlsInflight).length
+            },
+            stats: memoryCache.stats
         });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -900,7 +1178,8 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`K.R.O.N.O.S. ${RELEASE_VERSION} - Self-Relay Mode`);
     console.log(`${"=".repeat(60)}`);
     console.log(`Server: http://0.0.0.0:${PORT}`);
-    console.log(`HLS refresh: ${HLS_REFRESH_TTL}ms | stale: ${HLS_STALE_TTL}ms`);
+    console.log(`HLS live refresh: ${HLS_REFRESH_TTL}ms | master refresh: ${HLS_MASTER_REFRESH_TTL}ms | stale: ${HLS_STALE_TTL}ms`);
+    console.log(`Segment timeout: ${SEG_REQUEST_TIMEOUT}ms | segment log every: ${SEG_LOG_EVERY}`);
     console.log(`Node: ${process.version}`);
     console.log(`${"=".repeat(60)}\n`);
 });
