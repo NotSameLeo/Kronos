@@ -69,8 +69,9 @@ const WAIT_SEGMENT_DURATION = Number(process.env.WAIT_SEGMENT_DURATION || 2);
 const WAIT_PLAYLIST_SEGMENTS = Number(process.env.WAIT_PLAYLIST_SEGMENTS || 4);
 const WAIT_SEGMENT_COUNT = Number(process.env.WAIT_SEGMENT_COUNT || 40);
 const STARTUP_ABANDON_TIMEOUT = Number(process.env.STARTUP_ABANDON_TIMEOUT || 12000);
+const WAIT_SEGMENT_ABANDON_TIMEOUT = Number(process.env.WAIT_SEGMENT_ABANDON_TIMEOUT || 7000);
 const ADDON_TYPE = "kronos";
-const RELEASE_VERSION = "1.7.1";
+const RELEASE_VERSION = "1.7.2";
 
 function decodeConfig(configKey) {
     try {
@@ -446,12 +447,22 @@ function assertStartupStillWanted(session, label = "stream") {
     assertSessionActive(session, label);
     const active = session?.key ? memoryCache.activeSessions[session.key] : null;
     if (!active || active.status === "ready") return;
+    if (!active.servedWaitingStream) return;
 
-    const idleMs = Date.now() - (active.lastSeenAt || active.startedAt || Date.now());
+    const now = Date.now();
+    if (active.lastWaitSegmentAt) {
+        const noSegmentMs = now - active.lastWaitSegmentAt;
+        if (noSegmentMs <= WAIT_SEGMENT_ABANDON_TIMEOUT) return;
+
+        cancelPlaybackSession(active, `waiting-segments-stopped:${noSegmentMs}ms`);
+        throw createCancelledError(`Cancelled ${label}: player stopped requesting waiting stream segments`);
+    }
+
+    const idleMs = now - (active.waitingStartedAt || active.lastSeenAt || active.startedAt || now);
     if (idleMs <= STARTUP_ABANDON_TIMEOUT) return;
 
-    cancelPlaybackSession(active, `startup-abandoned:${idleMs}ms`);
-    throw createCancelledError(`Cancelled ${label}: player stopped requesting startup stream`);
+    cancelPlaybackSession(active, `startup-abandoned-no-wait-segments:${idleMs}ms`);
+    throw createCancelledError(`Cancelled ${label}: player never requested waiting stream segments`);
 }
 
 function cancelPlaybackSession(session, reason = "cancelled") {
@@ -1929,6 +1940,7 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         if (readiness.status === "prebuffering") {
             touchPlaybackSession(session, "waiting-playlist");
             session.servedWaitingStream = true;
+            if (!session.waitingStartedAt) session.waitingStartedAt = Date.now();
             console.log(
                 `[WAIT STREAM] channel="${c.name}" serving=black-screen` +
                 ` cached=${formatSeconds(readiness.cachedSeconds || 0)}/${formatSeconds(STREAM_PREBUFFER_SECONDS)}`
@@ -1989,6 +2001,7 @@ app.get("/:base64Config/wait/:id/:segment", (req, res) => {
     }
 
     touchPlaybackSession(session, "waiting-segment");
+    session.lastWaitSegmentAt = Date.now();
 
     const segmentName = String(req.params.segment || "");
     if (!/^black_\d{3}\.ts$/.test(segmentName)) return res.status(404).end();
