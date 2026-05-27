@@ -66,7 +66,7 @@ const SEGMENT_WAIT_FOR_PREFETCH_MS = Number(process.env.SEGMENT_WAIT_FOR_PREFETC
 const PLAYER_SEGMENT_SLOW_MS = Number(process.env.PLAYER_SEGMENT_SLOW_MS || 2500);
 const PLAYER_SEGMENT_GAP_WARN_MS = Number(process.env.PLAYER_SEGMENT_GAP_WARN_MS || 30000);
 const ADDON_TYPE = "kronos";
-const RELEASE_VERSION = "1.7.3";
+const RELEASE_VERSION = "1.6.3";
 
 function decodeConfig(configKey) {
     try {
@@ -366,14 +366,13 @@ function activatePlaybackSession(req, channel) {
         channelName,
         sourceUrl: channel?.url || "",
         startedAt: Date.now(),
-        lastSeenAt: Date.now(),
-        cancelled: false
+        lastSeenAt: Date.now()
     };
 
     memoryCache.activeSessions[key] = session;
 
     if (previous) {
-        cancelPlaybackSession(previous, `channel-switch:${channelName}`);
+        cancelSessionWork(previous, `channel-switch:${channelName}`);
         console.log(`[CHANNEL SWITCH] from="${previous.channelName}" to="${channelName}"`);
     } else {
         console.log(`[CHANNEL SESSION] channel="${channelName}" active`);
@@ -382,40 +381,15 @@ function activatePlaybackSession(req, channel) {
     return session;
 }
 
-function touchPlaybackSession(session, reason = "activity") {
-    if (!session) return;
-    session.lastSeenAt = Date.now();
-    session.lastActivity = reason;
-}
-
 function isSessionActive(session) {
     if (!session?.key || !session?.id) return true;
-    const active = memoryCache.activeSessions[session.key];
-    return active?.id === session.id && !active.cancelled && !session.cancelled;
+    return memoryCache.activeSessions[session.key]?.id === session.id;
 }
 
 function assertSessionActive(session, label = "stream") {
     if (isSessionActive(session)) return;
     console.log(`[STARTUP CANCELLED] channel="${label}" reason=channel-switch`);
     throw createCancelledError(`Cancelled ${label}: another channel became active`);
-}
-
-function cancelPlaybackSession(session, reason = "cancelled") {
-    if (!session) return;
-    session.cancelled = true;
-    cancelSessionWork(session, reason);
-
-    if (session.key && memoryCache.activeSessions[session.key]?.id === session.id) {
-        delete memoryCache.activeSessions[session.key];
-    }
-
-    const state = session.sourceUrl ? memoryCache.streamStates[getHLSCacheKey(session.sourceUrl)] : null;
-    if (state && (state.status === "acquiring" || state.status === "prebuffering")) {
-        state.status = "cancelled";
-        state.lastError = `Cancelled: ${reason}`;
-    }
-
-    console.log(`[SESSION CANCELLED] channel="${session.channelName}" reason=${reason}`);
 }
 
 function cancelSessionWork(session, reason = "inactive-session") {
@@ -1192,7 +1166,7 @@ function parseM3UChannels(data, source = {}) {
             const group = (line.match(/group-title="([^"]+)"/) || [, "Altri Canali"])[1].trim();
             const logoMatch = line.match(/tvg-logo="([^"]+)"/);
             const tvgId = (line.match(/tvg-id="([^"]+)"/) || [, null])[1];
-            const logo = logoMatch ? logoMatch[1] : `https://placehold.co/512x512/111827/ffffff?text=${encodeURIComponent(name.substring(0, 5))}`;
+            const logo = logoMatch ? logoMatch[1] : "";
 
             currentChannel = {
                 name,
@@ -1285,13 +1259,6 @@ function getExtraParams(extra) {
     return params;
 }
 
-function getCatalogExtraParams(req) {
-    return {
-        ...getExtraParams(req.params.extra),
-        ...Object.fromEntries(Object.entries(req.query || {}).map(([key, value]) => [key, Array.isArray(value) ? value[0] : value]))
-    };
-}
-
 function getCatalogSourceName(catalogId) {
     if (!String(catalogId || "").startsWith("kronos_list_")) return null;
     return Buffer.from(catalogId.replace("kronos_list_", ""), "hex").toString("utf8");
@@ -1366,7 +1333,7 @@ function buildStream(channel, host, configKey, config) {
 
 function toMeta(channel, host, configKey = "", config = {}) {
     const fallbackLogo = `${host}/logo.svg`;
-    const poster = configKey ? `${host}/${configKey}/poster/${channel.id}.svg` : (channel.logo || fallbackLogo);
+    const poster = configKey ? `${host}/${configKey}/poster/${channel.id}.svg?v=${encodeURIComponent(RELEASE_VERSION)}` : (channel.logo || fallbackLogo);
     const logo = channel.logo || fallbackLogo;
     const stream = configKey ? buildStream(channel, host, configKey, config) : null;
 
@@ -1603,7 +1570,7 @@ async function catalogResponse(req, res) {
         const configKey = req.params.base64Config;
         const config = decodeConfig(configKey);
         const channels = await getChannelsFromCache(configKey, config);
-        const extraParams = getCatalogExtraParams(req);
+        const extraParams = getExtraParams(req.params.extra);
         const targetGroup = extraParams.genre || null;
         const targetSource = getCatalogSourceName(req.params.id);
         const searchQuery = extraParams.search ? String(extraParams.search).trim() : null;
@@ -1624,8 +1591,6 @@ async function catalogResponse(req, res) {
         );
 
         const metas = filteredChannels.map(c => toMeta(c, host, configKey, config));
-        res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-        res.setHeader("Content-Type", "application/json; charset=utf-8");
         res.json({ metas });
     } catch (err) {
         console.error('[ERROR CATALOG]', err);
@@ -1635,7 +1600,6 @@ async function catalogResponse(req, res) {
 
 app.get("/:base64Config/catalog/:type/:id.json", catalogResponse);
 app.get("/:base64Config/catalog/:type/:id/:extra.json", catalogResponse);
-app.get("/:base64Config/catalog/:type/:id/:extra", catalogResponse);
 
 app.get("/:base64Config/meta/:type/:id.json", async (req, res) => {
     const configKey = req.params.base64Config;
@@ -1652,7 +1616,7 @@ app.get("/:base64Config/poster/:id.svg", async (req, res) => {
         const config = decodeConfig(configKey);
         const c = await getChannelById(configKey, config, req.params.id);
         const host = getPublicHost(req);
-        const logoUrl = c?.logo || `${host}/logo.svg`;
+        const logoUrl = c?.logo || "";
         const logoDataUri = await getLogoDataUri(logoUrl);
         const name = stripInitialCountryPrefix(c?.name || "Kronos");
         const initials = name
@@ -1668,7 +1632,7 @@ app.get("/:base64Config/poster/:id.svg", async (req, res) => {
             : `<text x="256" y="274" text-anchor="middle" fill="#111827" font-family="Arial, sans-serif" font-size="86" font-weight="800">${escapeXml(initials)}</text>`;
 
         res.setHeader("Content-Type", "image/svg+xml");
-        res.setHeader("Cache-Control", "public, max-age=604800");
+        res.setHeader("Cache-Control", "public, max-age=3600");
         res.send(`
             <svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
                 <defs>
@@ -1752,19 +1716,8 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
 
         const host = getPublicHost(req);
         const session = activatePlaybackSession(req, c);
-        let responseFinished = false;
-        res.on("finish", () => {
-            responseFinished = true;
-        });
-        req.on("close", () => {
-            if (!responseFinished && session.status !== "ready") {
-                cancelPlaybackSession(session, "player-closed-during-startup");
-            }
-        });
-
-        touchPlaybackSession(session, "hls-index");
         await ensureStreamReady(c.url, c.name, { session, label: c.name });
-        session.status = "ready";
+
         const hls = await getCachedHLSRaw(c.url);
         assertSessionActive(session, c.name);
         const buffered = updateLiveBufferFromPlaylist(c.url, hls.playlist, hls.baseUrl, { session, label: c.name });
@@ -1984,6 +1937,12 @@ app.get("/:base64Config/debug", async (req, res) => {
                 segmentCacheBytes: memoryCache.segmentCacheBytes,
                 segmentPrefetchActive: memoryCache.segmentPrefetchActive,
                 segmentPrefetchQueue: memoryCache.segmentPrefetchQueue.length,
+                activeSessions: Object.values(memoryCache.activeSessions).map(session => ({
+                    channelName: session.channelName,
+                    channelId: session.channelId,
+                    startedAt: session.startedAt,
+                    lastSeenAt: session.lastSeenAt
+                })),
                 playbackStates: Object.entries(memoryCache.playbackStates).map(([key, state]) => ({
                     key,
                     ok: state.ok,
