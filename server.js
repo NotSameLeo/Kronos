@@ -90,10 +90,10 @@ const CACHE_TTL = 30 * 60 * 1000;
 
 // HLS self-relay tuning
 // Dynamic-buffer mode: quick start + progressive server-side buffer.
-const HLS_REFRESH_TTL = Number(process.env.HLS_REFRESH_TTL || 6000);
+const HLS_REFRESH_TTL = Number(process.env.HLS_REFRESH_TTL || 2500);
 const HLS_MASTER_REFRESH_TTL = Number(process.env.HLS_MASTER_REFRESH_TTL || 30000);
 const HLS_STALE_TTL = Number(process.env.HLS_STALE_TTL || 120000);
-const HLS_LIVE_STALE_REFRESH_TTL = Number(process.env.HLS_LIVE_STALE_REFRESH_TTL || 25000);
+const HLS_LIVE_STALE_REFRESH_TTL = Number(process.env.HLS_LIVE_STALE_REFRESH_TTL || 5000);
 const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 12000);
 
 // Keep HLS retries simple: the stream-acquire loop is now the real retry controller.
@@ -110,7 +110,7 @@ const SEG_LOG_EVERY = Number(process.env.SEG_LOG_EVERY || 1);
 // Phase 3: while playing, keep filling the buffer toward the target.
 const LIVE_BUFFER_SEGMENTS = Number(process.env.LIVE_BUFFER_SEGMENTS || 32);
 const LIVE_PLAYLIST_SEGMENTS = Number(process.env.LIVE_PLAYLIST_SEGMENTS || 10);
-const LIVE_DELAY_SEGMENTS = Number(process.env.LIVE_DELAY_SEGMENTS || 2);
+const LIVE_DELAY_SEGMENTS = Number(process.env.LIVE_DELAY_SEGMENTS || 1);
 const MIN_LIVE_SEGMENTS_READY = Number(process.env.MIN_LIVE_SEGMENTS_READY || 2);
 const MIN_LIVE_WARMUP_ATTEMPTS = Number(process.env.MIN_LIVE_WARMUP_ATTEMPTS || 2);
 const MIN_LIVE_WARMUP_DELAY_MS = Number(process.env.MIN_LIVE_WARMUP_DELAY_MS || 2500);
@@ -120,7 +120,7 @@ const STREAM_STARTUP_PREBUFFER_ENABLED = String(process.env.STREAM_STARTUP_PREBU
 const STREAM_ACQUIRE_TIMEOUT = Number(process.env.STREAM_ACQUIRE_TIMEOUT || 25000);
 const STREAM_ACQUIRE_POLL_MS = Number(process.env.STREAM_ACQUIRE_POLL_MS || 2500);
 
-const STREAM_PREBUFFER_START_SECONDS = Number(process.env.STREAM_PREBUFFER_START_SECONDS || 24);
+const STREAM_PREBUFFER_START_SECONDS = Number(process.env.STREAM_PREBUFFER_START_SECONDS || 18);
 const STREAM_PREBUFFER_START_MIN_SEGMENTS = Number(process.env.STREAM_PREBUFFER_START_MIN_SEGMENTS || 2);
 const STREAM_PREBUFFER_TIMEOUT = Number(process.env.STREAM_PREBUFFER_TIMEOUT || 35000);
 
@@ -142,12 +142,12 @@ const SEGMENT_CACHE_TTL = Number(process.env.SEGMENT_CACHE_TTL || 10 * 60 * 1000
 const SEGMENT_CACHE_MAX_BYTES = Number(process.env.SEGMENT_CACHE_MAX_BYTES || 512 * 1024 * 1024);
 const SEGMENT_CACHE_MAX_SEGMENTS = Number(process.env.SEGMENT_CACHE_MAX_SEGMENTS || 100);
 const SEGMENT_CACHE_MAX_ITEM_BYTES = Number(process.env.SEGMENT_CACHE_MAX_ITEM_BYTES || 24 * 1024 * 1024);
-const SEGMENT_PREFETCH_CONCURRENCY = Number(process.env.SEGMENT_PREFETCH_CONCURRENCY || 2);
-const SEGMENT_PREFETCH_AHEAD = Number(process.env.SEGMENT_PREFETCH_AHEAD || 8);
+const SEGMENT_PREFETCH_CONCURRENCY = Number(process.env.SEGMENT_PREFETCH_CONCURRENCY || 3);
+const SEGMENT_PREFETCH_AHEAD = Number(process.env.SEGMENT_PREFETCH_AHEAD || 10);
 const SEGMENT_WAIT_FOR_PREFETCH_MS = Number(process.env.SEGMENT_WAIT_FOR_PREFETCH_MS || 2500);
 
 const ADDON_TYPE = "tv";
-const RELEASE_VERSION = "1.6.6";
+const RELEASE_VERSION = "1.6.7";
 
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
@@ -320,9 +320,11 @@ function extractSegmentIdentityFromUrl(value) {
     return null;
 }
 
-function getSegmentLogicalKey(segment) {
+function getSegmentLogicalKey(segment, options = {}) {
     if (!segment) return null;
-    if (Number.isFinite(segment.sequence)) return `seq:${segment.sequence}`;
+    const useSequence = options.useSequence !== false;
+
+    if (useSequence && Number.isFinite(segment.sequence)) return `seq:${segment.sequence}`;
 
     const identity = extractSegmentIdentityFromUrl(segment.url);
     if (identity) return identity;
@@ -330,12 +332,28 @@ function getSegmentLogicalKey(segment) {
     return segment.url ? `url:${hashKey(segment.url)}` : null;
 }
 
-function cloneSegmentWithLogicalKey(segment) {
-    const logicalKey = getSegmentLogicalKey(segment);
+function cloneSegmentWithLogicalKey(segment, options = {}) {
+    const logicalKey = getSegmentLogicalKey(segment, options);
     return {
         ...segment,
         logicalKey
     };
+}
+
+function shouldUseSequenceLogicalKeys(buffer, parsed) {
+    if (!parsed?.info?.isLive) return true;
+    if (buffer?.logicalKeyMode === "url") return false;
+    if (buffer?.logicalKeyMode === "sequence") return true;
+
+    const mediaSequence = parsed.info.mediaSequence;
+
+    if (!Number.isFinite(mediaSequence)) return false;
+    if (mediaSequence > 0) return true;
+
+    // Some IPTV providers keep #EXT-X-MEDIA-SEQUENCE pinned to 0 while rotating
+    // tokenized segment URLs. In that case seq:0/seq:1 collisions make Kronos
+    // keep old URLs and cache entries, so prefer filename/URL identity.
+    return false;
 }
 
 function shouldResetLiveBufferForParsedSegments(buffer, parsed) {
@@ -1189,17 +1207,22 @@ function updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl, options = {}
             segments: [],
             segmentMap: {},
             lastUpdated: 0,
-            lastMediaSequence: null
+            lastMediaSequence: null,
+            logicalKeyMode: null
         };
         memoryCache.liveBuffers[cacheKey] = buffer;
     }
 
+    const useSequenceKeys = shouldUseSequenceLogicalKeys(buffer, parsed);
+    buffer.logicalKeyMode = useSequenceKeys ? "sequence" : "url";
     buffer.headerLines = parsed.headerLines;
     buffer.lastUpdated = Date.now();
     buffer.lastMediaSequence = parsed.info.mediaSequence;
 
     parsed.segments.forEach(rawSegment => {
-        const segment = cloneSegmentWithLogicalKey(rawSegment);
+        const segment = cloneSegmentWithLogicalKey(rawSegment, {
+            useSequence: useSequenceKeys
+        });
         const key = segment.logicalKey;
 
         if (!key) return;
@@ -1240,7 +1263,9 @@ function updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl, options = {}
 
     buffer.segmentMap = {};
     buffer.segments.forEach(segment => {
-        const key = segment.logicalKey || getSegmentLogicalKey(segment);
+        const key = segment.logicalKey || getSegmentLogicalKey(segment, {
+            useSequence: useSequenceKeys
+        });
         if (!key) return;
         segment.logicalKey = key;
         buffer.segmentMap[key] = segment;
