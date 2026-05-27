@@ -67,8 +67,10 @@ const PLAYER_SEGMENT_SLOW_MS = Number(process.env.PLAYER_SEGMENT_SLOW_MS || 2500
 const PLAYER_SEGMENT_GAP_WARN_MS = Number(process.env.PLAYER_SEGMENT_GAP_WARN_MS || 30000);
 const WAIT_SEGMENT_DURATION = Number(process.env.WAIT_SEGMENT_DURATION || 2);
 const WAIT_PLAYLIST_SEGMENTS = Number(process.env.WAIT_PLAYLIST_SEGMENTS || 4);
+const WAIT_SEGMENT_COUNT = Number(process.env.WAIT_SEGMENT_COUNT || 40);
+const STARTUP_ABANDON_TIMEOUT = Number(process.env.STARTUP_ABANDON_TIMEOUT || 12000);
 const ADDON_TYPE = "kronos";
-const RELEASE_VERSION = "1.7.0";
+const RELEASE_VERSION = "1.7.1";
 
 function decodeConfig(configKey) {
     try {
@@ -286,7 +288,6 @@ function formatSeconds(value) {
 
 function buildWaitingPlaylist(host, configKey, channelId, sequenceSeed = Date.now()) {
     const sequence = Math.floor(Number(sequenceSeed || Date.now()) / (WAIT_SEGMENT_DURATION * 1000));
-    const segmentUrl = `${host}/${configKey}/wait/${encodeURIComponent(channelId)}/black.ts`;
     const lines = [
         "#EXTM3U",
         "#EXT-X-VERSION:3",
@@ -296,8 +297,10 @@ function buildWaitingPlaylist(host, configKey, channelId, sequenceSeed = Date.no
     ];
 
     for (let i = 0; i < WAIT_PLAYLIST_SEGMENTS; i++) {
+        const segmentIndex = (sequence + i) % WAIT_SEGMENT_COUNT;
+        const segmentName = `black_${String(segmentIndex).padStart(3, "0")}.ts`;
         lines.push(`#EXTINF:${WAIT_SEGMENT_DURATION.toFixed(3)},`);
-        lines.push(`${segmentUrl}?seq=${sequence + i}`);
+        lines.push(`${host}/${configKey}/wait/${encodeURIComponent(channelId)}/${segmentName}?seq=${sequence + i}`);
     }
 
     return lines.join("\n") + "\n";
@@ -401,13 +404,14 @@ function activatePlaybackSession(req, channel) {
         channelName,
         sourceUrl: channel?.url || "",
         startedAt: Date.now(),
-        lastSeenAt: Date.now()
+        lastSeenAt: Date.now(),
+        cancelled: false
     };
 
     memoryCache.activeSessions[key] = session;
 
     if (previous) {
-        cancelSessionWork(previous, `channel-switch:${channelName}`);
+        cancelPlaybackSession(previous, `channel-switch:${channelName}`);
         console.log(`[CHANNEL SWITCH] from="${previous.channelName}" to="${channelName}"`);
     } else {
         console.log(`[CHANNEL SESSION] channel="${channelName}" active`);
@@ -416,15 +420,56 @@ function activatePlaybackSession(req, channel) {
     return session;
 }
 
+function getActiveSessionForRequest(req) {
+    return memoryCache.activeSessions[getPlaybackKey(req)] || null;
+}
+
+function touchPlaybackSession(session, reason = "activity") {
+    if (!session) return;
+    session.lastSeenAt = Date.now();
+    session.lastActivity = reason;
+}
+
 function isSessionActive(session) {
     if (!session?.key || !session?.id) return true;
-    return memoryCache.activeSessions[session.key]?.id === session.id;
+    const active = memoryCache.activeSessions[session.key];
+    return active?.id === session.id && !active.cancelled && !session.cancelled;
 }
 
 function assertSessionActive(session, label = "stream") {
     if (isSessionActive(session)) return;
     console.log(`[STARTUP CANCELLED] channel="${label}" reason=channel-switch`);
     throw createCancelledError(`Cancelled ${label}: another channel became active`);
+}
+
+function assertStartupStillWanted(session, label = "stream") {
+    assertSessionActive(session, label);
+    const active = session?.key ? memoryCache.activeSessions[session.key] : null;
+    if (!active || active.status === "ready") return;
+
+    const idleMs = Date.now() - (active.lastSeenAt || active.startedAt || Date.now());
+    if (idleMs <= STARTUP_ABANDON_TIMEOUT) return;
+
+    cancelPlaybackSession(active, `startup-abandoned:${idleMs}ms`);
+    throw createCancelledError(`Cancelled ${label}: player stopped requesting startup stream`);
+}
+
+function cancelPlaybackSession(session, reason = "cancelled") {
+    if (!session) return;
+    session.cancelled = true;
+    cancelSessionWork(session, reason);
+
+    if (session.key && memoryCache.activeSessions[session.key]?.id === session.id) {
+        delete memoryCache.activeSessions[session.key];
+    }
+
+    const state = session.sourceUrl ? memoryCache.streamStates[getHLSCacheKey(session.sourceUrl)] : null;
+    if (state && (state.status === "acquiring" || state.status === "prebuffering")) {
+        state.status = "cancelled";
+        state.lastError = `Cancelled: ${reason}`;
+    }
+
+    console.log(`[SESSION CANCELLED] channel="${session.channelName}" reason=${reason}`);
 }
 
 function cancelSessionWork(session, reason = "inactive-session") {
@@ -1092,9 +1137,9 @@ async function prebufferInitialStream(sourceUrl, label = "stream", context = {})
     );
 
     while (Date.now() - started < STREAM_PREBUFFER_TIMEOUT) {
-        assertSessionActive(context.session, label);
+        assertStartupStillWanted(context.session, label);
         const hls = await fetchAndStoreHLSRaw(getHLSCacheKey(sourceUrl), sourceUrl, "prebuffer");
-        assertSessionActive(context.session, label);
+        assertStartupStillWanted(context.session, label);
         const buffered = updateLiveBufferFromPlaylist(sourceUrl, hls.playlist, hls.baseUrl, context);
         const candidates = (buffered.segments || []).slice(-SEGMENT_PREFETCH_AHEAD);
 
@@ -1121,7 +1166,7 @@ async function prebufferInitialStream(sourceUrl, label = "stream", context = {})
         }
 
         await sleep(700);
-        assertSessionActive(context.session, label);
+        assertStartupStillWanted(context.session, label);
     }
 
     throw new Error(`Prebuffer failed: less than ${STREAM_PREBUFFER_SECONDS}s after ${Date.now() - started}ms`);
@@ -1200,6 +1245,7 @@ async function ensureStreamAcquiredOrReady(sourceUrl, label = "stream", context 
     const cachedSeconds = getCachedDurationForSegments(buffer?.segments || []);
     if (state.status === "ready" && cachedSeconds >= STREAM_PREBUFFER_SECONDS) {
         assertSessionActive(context.session, label);
+        if (context.session) context.session.status = "ready";
         queueDynamicPrefetchForBuffer(buffer, context);
         console.log(`[STARTUP REUSE] channel="${label}" ready-cache cached=${formatSeconds(cachedSeconds)}`);
         return { status: "ready", cachedSeconds, reused: true };
@@ -1244,6 +1290,7 @@ async function ensureStreamAcquiredOrReady(sourceUrl, label = "stream", context 
 
             state.status = "prebuffering";
             state.prebufferStartedAt = Date.now();
+            if (context.session) context.session.status = "prebuffering";
             console.log(`[WAIT STREAM START] channel="${label}" acquired=true serving=black-screen untilPrebuffer=${formatSeconds(STREAM_PREBUFFER_SECONDS)}`);
 
             state.promise = prebufferInitialStream(sourceUrl, label, context)
@@ -1252,6 +1299,7 @@ async function ensureStreamAcquiredOrReady(sourceUrl, label = "stream", context 
                     state.status = "ready";
                     state.readyAt = Date.now();
                     state.lastError = null;
+                    if (context.session) context.session.status = "ready";
                     console.log(`[WAIT STREAM END] channel="${label}" switching-to-real-stream cached=${formatSeconds(ready.cachedSeconds)}`);
                     return ready;
                 })
@@ -1396,6 +1444,13 @@ function getExtraParams(extra) {
         if (name) params[name] = decodeURIComponent(value || "");
     });
     return params;
+}
+
+function getCatalogExtraParams(req) {
+    return {
+        ...getExtraParams(req.params.extra),
+        ...Object.fromEntries(Object.entries(req.query || {}).map(([key, value]) => [key, Array.isArray(value) ? value[0] : value]))
+    };
 }
 
 function getCatalogSourceName(catalogId) {
@@ -1709,7 +1764,7 @@ async function catalogResponse(req, res) {
         const configKey = req.params.base64Config;
         const config = decodeConfig(configKey);
         const channels = await getChannelsFromCache(configKey, config);
-        const extraParams = getExtraParams(req.params.extra);
+        const extraParams = getCatalogExtraParams(req);
         const targetGroup = extraParams.genre || null;
         const targetSource = getCatalogSourceName(req.params.id);
         const searchQuery = extraParams.search ? String(extraParams.search).trim() : null;
@@ -1730,6 +1785,8 @@ async function catalogResponse(req, res) {
         );
 
         const metas = filteredChannels.map(c => toMeta(c, host, configKey, config));
+        res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+        res.setHeader("Content-Type", "application/json; charset=utf-8");
         res.json({ metas });
     } catch (err) {
         console.error('[ERROR CATALOG]', err);
@@ -1739,6 +1796,7 @@ async function catalogResponse(req, res) {
 
 app.get("/:base64Config/catalog/:type/:id.json", catalogResponse);
 app.get("/:base64Config/catalog/:type/:id/:extra.json", catalogResponse);
+app.get("/:base64Config/catalog/:type/:id/:extra", catalogResponse);
 
 app.get("/:base64Config/meta/:type/:id.json", async (req, res) => {
     const configKey = req.params.base64Config;
@@ -1855,9 +1913,21 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
 
         const host = getPublicHost(req);
         const session = activatePlaybackSession(req, c);
+        let responseFinished = false;
+        res.on("finish", () => {
+            responseFinished = true;
+        });
+        req.on("close", () => {
+            if (!responseFinished && !session.realStreamStarted) {
+                cancelPlaybackSession(session, "player-closed-during-startup");
+            }
+        });
+
+        touchPlaybackSession(session, "hls-index");
         const readiness = await ensureStreamAcquiredOrReady(c.url, c.name, { session, label: c.name });
 
         if (readiness.status === "prebuffering") {
+            touchPlaybackSession(session, "waiting-playlist");
             session.servedWaitingStream = true;
             console.log(
                 `[WAIT STREAM] channel="${c.name}" serving=black-screen` +
@@ -1869,13 +1939,15 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
             return res.send(buildWaitingPlaylist(host, configKey, c.id));
         }
 
+        const needsWaitingDiscontinuity = session.servedWaitingStream && !session.realStreamStarted;
+        session.status = "ready";
+        session.realStreamStarted = true;
         const hls = await getCachedHLSRaw(c.url);
         assertSessionActive(session, c.name);
         const buffered = updateLiveBufferFromPlaylist(c.url, hls.playlist, hls.baseUrl, { session, label: c.name });
         let outputPlaylist = buffered.playlist || hls.playlist;
-        if (session.servedWaitingStream && !session.realStreamStarted) {
+        if (needsWaitingDiscontinuity) {
             outputPlaylist = insertDiscontinuityBeforeFirstMediaSegment(outputPlaylist);
-            session.realStreamStarted = true;
             console.log(`[WAIT STREAM SWITCH] channel="${c.name}" first-real-playlist discontinuity=true`);
         }
         const rewritten = rewriteHLSPlaylistThroughKronos(outputPlaylist, hls.baseUrl, host, configKey);
@@ -1910,10 +1982,21 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
     }
 });
 
-app.get("/:base64Config/wait/:id/black.ts", (req, res) => {
-    const blackSegmentPath = path.join(__dirname, "public", "kronos-black.ts");
+app.get("/:base64Config/wait/:id/:segment", (req, res) => {
+    const session = getActiveSessionForRequest(req);
+    if (!session || session.channelId !== req.params.id) {
+        return res.status(410).end();
+    }
+
+    touchPlaybackSession(session, "waiting-segment");
+
+    const segmentName = String(req.params.segment || "");
+    if (!/^black_\d{3}\.ts$/.test(segmentName)) return res.status(404).end();
+
+    const blackSegmentPath = path.join(__dirname, "public", "kronos-wait", segmentName);
     res.setHeader("Content-Type", "video/mp2t");
     res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    console.log(`[WAIT SEGMENT] channel="${session.channelName}" segment=${segmentName}`);
     res.sendFile(blackSegmentPath, err => {
         if (err && !res.headersSent) res.status(404).end();
     });
