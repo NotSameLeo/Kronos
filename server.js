@@ -34,6 +34,7 @@ const memoryCache = {
     segmentPrefetchQueue: [],
     segmentPrefetchActive: 0,
     segmentCacheBytes: 0,
+    playbackStates: {},
     logoData: {},
     lastUpdate: {},
     isUpdating: {}
@@ -61,8 +62,10 @@ const SEGMENT_CACHE_MAX_ITEM_BYTES = Number(process.env.SEGMENT_CACHE_MAX_ITEM_B
 const SEGMENT_PREFETCH_CONCURRENCY = Number(process.env.SEGMENT_PREFETCH_CONCURRENCY || 4);
 const SEGMENT_PREFETCH_AHEAD = Number(process.env.SEGMENT_PREFETCH_AHEAD || 14);
 const SEGMENT_WAIT_FOR_PREFETCH_MS = Number(process.env.SEGMENT_WAIT_FOR_PREFETCH_MS || 3000);
+const PLAYER_SEGMENT_SLOW_MS = Number(process.env.PLAYER_SEGMENT_SLOW_MS || 2500);
+const PLAYER_SEGMENT_GAP_WARN_MS = Number(process.env.PLAYER_SEGMENT_GAP_WARN_MS || 30000);
 const ADDON_TYPE = "kronos";
-const RELEASE_VERSION = "1.6.1";
+const RELEASE_VERSION = "1.6.2";
 
 function decodeConfig(configKey) {
     try {
@@ -283,6 +286,59 @@ function getBufferStatus(cachedSeconds) {
     if (cachedSeconds < DYNAMIC_BUFFER_TARGET_SECONDS) return "filling";
     if (cachedSeconds >= DYNAMIC_BUFFER_MAX_SECONDS) return "full";
     return "healthy";
+}
+
+function getPlaybackKey(req) {
+    return `${req.params.base64Config}:${req.ip || req.get("x-forwarded-for") || "client"}`;
+}
+
+function getSegmentLabel(sourceUrl) {
+    try {
+        const url = new URL(sourceUrl);
+        return decodeURIComponent(url.pathname.split("/").filter(Boolean).pop() || "segment");
+    } catch (err) {
+        return String(sourceUrl || "").split("?")[0].split("/").filter(Boolean).pop() || "segment";
+    }
+}
+
+function notePlayerSegment(req, sourceUrl, event = {}) {
+    const key = getPlaybackKey(req);
+    const now = Date.now();
+    const state = memoryCache.playbackStates[key] || {
+        startedAt: now,
+        lastSegmentAt: 0,
+        ok: 0,
+        errors: 0,
+        slow: 0,
+        possibleBuffering: 0
+    };
+
+    const gapMs = state.lastSegmentAt ? now - state.lastSegmentAt : 0;
+    state.lastSegmentAt = now;
+
+    if (event.ok) state.ok += 1;
+    if (event.error) state.errors += 1;
+    if (event.durationMs >= PLAYER_SEGMENT_SLOW_MS) state.slow += 1;
+
+    const gapRisk = gapMs >= PLAYER_SEGMENT_GAP_WARN_MS;
+    const slowRisk = event.durationMs >= PLAYER_SEGMENT_SLOW_MS;
+    const errorRisk = Boolean(event.error);
+
+    if (gapRisk || slowRisk || errorRisk) {
+        state.possibleBuffering += 1;
+        console.warn(
+            `[PLAYER BUFFER RISK] segment=${getSegmentLabel(sourceUrl)}` +
+            ` reason=${errorRisk ? "segment-error" : slowRisk ? "slow-segment" : "long-request-gap"}` +
+            `${event.status ? ` status=${event.status}` : ""}` +
+            `${event.durationMs !== undefined ? ` time=${event.durationMs}ms` : ""}` +
+            `${gapMs ? ` gap=${gapMs}ms` : ""}` +
+            `${event.source ? ` source=${event.source}` : ""}` +
+            ` totals=ok:${state.ok},slow:${state.slow},errors:${state.errors}`
+        );
+    }
+
+    memoryCache.playbackStates[key] = state;
+    return { gapMs, state };
 }
 
 function getHLSCacheKey(sourceUrl) {
@@ -1459,7 +1515,7 @@ app.get("/:base64Config/poster/:id.svg", async (req, res) => {
         const host = getPublicHost(req);
         const logoUrl = c?.logo || `${host}/logo.svg`;
         const logoDataUri = await getLogoDataUri(logoUrl);
-        const name = c?.name || "Kronos";
+        const name = stripInitialCountryPrefix(c?.name || "Kronos");
         const initials = name
             .replace(/\([^)]*\)/g, "")
             .split(/\s+/)
@@ -1494,7 +1550,7 @@ app.get("/:base64Config/poster/:id.svg", async (req, res) => {
     }
 });
 
-function sendCachedSegment(req, res, cached) {
+function sendCachedSegment(req, res, cached, source = "cache", started = Date.now()) {
     const buffer = cached.buffer;
     const total = buffer.length;
     const rangeHeader = req.headers.range;
@@ -1533,6 +1589,18 @@ function sendCachedSegment(req, res, cached) {
     if (!res.getHeader("content-type")) {
         res.setHeader("Content-Type", cached.headers?.["content-type"] || "video/mp2t");
     }
+
+    const durationMs = Date.now() - started;
+    notePlayerSegment(req, cached.url, { ok: true, source, status, durationMs, bytes: chunk.length });
+    console.log(
+        `[PLAYER SEGMENT] segment=${getSegmentLabel(cached.url)}` +
+        ` source=${source}` +
+        ` status=${status}` +
+        ` bytes=${formatBytes(chunk.length)}` +
+        ` time=${durationMs}ms` +
+        `${req.headers.range ? ` range=${req.headers.range}` : ""}`
+    );
+
     return res.end(chunk);
 }
 
@@ -1557,6 +1625,15 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
             ` segs=${buffered.info?.segmentCount ?? hls.info?.segmentCount ?? 0}` +
             `${buffered.cachedSeconds !== undefined ? ` cached≈${Math.round(buffered.cachedSeconds)}s` : ""}`
         );
+
+        if (buffered.cachedSeconds !== undefined && buffered.cachedSeconds < STREAM_PREBUFFER_SECONDS) {
+            console.warn(
+                `[PLAYER BUFFER RISK] channel="${c.name}" reason=low-visible-playlist-cache` +
+                ` visibleCached=${formatSeconds(buffered.cachedSeconds)}` +
+                ` startupTarget=${formatSeconds(STREAM_PREBUFFER_SECONDS)}` +
+                ` playlistSegs=${buffered.playlistSegments || 0}`
+            );
+        }
 
         res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
         res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
@@ -1604,10 +1681,17 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
 
         const sourceUrl = decodeProxyUrl(req.query.u);
         const cached = getSegmentFromCache(sourceUrl);
-        if (cached) return sendCachedSegment(req, res, cached);
+        if (cached) return sendCachedSegment(req, res, cached, "cache-hit", started);
 
+        const prefetchWaitStarted = Date.now();
         const waitedCached = await waitForSegmentPrefetch(sourceUrl, SEGMENT_WAIT_FOR_PREFETCH_MS);
-        if (waitedCached) return sendCachedSegment(req, res, waitedCached);
+        if (waitedCached) {
+            console.log(
+                `[PLAYER WAITED PREFETCH] segment=${getSegmentLabel(sourceUrl)}` +
+                ` waited=${Date.now() - prefetchWaitStarted}ms`
+            );
+            return sendCachedSegment(req, res, waitedCached, "prefetch-wait", started);
+        }
 
         const headers = {
             "User-Agent": UPSTREAM_UA,
@@ -1651,11 +1735,32 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
             if (shouldStore && cacheChunks.length > 0 && bytes <= SEGMENT_CACHE_MAX_ITEM_BYTES) {
                 storeSegmentInCache(sourceUrl, Buffer.concat(cacheChunks), response.headers, response.status);
             }
-            console.log(`[SEG OK] bytes=${formatBytes(bytes)} time=${Date.now() - started}ms`);
+            const durationMs = Date.now() - started;
+            notePlayerSegment(req, sourceUrl, {
+                ok: true,
+                source: "upstream",
+                status: response.status,
+                durationMs,
+                bytes
+            });
+            console.log(
+                `[PLAYER SEGMENT] segment=${getSegmentLabel(sourceUrl)}` +
+                ` source=upstream` +
+                ` status=${response.status}` +
+                ` bytes=${formatBytes(bytes)}` +
+                ` time=${durationMs}ms` +
+                `${req.headers.range ? ` range=${req.headers.range}` : ""}`
+            );
         });
 
         upstream.on("error", err => {
             console.error("[SEG STREAM ERROR]", err.message);
+            notePlayerSegment(req, sourceUrl, {
+                error: true,
+                source: "upstream-stream",
+                status: res.statusCode || 502,
+                durationMs: Date.now() - started
+            });
             if (!res.headersSent) res.status(502);
             res.end();
         });
@@ -1666,6 +1771,13 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
 
         upstream.pipe(res);
     } catch (err) {
+        const sourceUrl = req.query.u ? decodeProxyUrl(req.query.u) : "";
+        notePlayerSegment(req, sourceUrl, {
+            error: true,
+            source: "upstream-request",
+            status: err.response?.status || 502,
+            durationMs: Date.now() - started
+        });
         if (!res.headersSent) res.status(err.response?.status || 502);
         res.end();
         if (upstream && !upstream.destroyed) upstream.destroy();
@@ -1716,6 +1828,14 @@ app.get("/:base64Config/debug", async (req, res) => {
                 segmentCacheBytes: memoryCache.segmentCacheBytes,
                 segmentPrefetchActive: memoryCache.segmentPrefetchActive,
                 segmentPrefetchQueue: memoryCache.segmentPrefetchQueue.length,
+                playbackStates: Object.entries(memoryCache.playbackStates).map(([key, state]) => ({
+                    key,
+                    ok: state.ok,
+                    slow: state.slow,
+                    errors: state.errors,
+                    possibleBuffering: state.possibleBuffering,
+                    lastSegmentAt: state.lastSegmentAt
+                })),
                 streamStates: Object.entries(memoryCache.streamStates).map(([key, state]) => ({
                     key,
                     status: state.status,
