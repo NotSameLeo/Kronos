@@ -1097,7 +1097,7 @@ async function ensureStreamReady(sourceUrl, label = "stream", context = {}) {
     let state = memoryCache.streamStates[cacheKey];
 
     if (!state) {
-        state = { status: "idle", promise: null, readyAt: 0, lastError: null };
+        state = { status: "idle", promise: null, readyAt: 0, lastError: null, generation: 0 };
         memoryCache.streamStates[cacheKey] = state;
     }
 
@@ -1112,12 +1112,15 @@ async function ensureStreamReady(sourceUrl, label = "stream", context = {}) {
         return { status: "ready", reused: true };
     }
 
-    if (state.promise) {
+    if (state.promise && state.status !== "cancelled" && state.status !== "failed") {
         console.log(`[STARTUP WAIT] channel="${label}" existingPhase=${state.status}`);
         return state.promise;
     }
 
+    state.generation = (state.generation || 0) + 1;
+    const myGen = state.generation;
     state.status = "acquiring";
+    state.lastError = null;
     state.promise = (async () => {
         try {
             const initial = await acquireInitialHLS(sourceUrl, label, context);
@@ -1156,16 +1159,22 @@ async function ensureStreamReady(sourceUrl, label = "stream", context = {}) {
 
             return ready;
         } catch (err) {
-            if (err.code === "KRONOS_SESSION_CANCELLED") {
-                state.status = "cancelled";
-                state.lastError = err.message;
-            } else {
-                state.status = "failed";
+            // Only update state if no newer generation has superseded us. Otherwise
+            // we'd corrupt the state of a fresh startup that took over after a
+            // player-close or channel-switch cancellation.
+            if (state.generation === myGen) {
+                if (err.code === "KRONOS_SESSION_CANCELLED") {
+                    state.status = "cancelled";
+                } else {
+                    state.status = "failed";
+                }
                 state.lastError = err.message;
             }
             throw err;
         } finally {
-            state.promise = null;
+            if (state.generation === myGen) {
+                state.promise = null;
+            }
         }
     })();
 
@@ -1589,12 +1598,14 @@ async function catalogResponse(req, res) {
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
     res.setHeader("Content-Type", "application/json; charset=utf-8");
 
+    const requestStarted = Date.now();
+    const rawExtra = req.params.extra || "";
+    const rawQuery = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
+
     try {
         const configKey = req.params.base64Config;
         const config = decodeConfig(configKey);
 
-        // Read extra params from both the path segment and query string (Stremio uses path,
-        // but being defensive here handles edge cases).
         const extraParams = {
             ...getExtraParams(req.params.extra),
             ...Object.fromEntries(
@@ -1606,16 +1617,14 @@ async function catalogResponse(req, res) {
         const searchQuery = extraParams.search ? String(extraParams.search).trim() : null;
         const host = getPublicHost(req);
 
-        // If this is a search request and channels aren't cached yet, kick off loading
-        // in the background and return empty immediately. Stremio will retry on the next
-        // keystroke by which time the cache will be warm.
-        if (searchQuery && !memoryCache.channelItems[configKey]) {
-            console.log(`[CATALOG SEARCH MISS] search="${searchQuery}" triggering background load`);
-            getChannelsFromCache(configKey, config).catch(err => {
-                console.error("[CATALOG BACKGROUND LOAD ERROR]", err.message);
-            });
-            return res.json({ metas: [] });
-        }
+        console.log(
+            `[CATALOG REQ] id=${req.params.id}` +
+            ` rawExtra="${rawExtra}"` +
+            `${rawQuery ? ` rawQuery="${rawQuery}"` : ""}` +
+            `${searchQuery ? ` search="${searchQuery}"` : ""}` +
+            `${targetGroup ? ` genre="${targetGroup}"` : ""}` +
+            ` cached=${Boolean(memoryCache.channelItems[configKey])}`
+        );
 
         const channels = await getChannelsFromCache(configKey, config);
 
@@ -1630,7 +1639,8 @@ async function catalogResponse(req, res) {
             `[CATALOG ROUTE] id=${req.params.id}` +
             `${targetGroup ? ` genre="${targetGroup}"` : ""}` +
             `${searchQuery ? ` search="${searchQuery}"` : ""}` +
-            ` results=${filteredChannels.length}/${channels.length}`
+            ` results=${filteredChannels.length}/${channels.length}` +
+            ` time=${Date.now() - requestStarted}ms`
         );
 
         const metas = filteredChannels.map(c => toMeta(c, host, configKey, config));
@@ -1763,11 +1773,26 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
 
         let startupDone = false;
         req.on("close", () => {
-            if (!startupDone && memoryCache.activeSessions[session.key]?.id === session.id) {
-                delete memoryCache.activeSessions[session.key];
-                cancelSessionWork(session, "player-closed");
-                console.log(`[SESSION CLOSED] channel="${c.name}" reason=player-disconnected`);
+            if (startupDone) return;
+            if (memoryCache.activeSessions[session.key]?.id !== session.id) return;
+
+            delete memoryCache.activeSessions[session.key];
+            cancelSessionWork(session, "player-closed");
+
+            // Force-reset the stream state so a subsequent re-open of the same channel
+            // starts a fresh startup instead of attaching to the about-to-fail promise.
+            // Bumping the generation also prevents the old promise from corrupting any
+            // newer state when it finally throws.
+            const cacheKey = getHLSCacheKey(c.url);
+            const state = memoryCache.streamStates[cacheKey];
+            if (state && state.status !== "ready") {
+                state.generation = (state.generation || 0) + 1;
+                state.status = "cancelled";
+                state.promise = null;
+                state.lastError = "player-closed-during-startup";
             }
+
+            console.log(`[SESSION CLOSED] channel="${c.name}" reason=player-disconnected`);
         });
 
         await ensureStreamReady(c.url, c.name, { session, label: c.name });
