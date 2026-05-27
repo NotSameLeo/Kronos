@@ -65,13 +65,8 @@ const SEGMENT_PREFETCH_AHEAD = Number(process.env.SEGMENT_PREFETCH_AHEAD || 14);
 const SEGMENT_WAIT_FOR_PREFETCH_MS = Number(process.env.SEGMENT_WAIT_FOR_PREFETCH_MS || 3000);
 const PLAYER_SEGMENT_SLOW_MS = Number(process.env.PLAYER_SEGMENT_SLOW_MS || 2500);
 const PLAYER_SEGMENT_GAP_WARN_MS = Number(process.env.PLAYER_SEGMENT_GAP_WARN_MS || 30000);
-const WAIT_SEGMENT_DURATION = Number(process.env.WAIT_SEGMENT_DURATION || 2);
-const WAIT_PLAYLIST_SEGMENTS = Number(process.env.WAIT_PLAYLIST_SEGMENTS || 4);
-const WAIT_SEGMENT_COUNT = Number(process.env.WAIT_SEGMENT_COUNT || 40);
-const STARTUP_ABANDON_TIMEOUT = Number(process.env.STARTUP_ABANDON_TIMEOUT || 12000);
-const WAIT_SEGMENT_ABANDON_TIMEOUT = Number(process.env.WAIT_SEGMENT_ABANDON_TIMEOUT || 7000);
 const ADDON_TYPE = "kronos";
-const RELEASE_VERSION = "1.7.2";
+const RELEASE_VERSION = "1.7.3";
 
 function decodeConfig(configKey) {
     try {
@@ -287,40 +282,6 @@ function formatSeconds(value) {
     return `${Math.round(Number(value || 0))}s`;
 }
 
-function buildWaitingPlaylist(host, configKey, channelId, sequenceSeed = Date.now()) {
-    const sequence = Math.floor(Number(sequenceSeed || Date.now()) / (WAIT_SEGMENT_DURATION * 1000));
-    const lines = [
-        "#EXTM3U",
-        "#EXT-X-VERSION:3",
-        `#EXT-X-TARGETDURATION:${Math.ceil(WAIT_SEGMENT_DURATION)}`,
-        `#EXT-X-MEDIA-SEQUENCE:${sequence}`,
-        "#EXT-X-DISCONTINUITY"
-    ];
-
-    for (let i = 0; i < WAIT_PLAYLIST_SEGMENTS; i++) {
-        const segmentIndex = (sequence + i) % WAIT_SEGMENT_COUNT;
-        const segmentName = `black_${String(segmentIndex).padStart(3, "0")}.ts`;
-        lines.push(`#EXTINF:${WAIT_SEGMENT_DURATION.toFixed(3)},`);
-        lines.push(`${host}/${configKey}/wait/${encodeURIComponent(channelId)}/${segmentName}?seq=${sequence + i}`);
-    }
-
-    return lines.join("\n") + "\n";
-}
-
-function insertDiscontinuityBeforeFirstMediaSegment(playlist) {
-    const lines = String(playlist || "").split(/\r?\n/);
-    const firstSegmentIndex = lines.findIndex(line => {
-        const trimmed = String(line || "").trim();
-        return trimmed && !trimmed.startsWith("#");
-    });
-
-    if (firstSegmentIndex <= 0) return playlist;
-    if (String(lines[firstSegmentIndex - 1] || "").trim() === "#EXT-X-DISCONTINUITY") return playlist;
-
-    lines.splice(firstSegmentIndex, 0, "#EXT-X-DISCONTINUITY");
-    return lines.join("\n");
-}
-
 function getBufferStatus(cachedSeconds) {
     if (cachedSeconds < STREAM_PREBUFFER_SECONDS) return "warming";
     if (cachedSeconds < DYNAMIC_BUFFER_TARGET_SECONDS) return "filling";
@@ -421,10 +382,6 @@ function activatePlaybackSession(req, channel) {
     return session;
 }
 
-function getActiveSessionForRequest(req) {
-    return memoryCache.activeSessions[getPlaybackKey(req)] || null;
-}
-
 function touchPlaybackSession(session, reason = "activity") {
     if (!session) return;
     session.lastSeenAt = Date.now();
@@ -441,28 +398,6 @@ function assertSessionActive(session, label = "stream") {
     if (isSessionActive(session)) return;
     console.log(`[STARTUP CANCELLED] channel="${label}" reason=channel-switch`);
     throw createCancelledError(`Cancelled ${label}: another channel became active`);
-}
-
-function assertStartupStillWanted(session, label = "stream") {
-    assertSessionActive(session, label);
-    const active = session?.key ? memoryCache.activeSessions[session.key] : null;
-    if (!active || active.status === "ready") return;
-    if (!active.servedWaitingStream) return;
-
-    const now = Date.now();
-    if (active.lastWaitSegmentAt) {
-        const noSegmentMs = now - active.lastWaitSegmentAt;
-        if (noSegmentMs <= WAIT_SEGMENT_ABANDON_TIMEOUT) return;
-
-        cancelPlaybackSession(active, `waiting-segments-stopped:${noSegmentMs}ms`);
-        throw createCancelledError(`Cancelled ${label}: player stopped requesting waiting stream segments`);
-    }
-
-    const idleMs = now - (active.waitingStartedAt || active.lastSeenAt || active.startedAt || now);
-    if (idleMs <= STARTUP_ABANDON_TIMEOUT) return;
-
-    cancelPlaybackSession(active, `startup-abandoned-no-wait-segments:${idleMs}ms`);
-    throw createCancelledError(`Cancelled ${label}: player never requested waiting stream segments`);
 }
 
 function cancelPlaybackSession(session, reason = "cancelled") {
@@ -1148,9 +1083,9 @@ async function prebufferInitialStream(sourceUrl, label = "stream", context = {})
     );
 
     while (Date.now() - started < STREAM_PREBUFFER_TIMEOUT) {
-        assertStartupStillWanted(context.session, label);
+        assertSessionActive(context.session, label);
         const hls = await fetchAndStoreHLSRaw(getHLSCacheKey(sourceUrl), sourceUrl, "prebuffer");
-        assertStartupStillWanted(context.session, label);
+        assertSessionActive(context.session, label);
         const buffered = updateLiveBufferFromPlaylist(sourceUrl, hls.playlist, hls.baseUrl, context);
         const candidates = (buffered.segments || []).slice(-SEGMENT_PREFETCH_AHEAD);
 
@@ -1177,7 +1112,7 @@ async function prebufferInitialStream(sourceUrl, label = "stream", context = {})
         }
 
         await sleep(700);
-        assertStartupStillWanted(context.session, label);
+        assertSessionActive(context.session, label);
     }
 
     throw new Error(`Prebuffer failed: less than ${STREAM_PREBUFFER_SECONDS}s after ${Date.now() - started}ms`);
@@ -1188,7 +1123,7 @@ async function ensureStreamReady(sourceUrl, label = "stream", context = {}) {
     let state = memoryCache.streamStates[cacheKey];
 
     if (!state) {
-        state = { status: "idle", promise: null, acquirePromise: null, readyAt: 0, lastError: null };
+        state = { status: "idle", promise: null, readyAt: 0, lastError: null };
         memoryCache.streamStates[cacheKey] = state;
     }
 
@@ -1241,113 +1176,6 @@ async function ensureStreamReady(sourceUrl, label = "stream", context = {}) {
     })();
 
     return state.promise;
-}
-
-async function ensureStreamAcquiredOrReady(sourceUrl, label = "stream", context = {}) {
-    const cacheKey = getHLSCacheKey(sourceUrl);
-    let state = memoryCache.streamStates[cacheKey];
-
-    if (!state) {
-        state = { status: "idle", promise: null, acquirePromise: null, readyAt: 0, lastError: null };
-        memoryCache.streamStates[cacheKey] = state;
-    }
-
-    const buffer = getLiveBuffer(sourceUrl);
-    const cachedSeconds = getCachedDurationForSegments(buffer?.segments || []);
-    if (state.status === "ready" && cachedSeconds >= STREAM_PREBUFFER_SECONDS) {
-        assertSessionActive(context.session, label);
-        if (context.session) context.session.status = "ready";
-        queueDynamicPrefetchForBuffer(buffer, context);
-        console.log(`[STARTUP REUSE] channel="${label}" ready-cache cached=${formatSeconds(cachedSeconds)}`);
-        return { status: "ready", cachedSeconds, reused: true };
-    }
-
-    if (state.status === "failed" && state.failedPhase === "prebuffer") {
-        throw new Error(state.lastError || `Prebuffer failed: less than ${STREAM_PREBUFFER_SECONDS}s`);
-    }
-
-    if (state.status === "prebuffering") {
-        if (Date.now() - (state.prebufferStartedAt || Date.now()) >= STREAM_PREBUFFER_TIMEOUT) {
-            state.status = "failed";
-            state.failedPhase = "prebuffer";
-            state.lastError = `Prebuffer failed: less than ${STREAM_PREBUFFER_SECONDS}s after ${STREAM_PREBUFFER_TIMEOUT}ms`;
-            throw new Error(state.lastError);
-        }
-        return { status: "prebuffering", cachedSeconds };
-    }
-
-    if (state.acquirePromise) {
-        console.log(`[STARTUP WAIT] channel="${label}" existingPhase=${state.status}`);
-        await state.acquirePromise;
-        return {
-            status: state.status === "ready" ? "ready" : "prebuffering",
-            cachedSeconds: getCachedDurationForSegments(getLiveBuffer(sourceUrl)?.segments || [])
-        };
-    }
-
-    state.status = "acquiring";
-    state.acquirePromise = (async () => {
-        try {
-            const initial = await acquireInitialHLS(sourceUrl, label, context);
-            assertSessionActive(context.session, label);
-
-            if (initial.info?.isMaster) {
-                state.status = "ready";
-                state.readyAt = Date.now();
-                state.lastError = null;
-                console.log(`[STARTUP COMPLETE] channel="${label}" master-playlist-ready`);
-                return { status: "ready", master: true };
-            }
-
-            state.status = "prebuffering";
-            state.prebufferStartedAt = Date.now();
-            if (context.session) context.session.status = "prebuffering";
-            console.log(`[WAIT STREAM START] channel="${label}" acquired=true serving=black-screen untilPrebuffer=${formatSeconds(STREAM_PREBUFFER_SECONDS)}`);
-
-            state.promise = prebufferInitialStream(sourceUrl, label, context)
-                .then(ready => {
-                    assertSessionActive(context.session, label);
-                    state.status = "ready";
-                    state.readyAt = Date.now();
-                    state.lastError = null;
-                    if (context.session) context.session.status = "ready";
-                    console.log(`[WAIT STREAM END] channel="${label}" switching-to-real-stream cached=${formatSeconds(ready.cachedSeconds)}`);
-                    return ready;
-                })
-                .catch(err => {
-                    if (err.code === "KRONOS_SESSION_CANCELLED") {
-                        state.status = "cancelled";
-                        state.failedPhase = "cancelled";
-                    } else {
-                        state.status = "failed";
-                        state.failedPhase = "prebuffer";
-                    }
-                    state.lastError = err.message;
-                    return { status: state.status, error: err.message };
-                })
-                .finally(() => {
-                    state.promise = null;
-                });
-
-            return { status: "prebuffering" };
-        } catch (err) {
-            if (err.code === "KRONOS_SESSION_CANCELLED") {
-                state.status = "cancelled";
-            } else {
-                state.status = "failed";
-            }
-            state.lastError = err.message;
-            throw err;
-        } finally {
-            state.acquirePromise = null;
-        }
-    })();
-
-    await state.acquirePromise;
-    return {
-        status: state.status === "ready" ? "ready" : "prebuffering",
-        cachedSeconds: getCachedDurationForSegments(getLiveBuffer(sourceUrl)?.segments || [])
-    };
 }
 
 function parseM3UChannels(data, source = {}) {
@@ -1929,39 +1757,18 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
             responseFinished = true;
         });
         req.on("close", () => {
-            if (!responseFinished && !session.realStreamStarted) {
+            if (!responseFinished && session.status !== "ready") {
                 cancelPlaybackSession(session, "player-closed-during-startup");
             }
         });
 
         touchPlaybackSession(session, "hls-index");
-        const readiness = await ensureStreamAcquiredOrReady(c.url, c.name, { session, label: c.name });
-
-        if (readiness.status === "prebuffering") {
-            touchPlaybackSession(session, "waiting-playlist");
-            session.servedWaitingStream = true;
-            if (!session.waitingStartedAt) session.waitingStartedAt = Date.now();
-            console.log(
-                `[WAIT STREAM] channel="${c.name}" serving=black-screen` +
-                ` cached=${formatSeconds(readiness.cachedSeconds || 0)}/${formatSeconds(STREAM_PREBUFFER_SECONDS)}`
-            );
-            res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-            res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-            res.setHeader("Pragma", "no-cache");
-            return res.send(buildWaitingPlaylist(host, configKey, c.id));
-        }
-
-        const needsWaitingDiscontinuity = session.servedWaitingStream && !session.realStreamStarted;
+        await ensureStreamReady(c.url, c.name, { session, label: c.name });
         session.status = "ready";
-        session.realStreamStarted = true;
         const hls = await getCachedHLSRaw(c.url);
         assertSessionActive(session, c.name);
         const buffered = updateLiveBufferFromPlaylist(c.url, hls.playlist, hls.baseUrl, { session, label: c.name });
-        let outputPlaylist = buffered.playlist || hls.playlist;
-        if (needsWaitingDiscontinuity) {
-            outputPlaylist = insertDiscontinuityBeforeFirstMediaSegment(outputPlaylist);
-            console.log(`[WAIT STREAM SWITCH] channel="${c.name}" first-real-playlist discontinuity=true`);
-        }
+        const outputPlaylist = buffered.playlist || hls.playlist;
         const rewritten = rewriteHLSPlaylistThroughKronos(outputPlaylist, hls.baseUrl, host, configKey);
 
         console.log(
@@ -1992,27 +1799,6 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         console.error("[ERROR HLS ROUTE]", err.message);
         res.status(502).send("#EXTM3U\n#EXT-X-ENDLIST\n");
     }
-});
-
-app.get("/:base64Config/wait/:id/:segment", (req, res) => {
-    const session = getActiveSessionForRequest(req);
-    if (!session || session.channelId !== req.params.id) {
-        return res.status(410).end();
-    }
-
-    touchPlaybackSession(session, "waiting-segment");
-    session.lastWaitSegmentAt = Date.now();
-
-    const segmentName = String(req.params.segment || "");
-    if (!/^black_\d{3}\.ts$/.test(segmentName)) return res.status(404).end();
-
-    const blackSegmentPath = path.join(__dirname, "public", "kronos-wait", segmentName);
-    res.setHeader("Content-Type", "video/mp2t");
-    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
-    console.log(`[WAIT SEGMENT] channel="${session.channelName}" segment=${segmentName}`);
-    res.sendFile(blackSegmentPath, err => {
-        if (err && !res.headersSent) res.status(404).end();
-    });
 });
 
 app.get("/:base64Config/proxy/pl", async (req, res) => {
