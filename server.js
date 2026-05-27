@@ -65,7 +65,7 @@ const SEGMENT_PREFETCH_AHEAD = Number(process.env.SEGMENT_PREFETCH_AHEAD || 14);
 const SEGMENT_WAIT_FOR_PREFETCH_MS = Number(process.env.SEGMENT_WAIT_FOR_PREFETCH_MS || 3000);
 const PLAYER_SEGMENT_SLOW_MS = Number(process.env.PLAYER_SEGMENT_SLOW_MS || 2500);
 const PLAYER_SEGMENT_GAP_WARN_MS = Number(process.env.PLAYER_SEGMENT_GAP_WARN_MS || 30000);
-const ADDON_TYPE = "kronos";
+const ADDON_TYPE = "tv";
 const RELEASE_VERSION = "1.6.3";
 
 function decodeConfig(configKey) {
@@ -212,7 +212,7 @@ function getConfiguredLists(config) {
     }
 
     return [{
-        name: String(config.ln || "Kronos").trim() || "Kronos",
+        name: String(config.ln || "Canali TV").trim() || "Canali TV",
         url: String(config.u || "").trim()
     }].filter(list => list.url);
 }
@@ -1351,7 +1351,7 @@ function buildStream(channel, host, configKey, config) {
     if (isHlsUrl(channel.url)) {
         return {
             title: channel.name,
-            name: "Kronos",
+            name: "TV",
             url: `${host}/${configKey}/hls/${channel.id}/index.m3u8`,
             behaviorHints: {
                 notWebReady: true,
@@ -1363,7 +1363,7 @@ function buildStream(channel, host, configKey, config) {
     if (isPlayableHttpUrl(channel.url)) {
         return {
             title: channel.name,
-            name: "Kronos",
+            name: "TV",
             url: `${host}/${configKey}/proxy/seg?u=${encodeProxyUrl(channel.url)}`,
             behaviorHints: {
                 notWebReady: true,
@@ -1374,7 +1374,7 @@ function buildStream(channel, host, configKey, config) {
 
     return {
         title: `${channel.name} - sorgente web`,
-        name: "Kronos",
+        name: "TV",
         externalUrl: channel.url
     };
 }
@@ -1542,7 +1542,7 @@ app.get("/:base64Config/manifest.json", async (req, res) => {
         const manifest = {
             id: "org.stremio.kronos.channel",
             version: RELEASE_VERSION,
-            name: "Kronos",
+            name: "TV",
             description: "TV",
             logo: `${host}/logo.svg`,
             resources: ["catalog", "meta", "stream"],
@@ -1820,34 +1820,30 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         const hls = await getCachedHLSRaw(c.url);
         assertSessionActive(session, c.name);
         const buffered = updateLiveBufferFromPlaylist(c.url, hls.playlist, hls.baseUrl, { session, label: c.name });
-        const outputPlaylist = buffered.playlist || hls.playlist;
-        const rewritten = rewriteHLSPlaylistThroughKronos(outputPlaylist, hls.baseUrl, host, configKey);
+        const rewritten = rewriteHLSPlaylistThroughKronos(buffered.playlist, hls.baseUrl, host, configKey);
+        const info = buffered.info || analyzeHLSPlaylist(buffered.playlist);
 
         console.log(
-            `[HLS ROUTE] channel="${c.name}" cache=${hls.cacheStatus}` +
-            `${typeof hls.age === "number" ? ` age=${hls.age}ms` : ""}` +
-            ` segs=${buffered.info?.segmentCount ?? hls.info?.segmentCount ?? 0}` +
-            `${buffered.cachedSeconds !== undefined ? ` cached≈${Math.round(buffered.cachedSeconds)}s` : ""}`
+            `[HLS ROUTE] channel="${c.name}"` +
+            ` cache=${hls.cacheStatus}` +
+            `${hls.age !== undefined ? ` age=${hls.age}ms` : ""}` +
+            ` type=${info.isMaster ? "master" : "media"}` +
+            ` segs=${info.segmentCount}` +
+            `${info.mediaSequence !== null ? ` seq=${info.mediaSequence}` : ""}` +
+            `${buffered.buffered ? ` buffer=${buffered.bufferSize} out=${buffered.playlistSegments}` : ""}` +
+            `${buffered.cachedSeconds !== undefined ? ` cached=${formatSeconds(buffered.cachedSeconds)}` : ""}`
         );
 
-        if (buffered.cachedSeconds !== undefined && buffered.cachedSeconds < STREAM_PREBUFFER_SECONDS) {
-            console.warn(
-                `[PLAYER BUFFER RISK] channel="${c.name}" reason=low-visible-playlist-cache` +
-                ` visibleCached=${formatSeconds(buffered.cachedSeconds)}` +
-                ` startupTarget=${formatSeconds(STREAM_PREBUFFER_SECONDS)}` +
-                ` playlistSegs=${buffered.playlistSegments || 0}`
-            );
-        }
-
         res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-        res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+        res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate, no-transform");
         res.setHeader("Pragma", "no-cache");
         res.send(rewritten);
     } catch (err) {
         if (err.code === "KRONOS_SESSION_CANCELLED") {
-            console.log(`[HLS ROUTE CANCELLED] ${err.message}`);
-            return res.status(204).end();
+            console.log("[HLS ROUTE CANCELLED]", err.message);
+            return res.status(499).send("#EXTM3U\n#EXT-X-ENDLIST\n");
         }
+
         console.error("[ERROR HLS ROUTE]", err.message);
         res.status(502).send("#EXTM3U\n#EXT-X-ENDLIST\n");
     }
@@ -1861,16 +1857,26 @@ app.get("/:base64Config/proxy/pl", async (req, res) => {
 
         const sourceUrl = decodeProxyUrl(req.query.u);
         const host = getPublicHost(req);
-        await ensureStreamReady(sourceUrl, "nested-playlist");
+
+        await ensureStreamReady(sourceUrl, "nested-playlist", { label: "nested-playlist" });
 
         const hls = await getCachedHLSRaw(sourceUrl);
-        const buffered = updateLiveBufferFromPlaylist(sourceUrl, hls.playlist, hls.baseUrl);
-        const outputPlaylist = buffered.playlist || hls.playlist;
-        const rewritten = rewriteHLSPlaylistThroughKronos(outputPlaylist, hls.baseUrl, host, configKey);
+        const buffered = updateLiveBufferFromPlaylist(sourceUrl, hls.playlist, hls.baseUrl, { label: "nested-playlist" });
+        const rewritten = rewriteHLSPlaylistThroughKronos(buffered.playlist, hls.baseUrl, host, configKey);
+        const info = buffered.info || analyzeHLSPlaylist(buffered.playlist);
+
+        console.log(
+            `[PL ROUTE] cache=${hls.cacheStatus}` +
+            `${hls.age !== undefined ? ` age=${hls.age}ms` : ""}` +
+            ` type=${info.isMaster ? "master" : "media"}` +
+            ` segs=${info.segmentCount}` +
+            `${info.mediaSequence !== null ? ` seq=${info.mediaSequence}` : ""}` +
+            `${buffered.buffered ? ` buffer=${buffered.bufferSize} out=${buffered.playlistSegments}` : ""}` +
+            `${buffered.cachedSeconds !== undefined ? ` cached=${formatSeconds(buffered.cachedSeconds)}` : ""}`
+        );
 
         res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-        res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-        res.setHeader("Pragma", "no-cache");
+        res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, no-transform");
         res.send(rewritten);
     } catch (err) {
         console.error("[ERROR PL ROUTE]", err.message);
@@ -1880,25 +1886,25 @@ app.get("/:base64Config/proxy/pl", async (req, res) => {
 
 app.get("/:base64Config/proxy/seg", async (req, res) => {
     let upstream = null;
-    let bytes = 0;
     const started = Date.now();
+    let sourceUrl = null;
+    let bytes = 0;
 
     try {
-        decodeConfig(req.params.base64Config);
+        const configKey = req.params.base64Config;
+        decodeConfig(configKey);
         if (!req.query.u) return res.status(400).end();
 
-        const sourceUrl = decodeProxyUrl(req.query.u);
-        const cached = getSegmentFromCache(sourceUrl);
-        if (cached) return sendCachedSegment(req, res, cached, "cache-hit", started);
+        sourceUrl = decodeProxyUrl(req.query.u);
 
-        const prefetchWaitStarted = Date.now();
-        const waitedCached = await waitForSegmentPrefetch(sourceUrl, SEGMENT_WAIT_FOR_PREFETCH_MS);
-        if (waitedCached) {
-            console.log(
-                `[PLAYER WAITED PREFETCH] segment=${getSegmentLabel(sourceUrl)}` +
-                ` waited=${Date.now() - prefetchWaitStarted}ms`
-            );
-            return sendCachedSegment(req, res, waitedCached, "prefetch-wait", started);
+        const cached = getSegmentFromCache(sourceUrl);
+        if (cached) {
+            return sendCachedSegment(req, res, cached, "cache", started);
+        }
+
+        const waited = await waitForSegmentPrefetch(sourceUrl);
+        if (waited) {
+            return sendCachedSegment(req, res, waited, "prefetch-wait", started);
         }
 
         const headers = {
@@ -1922,7 +1928,7 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
 
         upstream = response.data;
         const cacheChunks = [];
-        const shouldStore = !req.headers.range && response.status === 200;
+        let storeable = true;
 
         ["content-type", "content-length", "content-range", "accept-ranges", "last-modified", "etag", "cache-control", "expires"].forEach(h => {
             if (response.headers[h]) res.setHeader(h, response.headers[h]);
@@ -1934,83 +1940,114 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
 
         upstream.on("data", chunk => {
             bytes += chunk.length;
-            if (shouldStore && bytes <= SEGMENT_CACHE_MAX_ITEM_BYTES) {
+            if (storeable && bytes <= SEGMENT_CACHE_MAX_ITEM_BYTES) {
                 cacheChunks.push(chunk);
+            } else {
+                storeable = false;
+                cacheChunks.length = 0;
             }
         });
 
         res.on("finish", () => {
-            if (shouldStore && cacheChunks.length > 0 && bytes <= SEGMENT_CACHE_MAX_ITEM_BYTES) {
+            const durationMs = Date.now() - started;
+            if (storeable && cacheChunks.length > 0 && (response.status === 200 || response.status === 206)) {
                 storeSegmentInCache(sourceUrl, Buffer.concat(cacheChunks), response.headers, response.status);
             }
-            const durationMs = Date.now() - started;
-            notePlayerSegment(req, sourceUrl, {
-                ok: true,
-                source: "upstream",
-                status: response.status,
-                durationMs,
-                bytes
-            });
+            notePlayerSegment(req, sourceUrl, { ok: true, source: "upstream", status: response.status, durationMs, bytes });
             console.log(
                 `[PLAYER SEGMENT] segment=${getSegmentLabel(sourceUrl)}` +
-                ` source=upstream` +
-                ` status=${response.status}` +
+                ` source=upstream status=${response.status}` +
                 ` bytes=${formatBytes(bytes)}` +
                 ` time=${durationMs}ms` +
                 `${req.headers.range ? ` range=${req.headers.range}` : ""}`
             );
         });
 
-        upstream.on("error", err => {
-            console.error("[SEG STREAM ERROR]", err.message);
-            notePlayerSegment(req, sourceUrl, {
-                error: true,
-                source: "upstream-stream",
-                status: res.statusCode || 502,
-                durationMs: Date.now() - started
-            });
-            if (!res.headersSent) res.status(502);
-            res.end();
+        res.on("close", () => {
+            if (!res.writableEnded && upstream?.destroy) {
+                upstream.destroy();
+                const durationMs = Date.now() - started;
+                notePlayerSegment(req, sourceUrl, { error: true, source: "client-abort", status: res.statusCode, durationMs, bytes });
+                console.log(
+                    `[PLAYER SEGMENT ABORT] segment=${getSegmentLabel(sourceUrl)}` +
+                    ` bytes=${formatBytes(bytes)}` +
+                    ` time=${durationMs}ms`
+                );
+            }
         });
 
-        req.on("close", () => {
-            if (upstream && !upstream.destroyed) upstream.destroy();
+        upstream.on("error", err => {
+            const durationMs = Date.now() - started;
+            notePlayerSegment(req, sourceUrl, { error: true, source: "upstream-error", status: 502, durationMs, bytes });
+            if (!res.headersSent) return res.status(502).end();
+            res.destroy(err);
         });
 
         upstream.pipe(res);
     } catch (err) {
-        const sourceUrl = req.query.u ? decodeProxyUrl(req.query.u) : "";
-        notePlayerSegment(req, sourceUrl, {
-            error: true,
-            source: "upstream-request",
-            status: err.response?.status || 502,
-            durationMs: Date.now() - started
-        });
-        if (!res.headersSent) res.status(err.response?.status || 502);
-        res.end();
-        if (upstream && !upstream.destroyed) upstream.destroy();
+        if (upstream?.destroy) upstream.destroy();
+
+        const durationMs = Date.now() - started;
+        if (sourceUrl) {
+            notePlayerSegment(req, sourceUrl, { error: true, source: "proxy-error", status: 502, durationMs, bytes });
+        }
+
         console.error("[ERROR SEG ROUTE]", err.message);
+        if (!res.headersSent) res.status(502).end();
+        else if (!res.destroyed) res.destroy(err);
     }
 });
 
 app.get("/:base64Config/stream/:type/:id.json", async (req, res) => {
-    const configKey = req.params.base64Config;
-    const config = decodeConfig(configKey);
-    const c = await getChannelById(configKey, config, req.params.id);
-    if (!c) return res.json({ streams: [] });
+    try {
+        const configKey = req.params.base64Config;
+        const config = decodeConfig(configKey);
+        const host = getPublicHost(req);
+        const c = await getChannelById(configKey, config, req.params.id);
 
-    const host = getPublicHost(req);
-    const stream = buildStream(c, host, configKey, config);
+        if (!c) return res.status(404).json({ streams: [] });
 
-    res.json({ streams: [stream] });
+        res.json({ streams: [buildStream(c, host, configKey, config)] });
+    } catch (err) {
+        console.error('[ERROR STREAM]', err);
+        res.status(500).json({ streams: [] });
+    }
 });
 
-app.get("/configure", (req, res) => {
-    res.redirect("/");
-});
+app.get("/:base64Config/stats", (req, res) => {
+    const hlsEntries = Object.entries(memoryCache.hlsData).map(([key, value]) => ({
+        key,
+        ageMs: Date.now() - value.updatedAt,
+        info: value.info,
+        reason: value.reason
+    }));
 
-app.get("/:base64Config/configure", (req, res) => {
-    res.redirect(`/?config=${encodeURIComponent(req.params.base64Config)}`);
+    const liveBuffers = Object.entries(memoryCache.liveBuffers).map(([key, value]) => ({
+        key,
+        size: value.segments?.length || 0,
+        cachedSeconds: Math.round(getCachedDurationForSegments(value.segments || [])),
+        lastUpdatedMs: value.lastUpdated ? Date.now() - value.lastUpdated : null
+    }));
+
+    res.json({
+        version: RELEASE_VERSION,
+        uptime: process.uptime(),
+        memory: process.memoryUsage(),
+        cache: {
+            channels: Object.values(memoryCache.channelItems).reduce((sum, list) => sum + list.length, 0),
+            hlsEntries: hlsEntries.length,
+            segmentEntries: Object.keys(memoryCache.segmentData).length,
+            segmentCacheBytes: memoryCache.segmentCacheBytes,
+            segmentCacheBytesHuman: formatBytes(memoryCache.segmentCacheBytes),
+            liveBuffers: liveBuffers.length,
+            prefetchActive: memoryCache.segmentPrefetchActive,
+            prefetchQueue: memoryCache.segmentPrefetchQueue.length
+        },
+        hlsEntries,
+        liveBuffers,
+        playbackStates: memoryCache.playbackStates,
+        activeSessions: memoryCache.activeSessions
+    });
 });
 
 app.get("/:base64Config/debug", async (req, res) => {
@@ -2020,51 +2057,45 @@ app.get("/:base64Config/debug", async (req, res) => {
         const channels = await getChannelsFromCache(configKey, config);
         
         const debugInfo = {
-            config: config,
-            totalChannels: channels.length,
-            sampleChannels: channels.slice(0, 3),
-            uniqueGroups: [...new Set(channels.map(c => c.group))],
-            uniqueSourceNames: [...new Set(channels.map(c => c.sourceName))],
-            configuredLists: getConfiguredLists(config),
-            cacheInfo: {
+            config: {
+                hasUrl: !!config.u,
+                hasMultiLists: Array.isArray(config.l),
+                listCount: getConfiguredLists(config).length,
+                groupMode: config.gm,
+                selectedGroups: config.g
+            },
+            cache: {
+                hasChannels: !!memoryCache.channelItems[configKey],
+                channelCount: channels.length,
                 lastUpdate: memoryCache.lastUpdate[configKey],
                 isUpdating: memoryCache.isUpdating[configKey],
-                hlsCacheKeys: Object.keys(memoryCache.hlsData).length,
-                hlsInflightKeys: Object.keys(memoryCache.hlsInflight).length,
-                liveBufferKeys: Object.keys(memoryCache.liveBuffers).length,
-                segmentCacheKeys: Object.keys(memoryCache.segmentData).length,
-                segmentCacheBytes: memoryCache.segmentCacheBytes,
-                segmentPrefetchActive: memoryCache.segmentPrefetchActive,
-                segmentPrefetchQueue: memoryCache.segmentPrefetchQueue.length,
-                activeSessions: Object.values(memoryCache.activeSessions).map(session => ({
-                    channelName: session.channelName,
-                    channelId: session.channelId,
-                    startedAt: session.startedAt,
-                    lastSeenAt: session.lastSeenAt
-                })),
-                playbackStates: Object.entries(memoryCache.playbackStates).map(([key, state]) => ({
-                    key,
-                    ok: state.ok,
-                    slow: state.slow,
-                    errors: state.errors,
-                    possibleBuffering: state.possibleBuffering,
-                    lastSegmentAt: state.lastSegmentAt
-                })),
-                streamStates: Object.entries(memoryCache.streamStates).map(([key, state]) => ({
-                    key,
-                    status: state.status,
-                    readyAt: state.readyAt,
-                    lastError: state.lastError
-                }))
+                hasInflight: !!memoryCache.channelInflight[configKey]
             },
-            hlsSettings: {
-                HLS_REFRESH_TTL,
-                HLS_MASTER_REFRESH_TTL,
-                HLS_STALE_TTL,
-                HLS_REQUEST_TIMEOUT,
-                STREAM_ACQUIRE_TIMEOUT,
+            sampleChannels: channels.slice(0, 5).map(ch => ({
+                id: ch.id,
+                name: ch.name,
+                group: ch.group,
+                sourceName: ch.sourceName,
+                hasUrl: !!ch.url,
+                hasLogo: !!ch.logo
+            })),
+            groups: [...new Set(channels.map(ch => ch.group))].slice(0, 50),
+            hls: Object.entries(memoryCache.hlsData).map(([key, value]) => ({
+                key,
+                ageMs: Date.now() - value.updatedAt,
+                info: value.info,
+                reason: value.reason
+            })),
+            liveBuffers: Object.entries(memoryCache.liveBuffers).map(([key, value]) => ({
+                key,
+                size: value.segments?.length || 0,
+                cachedSeconds: Math.round(getCachedDurationForSegments(value.segments || [])),
+                lastUpdatedMs: value.lastUpdated ? Date.now() - value.lastUpdated : null
+            })),
+            constants: {
+                ADDON_TYPE,
+                RELEASE_VERSION,
                 STREAM_PREBUFFER_SECONDS,
-                STREAM_PREBUFFER_TIMEOUT,
                 DYNAMIC_BUFFER_TARGET_SECONDS,
                 DYNAMIC_BUFFER_MAX_SECONDS,
                 LIVE_BUFFER_SEGMENTS,
