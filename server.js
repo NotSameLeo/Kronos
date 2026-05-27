@@ -64,9 +64,11 @@ function safeConfigForLog(config) {
 function sanitizeUrlForLog(value) {
     try {
         const url = new URL(value);
+
         if (url.searchParams.has("api_password")) {
             url.searchParams.set("api_password", "***");
         }
+
         return url.toString();
     } catch (err) {
         return String(value || "").replace(/api_password=[^&]+/g, "api_password=***");
@@ -213,16 +215,33 @@ function addProxyPassword(proxy, config) {
     }
 }
 
+function isMediaFlowProxy(config) {
+    const value = String(config.p || "").toLowerCase();
+
+    return (
+        value.includes("mfp") ||
+        value.includes("mediaflow") ||
+        value.includes(":8888")
+    );
+}
+
 function getResolverPlaylistUrl(config, sourceUrl) {
     if (!config.p) return sourceUrl;
 
     const proxy = new URL(config.p);
     const cleanPath = proxy.pathname.replace(/\/$/, "");
 
+    if (isMediaFlowProxy(config)) {
+        proxy.pathname = `${cleanPath}/proxy/hls/manifest.m3u8`;
+        proxy.search = "";
+        proxy.searchParams.set("d", sourceUrl);
+        addProxyPassword(proxy, config);
+        return proxy.toString();
+    }
+
     proxy.pathname = `${cleanPath}/playlist`;
     proxy.search = "";
     proxy.searchParams.set("url", sourceUrl);
-
     addProxyPassword(proxy, config);
 
     return proxy.toString();
@@ -236,10 +255,17 @@ function getStreamFetchUrl(config, sourceUrl) {
             const proxy = new URL(config.p);
             const cleanPath = proxy.pathname.replace(/\/$/, "");
 
+            if (isMediaFlowProxy(config)) {
+                proxy.pathname = `${cleanPath}/proxy/hls/manifest.m3u8`;
+                proxy.search = "";
+                proxy.searchParams.set("d", sourceUrl);
+                addProxyPassword(proxy, config);
+                return proxy.toString();
+            }
+
             proxy.pathname = `${cleanPath}/proxy/manifest.m3u8`;
             proxy.search = "";
             proxy.searchParams.set("url", sourceUrl);
-
             addProxyPassword(proxy, config);
 
             return proxy.toString();
@@ -254,7 +280,7 @@ function getStreamFetchUrl(config, sourceUrl) {
 
 function getStreamCacheMode(config, sourceUrl) {
     if (!config.p) return "direct";
-    if (isHlsUrl(sourceUrl)) return "hls";
+    if (isHlsUrl(sourceUrl)) return isMediaFlowProxy(config) ? "mfp-hls" : "hls";
 
     try {
         const source = new URL(sourceUrl);
@@ -267,7 +293,7 @@ function getStreamCacheMode(config, sourceUrl) {
         return "direct";
     }
 
-    return "resolver";
+    return isMediaFlowProxy(config) ? "mfp-resolver" : "resolver";
 }
 
 function getConfiguredLists(config) {
@@ -394,7 +420,7 @@ async function getCachedHLS(cacheKey, sourceUrl, config = {}) {
             timeout: 15000,
             headers: {
                 "User-Agent": "Kronos/1.5.7",
-                "Accept": "application/x-mpegURL, audio/mpegurl, text/plain, */*"
+                "Accept": "application/x-mpegURL, application/vnd.apple.mpegurl, audio/mpegurl, text/plain, */*"
             },
             validateStatus(status) {
                 return status >= 200 && status < 300;
@@ -511,14 +537,12 @@ function getExtraParams(extra) {
 }
 
 function getCatalogSourceName(catalogId) {
-    if (catalogId === "kronos_all") return null;
     if (!String(catalogId || "").startsWith("kronos_list_")) return null;
 
     return Buffer.from(catalogId.replace("kronos_list_", ""), "hex").toString("utf8");
 }
 
 function toCatalogId(name) {
-    if (name === "TUTTI") return "kronos_all";
     return `kronos_list_${Buffer.from(name).toString("hex")}`;
 }
 
@@ -757,10 +781,9 @@ app.get("/:base64Config/manifest.json", async (req, res) => {
 
         console.log("[DEBUG] Public host:", host);
 
-        const catalogs = ["TUTTI", ...getConfiguredLists(config).map(list => list.name)].map(listName => {
-            const catalogChannels = listName === "TUTTI"
-                ? channels
-                : channels.filter(channel => channel.sourceName === listName);
+        const catalogs = getConfiguredLists(config).map(list => {
+            const listName = list.name;
+            const catalogChannels = channels.filter(channel => channel.sourceName === listName);
 
             console.log(`[DEBUG] Catalog "${listName}" has ${catalogChannels.length} channels`);
 
@@ -1096,14 +1119,15 @@ app.get("/:base64Config/debug", async (req, res) => {
         const debugInfo = {
             config: safeConfigForLog(config),
             addonType: ADDON_TYPE,
+            proxyType: isMediaFlowProxy(config) ? "mediaflowproxy" : (config.p ? "easyproxy" : "none"),
             totalChannels: channels.length,
             sampleChannels: channels.slice(0, 3),
             uniqueGroups: [...new Set(channels.map(c => c.group))],
             uniqueSourceNames: [...new Set(channels.map(c => c.sourceName))],
             configuredLists: getConfiguredLists(config),
-            manifestCatalogs: ["TUTTI", ...getConfiguredLists(config).map(list => list.name)].map(name => ({
-                id: toCatalogId(name),
-                name,
+            manifestCatalogs: getConfiguredLists(config).map(list => ({
+                id: toCatalogId(list.name),
+                name: list.name,
                 type: ADDON_TYPE
             })),
             cacheInfo: {
