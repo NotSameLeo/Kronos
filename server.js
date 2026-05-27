@@ -1134,6 +1134,26 @@ async function ensureStreamReady(sourceUrl, label = "stream", context = {}) {
             state.status = "ready";
             state.readyAt = Date.now();
             state.lastError = null;
+
+            // After startup, immediately do a background refresh cycle so the cache
+            // is in the optimal state for the player's first actual playlist poll.
+            // This mimics what happens on a "second entry" (exit + re-enter),
+            // which is always instant because the cache is already warm.
+            setImmediate(async () => {
+                try {
+                    await sleep(400);
+                    const hls = await getCachedHLSRaw(sourceUrl);
+                    const buffer = getLiveBuffer(sourceUrl);
+                    if (buffer) {
+                        updateLiveBufferFromPlaylist(sourceUrl, hls.playlist, hls.baseUrl);
+                        queueDynamicPrefetchForBuffer(buffer, { label });
+                    }
+                    console.log(`[STARTUP POST-WARM] channel="${label}" cache refreshed after startup`);
+                } catch (err) {
+                    // non-critical background task
+                }
+            });
+
             return ready;
         } catch (err) {
             if (err.code === "KRONOS_SESSION_CANCELLED") {
