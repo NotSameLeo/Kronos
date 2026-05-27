@@ -45,10 +45,12 @@ const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.3
 const HLS_REFRESH_TTL = Number(process.env.HLS_REFRESH_TTL || 2000);
 const HLS_MASTER_REFRESH_TTL = Number(process.env.HLS_MASTER_REFRESH_TTL || 30000);
 const HLS_STALE_TTL = Number(process.env.HLS_STALE_TTL || 120000);
-const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 12000);
+const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 7000);
 const STREAM_ACQUIRE_TIMEOUT = Number(process.env.STREAM_ACQUIRE_TIMEOUT || 25000);
-const STREAM_ACQUIRE_POLL_MS = Number(process.env.STREAM_ACQUIRE_POLL_MS || 1000);
+const STREAM_ACQUIRE_POLL_MS = Number(process.env.STREAM_ACQUIRE_POLL_MS || 750);
 const STREAM_PREBUFFER_SECONDS = Number(process.env.STREAM_PREBUFFER_SECONDS || 30);
+const STREAM_FAST_START_SECONDS = Number(process.env.STREAM_FAST_START_SECONDS || 20);
+const STREAM_FAST_START_MIN_SEGMENTS = Number(process.env.STREAM_FAST_START_MIN_SEGMENTS || 2);
 const STREAM_PREBUFFER_TIMEOUT = Number(process.env.STREAM_PREBUFFER_TIMEOUT || 70000);
 const DYNAMIC_BUFFER_TARGET_SECONDS = Number(process.env.DYNAMIC_BUFFER_TARGET_SECONDS || 70);
 const DYNAMIC_BUFFER_MAX_SECONDS = Number(process.env.DYNAMIC_BUFFER_MAX_SECONDS || 90);
@@ -66,7 +68,7 @@ const SEGMENT_WAIT_FOR_PREFETCH_MS = Number(process.env.SEGMENT_WAIT_FOR_PREFETC
 const PLAYER_SEGMENT_SLOW_MS = Number(process.env.PLAYER_SEGMENT_SLOW_MS || 2500);
 const PLAYER_SEGMENT_GAP_WARN_MS = Number(process.env.PLAYER_SEGMENT_GAP_WARN_MS || 30000);
 const ADDON_TYPE = "tv";
-const RELEASE_VERSION = "1.6.3";
+const RELEASE_VERSION = "1.6.4";
 
 function decodeConfig(configKey) {
     try {
@@ -370,6 +372,7 @@ function activatePlaybackSession(req, channel) {
     };
 
     memoryCache.activeSessions[key] = session;
+    delete memoryCache.playbackStates[key];
 
     if (previous) {
         cancelSessionWork(previous, `channel-switch:${channelName}`);
@@ -388,8 +391,10 @@ function isSessionActive(session) {
 
 function assertSessionActive(session, label = "stream") {
     if (isSessionActive(session)) return;
-    console.log(`[STARTUP CANCELLED] channel="${label}" reason=channel-switch`);
-    throw createCancelledError(`Cancelled ${label}: another channel became active`);
+    const active = session?.key ? memoryCache.activeSessions[session.key] : null;
+    const reason = active ? `channel-switch:${active.channelName}` : "player-disconnected";
+    console.log(`[STARTUP CANCELLED] channel="${label}" reason=${reason}`);
+    throw createCancelledError(`Cancelled ${label}: ${reason}`);
 }
 
 function cancelSessionWork(session, reason = "inactive-session") {
@@ -667,6 +672,25 @@ async function getCachedHLSRaw(sourceUrl) {
         }
         throw err;
     }
+}
+
+function getStartupCachedHLSRaw(sourceUrl) {
+    const cacheKey = getHLSCacheKey(sourceUrl);
+    const cached = memoryCache.hlsData[cacheKey];
+    const now = Date.now();
+
+    if (!cached?.playlist || now - cached.updatedAt > HLS_STALE_TTL) return null;
+    if (!isValidHLSManifest(cached.playlist)) return null;
+
+    const info = cached.info || analyzeHLSPlaylist(cached.playlist);
+    if (!info.isMaster && info.segmentCount <= 0) return null;
+
+    return {
+        ...cached,
+        info,
+        cacheStatus: "startup-cache-fallback",
+        age: now - cached.updatedAt
+    };
 }
 
 function getSegmentFromCache(sourceUrl) {
@@ -972,6 +996,26 @@ function getCachedDurationForSegments(segments) {
     }, 0);
 }
 
+function getCachedSegmentCountForSegments(segments) {
+    return (segments || []).filter(segment => getCachedSegmentForLogicalSegment(segment)).length;
+}
+
+function getStartupBufferReadiness(segments) {
+    const cachedSeconds = getCachedDurationForSegments(segments);
+    const cachedSegments = getCachedSegmentCountForSegments(segments);
+    const fastStartSeconds = Math.min(STREAM_FAST_START_SECONDS, STREAM_PREBUFFER_SECONDS);
+    const fullReady = cachedSeconds >= STREAM_PREBUFFER_SECONDS;
+    const fastReady = cachedSeconds >= fastStartSeconds && cachedSegments >= STREAM_FAST_START_MIN_SEGMENTS;
+
+    return {
+        cachedSeconds,
+        cachedSegments,
+        fastStartSeconds,
+        ready: fullReady || fastReady,
+        mode: fullReady ? "target" : fastReady ? "fast-start" : "warming"
+    };
+}
+
 function queueDynamicPrefetchForBuffer(buffer, context = {}) {
     if (!buffer?.segments?.length) return;
     if (context.session && !isSessionActive(context.session)) {
@@ -1036,7 +1080,26 @@ async function acquireInitialHLS(sourceUrl, label = "stream", context = {}) {
             lastErr = new Error("Playlist valid but without playable segments");
         } catch (err) {
             lastErr = err;
-            console.error(`[STARTUP PHASE 1 RETRY] channel="${label}" fetch=${fetches} err=${err.message}`);
+            const cached = fetches >= 2 ? getStartupCachedHLSRaw(sourceUrl) : null;
+            if (cached) {
+                assertSessionActive(context.session, label);
+                console.warn(
+                    `[STARTUP PHASE 1 CACHE FALLBACK] channel="${label}"` +
+                    ` fetches=${fetches}` +
+                    ` elapsed=${Date.now() - started}ms` +
+                    ` cachedAge=${cached.age}ms` +
+                    ` lastErr=${err.message}`
+                );
+                return cached;
+            }
+
+            console.error(
+                `[STARTUP PHASE 1 RETRY] channel="${label}"` +
+                ` fetch=${fetches}` +
+                ` elapsed=${Date.now() - started}ms` +
+                ` remaining=${Math.max(0, STREAM_ACQUIRE_TIMEOUT - (Date.now() - started))}ms` +
+                ` err=${err.message}`
+            );
         }
 
         await sleep(Math.min(STREAM_ACQUIRE_POLL_MS, Math.max(0, STREAM_ACQUIRE_TIMEOUT - (Date.now() - started))));
@@ -1052,6 +1115,7 @@ async function prebufferInitialStream(sourceUrl, label = "stream", context = {})
     console.log(
         `[STARTUP PHASE 2] channel="${label}" prebuffering` +
         ` target=${formatSeconds(STREAM_PREBUFFER_SECONDS)}` +
+        ` fastStart=${formatSeconds(Math.min(STREAM_FAST_START_SECONDS, STREAM_PREBUFFER_SECONDS))}/${STREAM_FAST_START_MIN_SEGMENTS}segs` +
         ` timeout=${formatSeconds(STREAM_PREBUFFER_TIMEOUT / 1000)}` +
         ` dynamicTarget=${formatSeconds(DYNAMIC_BUFFER_TARGET_SECONDS)}`
     );
@@ -1072,23 +1136,26 @@ async function prebufferInitialStream(sourceUrl, label = "stream", context = {})
             candidates.forEach(segment => queueSegmentPrefetch(segment.sourceUrl || segment.url, context));
 
             const cachedSeconds = getCachedDurationForSegments(candidates);
+            const readiness = getStartupBufferReadiness(candidates);
             console.log(
                 `[STARTUP PHASE 2 PROGRESS] channel="${label}"` +
                 ` cached=${formatSeconds(cachedSeconds)}/${formatSeconds(STREAM_PREBUFFER_SECONDS)}` +
+                ` cachedSegs=${readiness.cachedSegments}/${candidates.length}` +
                 ` status=${getBufferStatus(cachedSeconds)}` +
                 ` candidateSegs=${candidates.length}` +
                 ` prefetchActive=${memoryCache.segmentPrefetchActive}` +
                 ` prefetchQueue=${memoryCache.segmentPrefetchQueue.length}`
             );
 
-            if (cachedSeconds >= STREAM_PREBUFFER_SECONDS) {
+            if (readiness.ready) {
                 console.log(
                     `[STARTUP COMPLETE] channel="${label}" stream-ready` +
                     ` startBuffer=${formatSeconds(cachedSeconds)}` +
                     ` target=${formatSeconds(STREAM_PREBUFFER_SECONDS)}` +
+                    ` mode=${readiness.mode}` +
                     ` elapsed=${Date.now() - started}ms`
                 );
-                return { status: "ready", cachedSeconds };
+                return { status: "ready", cachedSeconds, mode: readiness.mode };
             }
 
             lastErr = null;
@@ -1121,12 +1188,14 @@ async function ensureStreamReady(sourceUrl, label = "stream", context = {}) {
     }
 
     const buffer = getLiveBuffer(sourceUrl);
-    if (state.status === "ready" && getCachedDurationForSegments(buffer?.segments || []) >= STREAM_PREBUFFER_SECONDS) {
+    const readiness = getStartupBufferReadiness(buffer?.segments || []);
+    if (state.status === "ready" && readiness.ready) {
         assertSessionActive(context.session, label);
         queueDynamicPrefetchForBuffer(buffer, context);
         console.log(
             `[STARTUP REUSE] channel="${label}" ready-cache` +
-            ` cached=${formatSeconds(getCachedDurationForSegments(buffer?.segments || []))}`
+            ` cached=${formatSeconds(readiness.cachedSeconds)}` +
+            ` mode=${readiness.mode}`
         );
         return { status: "ready", reused: true };
     }
@@ -1716,7 +1785,7 @@ app.get("/:base64Config/poster/:id.svg", async (req, res) => {
                 </defs>
                 <rect width="512" height="512" rx="56" fill="url(#bg)"/>
                 <rect x="28" y="28" width="456" height="456" rx="44" fill="rgba(255,255,255,0.05)" stroke="rgba(255,255,255,0.16)"/>
-                <rect x="46" y="58" width="420" height="318" rx="32" fill="#f8fafc"/>
+                <rect x="46" y="58" width="420" height="318" rx="32" fill="#d9e1ea"/>
                 ${logoMarkup}
                 <text x="256" y="424" text-anchor="middle" fill="#f5f7fb" font-family="Arial, sans-serif" font-size="30" font-weight="700">${escapeXml(name.slice(0, 34))}</text>
             </svg>
@@ -2095,7 +2164,12 @@ app.get("/:base64Config/debug", async (req, res) => {
             constants: {
                 ADDON_TYPE,
                 RELEASE_VERSION,
+                HLS_REQUEST_TIMEOUT,
+                STREAM_ACQUIRE_TIMEOUT,
+                STREAM_ACQUIRE_POLL_MS,
                 STREAM_PREBUFFER_SECONDS,
+                STREAM_FAST_START_SECONDS,
+                STREAM_FAST_START_MIN_SEGMENTS,
                 DYNAMIC_BUFFER_TARGET_SECONDS,
                 DYNAMIC_BUFFER_MAX_SECONDS,
                 LIVE_BUFFER_SEGMENTS,
