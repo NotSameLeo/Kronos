@@ -72,7 +72,7 @@ const RELEASE_VERSION = "1.6.3";
 
 const PLACEHOLDER_DIR = path.join(__dirname, "static");
 const PLACEHOLDER_TS_PATH = path.join(PLACEHOLDER_DIR, "black.ts");
-const PLACEHOLDER_SEGMENT_DURATION = Number(process.env.PLACEHOLDER_SEGMENT_DURATION || 2);
+const PLACEHOLDER_SEGMENT_DURATION = Number(process.env.PLACEHOLDER_SEGMENT_DURATION || 1);
 
 function ensurePlaceholderSegment() {
     try {
@@ -93,7 +93,7 @@ function ensurePlaceholderSegment() {
             "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
             "-shortest",
             "-c:v", "libx264", "-profile:v", "main", "-level", "4.0", "-preset", "veryfast",
-            "-pix_fmt", "yuv420p", "-g", "25", "-keyint_min", "25",
+            "-pix_fmt", "yuv420p", "-g", `${Math.max(1, PLACEHOLDER_SEGMENT_DURATION * 25)}`, "-keyint_min", `${Math.max(1, PLACEHOLDER_SEGMENT_DURATION * 25)}`,
             "-c:a", "aac", "-b:a", "64k", "-ar", "48000", "-ac", "2",
             "-f", "mpegts", "-mpegts_flags", "resend_headers+initial_discontinuity",
             PLACEHOLDER_TS_PATH
@@ -1107,10 +1107,12 @@ async function prebufferInitialStream(sourceUrl, label = "stream", context = {})
 
     let lastErr = null;
     let attempt = 0;
+    let lastIterFailed = false;
 
     while (Date.now() - started < STREAM_PREBUFFER_TIMEOUT) {
         assertSessionActive(context.session, label);
         attempt += 1;
+        lastIterFailed = false;
 
         try {
             const hls = await fetchAndStoreHLSRaw(getHLSCacheKey(sourceUrl), sourceUrl, "prebuffer");
@@ -1144,13 +1146,16 @@ async function prebufferInitialStream(sourceUrl, label = "stream", context = {})
         } catch (err) {
             if (err.code === "KRONOS_SESSION_CANCELLED") throw err;
             lastErr = err;
+            lastIterFailed = true;
             console.warn(
                 `[STARTUP PHASE 2 RETRY] channel="${label}" attempt=${attempt}` +
                 ` err=${err.message} elapsed=${Date.now() - started}ms - continuing until timeout`
             );
         }
 
-        await sleep(700);
+        // Shorter back-off on transient upstream failures so we don't waste 700ms
+        // between every 502; normal polling cadence stays at 700ms.
+        await sleep(lastIterFailed ? 250 : 700);
         assertSessionActive(context.session, label);
     }
 
@@ -1979,24 +1984,35 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         let discontinuitySeq = 0;
 
         if (state) {
-            const minRequiredFirst = (state.maxServedSeq || 0) + 1;
-            const transitioning = state.placeholderActive === true;
-            const currentOffset = state.realOffset || 0;
-            const wouldRegress = (upstreamFirstSeq + currentOffset) < minRequiredFirst;
-
-            if (transitioning || wouldRegress || !state.realOffset) {
-                state.realOffset = Math.max(0, minRequiredFirst - upstreamFirstSeq);
-                if (transitioning) {
-                    state.discontinuitySeq = (state.discontinuitySeq || 0) + 1;
-                    console.log(
-                        `[HLS TRANSITION] channel="${c.name}"` +
-                        ` lastPlaceholderSeq=${state.maxServedSeq}` +
-                        ` upstreamFirstSeq=${upstreamFirstSeq}` +
-                        ` offset=${state.realOffset}` +
-                        ` discontinuitySeq=${state.discontinuitySeq}`
-                    );
-                }
+            // Offset is computed ONCE at the placeholder→real boundary and stays
+            // sticky for the rest of the session. Recomputing later would relabel
+            // segments the player has already cached under different sequence
+            // numbers, causing redundant re-downloads and massive buffer
+            // accumulation (the exact symptom the user reported as "40+ seconds
+            // of black after prebuffer done").
+            if (state.placeholderActive === true) {
+                state.realOffset = Math.max(0, ((state.maxServedSeq || 0) + 1) - upstreamFirstSeq);
+                state.discontinuitySeq = (state.discontinuitySeq || 0) + 1;
                 state.placeholderActive = false;
+                console.log(
+                    `[HLS TRANSITION] channel="${c.name}"` +
+                    ` lastPlaceholderSeq=${state.maxServedSeq}` +
+                    ` upstreamFirstSeq=${upstreamFirstSeq}` +
+                    ` offset=${state.realOffset}` +
+                    ` discontinuitySeq=${state.discontinuitySeq}`
+                );
+            } else if (state.realOffset == null) {
+                // No prior placeholder phase ever happened; serve upstream as-is.
+                state.realOffset = 0;
+            } else if (upstreamFirstSeq + state.realOffset < 0) {
+                // Defensive: upstream must have regressed substantially. Rebase
+                // the offset and bump discontinuity so the player resets cleanly.
+                state.realOffset = Math.max(0, ((state.maxServedSeq || 0) + 1) - upstreamFirstSeq);
+                state.discontinuitySeq = (state.discontinuitySeq || 0) + 1;
+                console.warn(
+                    `[HLS REBASE] channel="${c.name}" upstream regression detected,` +
+                    ` newOffset=${state.realOffset} discontinuitySeq=${state.discontinuitySeq}`
+                );
             }
 
             mediaSeqOffset = state.realOffset || 0;
