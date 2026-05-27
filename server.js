@@ -51,6 +51,8 @@ const memoryCache = {
         liveBuffer: {
             playlistsBuilt: 0,
             segmentsStored: 0,
+            segmentsUpdated: 0,
+            segmentsDeduped: 0,
             prefetchQueued: 0
         },
         startup: {
@@ -58,6 +60,7 @@ const memoryCache = {
             acquiring: 0,
             ready: 0,
             failed: 0,
+            cancelled: 0,
             reusedReady: 0,
             waitedExisting: 0
         },
@@ -144,7 +147,7 @@ const SEGMENT_PREFETCH_AHEAD = Number(process.env.SEGMENT_PREFETCH_AHEAD || 8);
 const SEGMENT_WAIT_FOR_PREFETCH_MS = Number(process.env.SEGMENT_WAIT_FOR_PREFETCH_MS || 2500);
 
 const ADDON_TYPE = "tv";
-const RELEASE_VERSION = "1.6.5";
+const RELEASE_VERSION = "1.6.6";
 
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
@@ -230,6 +233,53 @@ function isLiveMediaPlaylistInfo(info) {
     return Boolean(info && info.isLive && !info.isMaster);
 }
 
+function makeStartupCancelToken(sourceUrl, label = "stream") {
+    return {
+        sourceUrl,
+        label,
+        cacheKey: getHLSCacheKey(sourceUrl),
+        createdAt: Date.now(),
+        cancelled: false,
+        reason: null
+    };
+}
+
+function cancelStartupToken(token, reason = "cancelled") {
+    if (!token || token.cancelled) return;
+    token.cancelled = true;
+    token.reason = reason;
+}
+
+function throwIfStartupCancelled(token) {
+    if (token?.cancelled) {
+        const err = new Error(`Startup cancelled: ${token.reason || "cancelled"}`);
+        err.cancelled = true;
+        throw err;
+    }
+}
+
+function cancelOtherStartupStreams(currentCacheKey, label = "stream") {
+    Object.entries(memoryCache.streamStates || {}).forEach(([cacheKey, state]) => {
+        if (cacheKey === currentCacheKey) return;
+        if (!state || !state.promise) return;
+        if (!["acquiring", "prebuffering", "idle"].includes(state.status)) return;
+
+        if (state.cancelToken) {
+            cancelStartupToken(state.cancelToken, `new stream requested: ${label}`);
+        }
+
+        state.status = "cancelled";
+        state.updatedAt = Date.now();
+        state.lastError = `Cancelled because another stream was requested: ${label}`;
+
+        console.log(`[STREAM CANCEL REQUEST] previous=${cacheKey} new="${label}"`);
+    });
+}
+
+function isStartupCancelledError(err) {
+    return Boolean(err?.cancelled || String(err?.message || "").startsWith("Startup cancelled:"));
+}
+
 function normalizeHeaderLineToAbsolute(line, baseUrl) {
     const trimmed = String(line || "").trim();
 
@@ -245,6 +295,137 @@ function normalizeHeaderLineToAbsolute(line, baseUrl) {
     }
 
     return toAbsoluteUrl(trimmed, baseUrl);
+}
+
+function extractSegmentIdentityFromUrl(value) {
+    try {
+        const url = new URL(value);
+        const pathname = decodeURIComponent(url.pathname || "");
+        const filename = pathname.split("/").filter(Boolean).pop() || "";
+        const cleanFilename = filename.split("?")[0].split("#")[0];
+
+        // Common IPTV/HLS form: channel_123.ts
+        const numbered = cleanFilename.match(/(?:^|[_-])(\d+)\.(?:ts|m4s|mp4|aac|mp3)$/i);
+        if (numbered) return `file:${numbered[1]}`;
+
+        if (cleanFilename) return `file:${cleanFilename.toLowerCase()}`;
+    } catch (err) {
+        const raw = String(value || "");
+        const filename = raw.split("?")[0].split("#")[0].split("/").filter(Boolean).pop() || "";
+        const numbered = filename.match(/(?:^|[_-])(\d+)\.(?:ts|m4s|mp4|aac|mp3)$/i);
+        if (numbered) return `file:${numbered[1]}`;
+        if (filename) return `file:${filename.toLowerCase()}`;
+    }
+
+    return null;
+}
+
+function getSegmentLogicalKey(segment) {
+    if (!segment) return null;
+    if (Number.isFinite(segment.sequence)) return `seq:${segment.sequence}`;
+
+    const identity = extractSegmentIdentityFromUrl(segment.url);
+    if (identity) return identity;
+
+    return segment.url ? `url:${hashKey(segment.url)}` : null;
+}
+
+function cloneSegmentWithLogicalKey(segment) {
+    const logicalKey = getSegmentLogicalKey(segment);
+    return {
+        ...segment,
+        logicalKey
+    };
+}
+
+function shouldResetLiveBufferForParsedSegments(buffer, parsed) {
+    if (!buffer || !Array.isArray(buffer.segments) || buffer.segments.length === 0) return false;
+    if (!parsed || !Array.isArray(parsed.segments) || parsed.segments.length === 0) return false;
+
+    const existingSequences = buffer.segments
+        .map(segment => segment.sequence)
+        .filter(Number.isFinite);
+
+    const parsedSequences = parsed.segments
+        .map(segment => segment.sequence)
+        .filter(Number.isFinite);
+
+    if (existingSequences.length === 0 || parsedSequences.length === 0) return false;
+
+    const existingMax = Math.max(...existingSequences);
+    const parsedMax = Math.max(...parsedSequences);
+
+    // Some providers reset #EXT-X-MEDIA-SEQUENCE to 0 when a stream/session is rebuilt.
+    // If that happens, clear the old logical sequence map; otherwise seq:0 from a new session
+    // would collide with seq:0 from the old session.
+    return parsedMax + 3 < existingMax;
+}
+
+function getCachedSegmentForLogicalSegment(segment) {
+    if (!segment) return null;
+
+    const urls = [
+        segment.url,
+        segment.cacheUrl,
+        ...(Array.isArray(segment.altUrls) ? segment.altUrls : [])
+    ].filter(Boolean);
+
+    for (const url of urls) {
+        const cached = getSegmentFromCache(url);
+        if (cached) return cached;
+    }
+
+    return null;
+}
+
+function getBestUrlForLogicalSegment(existingSegment, incomingSegment) {
+    if (incomingSegment?.url && getSegmentFromCache(incomingSegment.url)) {
+        return incomingSegment.url;
+    }
+
+    if (existingSegment?.url && getSegmentFromCache(existingSegment.url)) {
+        return existingSegment.url;
+    }
+
+    if (existingSegment?.cacheUrl && getSegmentFromCache(existingSegment.cacheUrl)) {
+        return existingSegment.cacheUrl;
+    }
+
+    if (Array.isArray(existingSegment?.altUrls)) {
+        const cachedAlt = existingSegment.altUrls.find(url => getSegmentFromCache(url));
+        if (cachedAlt) return cachedAlt;
+    }
+
+    return incomingSegment?.url || existingSegment?.url || existingSegment?.cacheUrl || null;
+}
+
+function mergeLogicalSegment(existingSegment, incomingSegment) {
+    const now = Date.now();
+    const altUrls = new Set();
+
+    [existingSegment?.url, existingSegment?.cacheUrl, incomingSegment?.url]
+        .filter(Boolean)
+        .forEach(url => altUrls.add(url));
+
+    if (Array.isArray(existingSegment?.altUrls)) {
+        existingSegment.altUrls.filter(Boolean).forEach(url => altUrls.add(url));
+    }
+
+    const bestUrl = getBestUrlForLogicalSegment(existingSegment, incomingSegment);
+    const useIncomingLines = bestUrl === incomingSegment?.url || !existingSegment?.lines;
+
+    return {
+        ...(existingSegment || {}),
+        ...incomingSegment,
+        url: bestUrl,
+        cacheUrl: getCachedSegmentForLogicalSegment(existingSegment)?.url || getCachedSegmentForLogicalSegment(incomingSegment)?.url || existingSegment?.cacheUrl || incomingSegment?.url || bestUrl,
+        lines: useIncomingLines ? incomingSegment.lines : existingSegment.lines,
+        duration: incomingSegment.duration || existingSegment?.duration || 0,
+        firstSeenAt: existingSegment?.firstSeenAt || incomingSegment.firstSeenAt || now,
+        lastSeenAt: now,
+        altUrls: [...altUrls].slice(-6),
+        logicalKey: incomingSegment.logicalKey || existingSegment?.logicalKey || getSegmentLogicalKey(incomingSegment)
+    };
 }
 
 function parseHLSMediaPlaylist(playlist, baseUrl) {
@@ -568,12 +749,12 @@ function selectBufferedSegments(buffer, options = {}) {
 }
 
 function getCachedCountForSegments(segments) {
-    return (segments || []).filter(segment => getSegmentFromCache(segment.url)).length;
+    return (segments || []).filter(segment => getCachedSegmentForLogicalSegment(segment)).length;
 }
 
 function getCachedDurationForSegments(segments) {
     return (segments || []).reduce((sum, segment) => {
-        return sum + (getSegmentFromCache(segment.url) ? (Number(segment.duration) || 0) : 0);
+        return sum + (getCachedSegmentForLogicalSegment(segment) ? (Number(segment.duration) || 0) : 0);
     }, 0);
 }
 
@@ -606,13 +787,14 @@ function selectSegmentsUntilSeconds(segments, targetSeconds, maxSegments = SEGME
     return selected;
 }
 
-async function waitForCachedBufferSeconds(segments, minSeconds, minSegments, maxWaitMs, label = "startup") {
+async function waitForCachedBufferSeconds(segments, minSeconds, minSegments, maxWaitMs, label = "startup", cancelToken = null) {
     const uniqueSegments = [];
     const seen = new Set();
 
     (segments || []).forEach(segment => {
-        if (!segment?.url || seen.has(segment.url)) return;
-        seen.add(segment.url);
+        const key = segment?.logicalKey || getSegmentLogicalKey(segment) || segment?.url;
+        if (!segment?.url || seen.has(key)) return;
+        seen.add(key);
         uniqueSegments.push(segment);
     });
 
@@ -621,6 +803,8 @@ async function waitForCachedBufferSeconds(segments, minSeconds, minSegments, max
     const started = Date.now();
 
     while (Date.now() - started <= maxWaitMs) {
+        throwIfStartupCancelled(cancelToken);
+
         const cachedCount = getCachedCountForSegments(uniqueSegments);
         const cachedSeconds = getCachedDurationForSegments(uniqueSegments);
 
@@ -657,7 +841,7 @@ function queueDynamicPrefetchForBuffer(buffer, label = "stream") {
     }
 
     const uncachedSegments = buffer.segments
-        .filter(segment => !getSegmentFromCache(segment.url))
+        .filter(segment => !getCachedSegmentForLogicalSegment(segment))
         .slice(-Math.max(1, SEGMENT_PREFETCH_AHEAD));
 
     const neededSeconds = Math.max(0, DYNAMIC_BUFFER_TARGET_SECONDS - cachedSeconds);
@@ -707,7 +891,7 @@ function buildPlaylistFromBufferedSegments(buffer, selectedSegments, effectiveDe
     ].join("\n") + "\n";
 }
 
-async function acquireInitialHLS(sourceUrl, label = "stream") {
+async function acquireInitialHLS(sourceUrl, label = "stream", cancelToken = null) {
     const cacheKey = getHLSCacheKey(sourceUrl);
     const started = Date.now();
     let fetches = 0;
@@ -716,10 +900,13 @@ async function acquireInitialHLS(sourceUrl, label = "stream") {
     console.log(`[STREAM ACQUIRE] channel="${label}" timeout=${STREAM_ACQUIRE_TIMEOUT}ms`);
 
     while (Date.now() - started < STREAM_ACQUIRE_TIMEOUT) {
+        throwIfStartupCancelled(cancelToken);
         fetches += 1;
 
         try {
             const hls = await fetchAndStoreHLSRaw(cacheKey, sourceUrl, "acquire");
+            throwIfStartupCancelled(cancelToken);
+
             const info = hls.info || analyzeHLSPlaylist(hls.playlist);
 
             if (isLiveMediaPlaylistInfo(info) && info.segmentCount > 0) {
@@ -746,18 +933,21 @@ async function acquireInitialHLS(sourceUrl, label = "stream") {
 
             lastErr = new Error("Playlist valid but without playable segments");
         } catch (err) {
+            if (isStartupCancelledError(err)) throw err;
             lastErr = err;
             console.error(`[STREAM ACQUIRE ERROR] channel="${label}" fetch=${fetches} err=${err.message}`);
         }
 
         const remaining = STREAM_ACQUIRE_TIMEOUT - (Date.now() - started);
-        if (remaining > 0) await sleep(Math.min(STREAM_ACQUIRE_POLL_MS, remaining));
+        if (remaining > 0) {
+            await sleep(Math.min(STREAM_ACQUIRE_POLL_MS, remaining));
+        }
     }
 
     throw new Error(lastErr ? `Acquire failed: ${lastErr.message}` : "Acquire failed: timeout");
 }
 
-async function prebufferInitialStream(sourceUrl, label = "stream") {
+async function prebufferInitialStream(sourceUrl, label = "stream", cancelToken = null) {
     const cacheKey = getHLSCacheKey(sourceUrl);
     const started = Date.now();
 
@@ -767,8 +957,12 @@ async function prebufferInitialStream(sourceUrl, label = "stream") {
     );
 
     while (Date.now() - started < STREAM_PREBUFFER_TIMEOUT) {
+        throwIfStartupCancelled(cancelToken);
+
         const hls = await fetchAndStoreHLSRaw(cacheKey, sourceUrl, "prebuffer");
-        const buffered = updateLiveBufferFromPlaylist(sourceUrl, hls.playlist, hls.baseUrl, {
+        throwIfStartupCancelled(cancelToken);
+
+        updateLiveBufferFromPlaylist(sourceUrl, hls.playlist, hls.baseUrl, {
             minOutputSegments: 1,
             maxPlaylistSegments: LIVE_PLAYLIST_SEGMENTS,
             delaySegments: 0,
@@ -793,8 +987,11 @@ async function prebufferInitialStream(sourceUrl, label = "stream") {
             STREAM_PREBUFFER_START_SECONDS,
             STREAM_PREBUFFER_START_MIN_SEGMENTS,
             Math.min(3500, Math.max(500, STREAM_PREBUFFER_TIMEOUT - (Date.now() - started))),
-            label
+            label,
+            cancelToken
         );
+
+        throwIfStartupCancelled(cancelToken);
 
         const totalDuration = getSegmentDurationSum(selection.segments);
         const cachedSeconds = getCachedDurationForSegments(selection.segments);
@@ -832,12 +1029,18 @@ async function prebufferInitialStream(sourceUrl, label = "stream") {
     throw new Error(`Prebuffer failed: cached less than ${STREAM_PREBUFFER_START_SECONDS}s after ${Date.now() - started}ms`);
 }
 
-async function ensureStreamPrebuffered(sourceUrl, label = "stream") {
+async function ensureStreamPrebuffered(sourceUrl, label = "stream", cancelToken = null, options = {}) {
     if (!STREAM_STARTUP_PREBUFFER_ENABLED) {
         return { skipped: true };
     }
 
     const cacheKey = getHLSCacheKey(sourceUrl);
+    const shouldCancelOthers = options.cancelOthers !== false;
+
+    if (shouldCancelOthers) {
+        cancelOtherStartupStreams(cacheKey, label);
+    }
+
     let state = memoryCache.streamStates[cacheKey];
 
     if (!state) {
@@ -847,7 +1050,8 @@ async function ensureStreamPrebuffered(sourceUrl, label = "stream") {
             updatedAt: Date.now(),
             readyAt: 0,
             promise: null,
-            lastError: null
+            lastError: null,
+            cancelToken: null
         };
         memoryCache.streamStates[cacheKey] = state;
     }
@@ -886,11 +1090,14 @@ async function ensureStreamPrebuffered(sourceUrl, label = "stream") {
         return state.promise;
     }
 
+    const effectiveToken = cancelToken || makeStartupCancelToken(sourceUrl, label);
+
     memoryCache.stats.startup.requested += 1;
 
     state.status = "acquiring";
     state.updatedAt = Date.now();
     state.lastError = null;
+    state.cancelToken = effectiveToken;
 
     state.promise = (async () => {
         const started = Date.now();
@@ -898,17 +1105,22 @@ async function ensureStreamPrebuffered(sourceUrl, label = "stream") {
         try {
             memoryCache.stats.startup.acquiring += 1;
 
-            await acquireInitialHLS(sourceUrl, label);
+            throwIfStartupCancelled(effectiveToken);
+            await acquireInitialHLS(sourceUrl, label, effectiveToken);
 
             state.status = "prebuffering";
             state.updatedAt = Date.now();
 
-            const ready = await prebufferInitialStream(sourceUrl, label);
+            throwIfStartupCancelled(effectiveToken);
+            const ready = await prebufferInitialStream(sourceUrl, label, effectiveToken);
+
+            throwIfStartupCancelled(effectiveToken);
 
             state.status = "ready";
             state.readyAt = Date.now();
             state.updatedAt = Date.now();
             state.lastError = null;
+            state.cancelToken = null;
             memoryCache.stats.startup.ready += 1;
 
             return {
@@ -916,9 +1128,24 @@ async function ensureStreamPrebuffered(sourceUrl, label = "stream") {
                 totalStartupMs: Date.now() - started
             };
         } catch (err) {
+            if (isStartupCancelledError(err)) {
+                state.status = "cancelled";
+                state.updatedAt = Date.now();
+                state.lastError = err.message;
+                state.cancelToken = null;
+                memoryCache.stats.startup.cancelled += 1;
+
+                console.log(
+                    `[STREAM CANCELLED] channel="${label}" total=${Date.now() - started}ms reason=${err.message}`
+                );
+
+                throw err;
+            }
+
             state.status = "failed";
             state.updatedAt = Date.now();
             state.lastError = err.message;
+            state.cancelToken = null;
             memoryCache.stats.startup.failed += 1;
 
             console.error(
@@ -933,6 +1160,9 @@ async function ensureStreamPrebuffered(sourceUrl, label = "stream") {
         return await state.promise;
     } finally {
         state.promise = null;
+        if (state.cancelToken === effectiveToken) {
+            state.cancelToken = null;
+        }
     }
 }
 
@@ -946,34 +1176,61 @@ function updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl, options = {}
 
     let buffer = memoryCache.liveBuffers[cacheKey];
 
-    if (!buffer) {
+    if (!buffer || shouldResetLiveBufferForParsedSegments(buffer, parsed)) {
+        if (buffer) {
+            console.log(
+                `[LIVE BUFFER RESET] channel="${options.label || "stream"}"` +
+                ` old=${buffer.segments?.length || 0} newSeq=${parsed.info.mediaSequence}`
+            );
+        }
+
         buffer = {
             headerLines: [],
             segments: [],
             segmentMap: {},
-            lastUpdated: 0
+            lastUpdated: 0,
+            lastMediaSequence: null
         };
         memoryCache.liveBuffers[cacheKey] = buffer;
     }
 
     buffer.headerLines = parsed.headerLines;
     buffer.lastUpdated = Date.now();
+    buffer.lastMediaSequence = parsed.info.mediaSequence;
 
-    parsed.segments.forEach(segment => {
-        const key = `${segment.sequence}:${segment.url}`;
+    parsed.segments.forEach(rawSegment => {
+        const segment = cloneSegmentWithLogicalKey(rawSegment);
+        const key = segment.logicalKey;
 
-        if (!buffer.segmentMap[key]) {
+        if (!key) return;
+
+        const existing = buffer.segmentMap[key];
+
+        if (!existing) {
             buffer.segmentMap[key] = {
                 ...segment,
                 firstSeenAt: Date.now(),
-                lastSeenAt: Date.now()
+                lastSeenAt: Date.now(),
+                altUrls: [segment.url].filter(Boolean)
             };
             buffer.segments.push(buffer.segmentMap[key]);
             memoryCache.stats.liveBuffer.segmentsStored += 1;
         } else {
-            buffer.segmentMap[key].lastSeenAt = Date.now();
-            buffer.segmentMap[key].duration = segment.duration || buffer.segmentMap[key].duration;
-            buffer.segmentMap[key].lines = segment.lines || buffer.segmentMap[key].lines;
+            const beforeUrl = existing.url;
+            const merged = mergeLogicalSegment(existing, segment);
+
+            Object.keys(existing).forEach(k => delete existing[k]);
+            Object.assign(existing, merged);
+
+            memoryCache.stats.liveBuffer.segmentsUpdated += 1;
+
+            if (beforeUrl && segment.url && beforeUrl !== segment.url) {
+                memoryCache.stats.liveBuffer.segmentsDeduped += 1;
+                console.log(
+                    `[LIVE DEDUPE] channel="${options.label || "stream"}"` +
+                    ` key=${key} keeping=${sanitizeUrlForLog(existing.url)} incoming=${sanitizeUrlForLog(segment.url)}`
+                );
+            }
         }
     });
 
@@ -983,7 +1240,10 @@ function updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl, options = {}
 
     buffer.segmentMap = {};
     buffer.segments.forEach(segment => {
-        buffer.segmentMap[`${segment.sequence}:${segment.url}`] = segment;
+        const key = segment.logicalKey || getSegmentLogicalKey(segment);
+        if (!key) return;
+        segment.logicalKey = key;
+        buffer.segmentMap[key] = segment;
     });
 
     const selection = selectBufferedSegments(buffer, {
@@ -996,7 +1256,9 @@ function updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl, options = {}
 
     // Always make sure the visible playlist is being cached, but do not over-prefetch
     // beyond the dynamic target/max buffer.
-    selection.segments.forEach(segment => queueSegmentPrefetch(segment.url));
+    selection.segments.forEach(segment => {
+        if (!getCachedSegmentForLogicalSegment(segment)) queueSegmentPrefetch(segment.url);
+    });
 
     if (!selection.segments.length) {
         return { playlist, info: parsed.info, cacheKey, buffered: false };
@@ -1522,6 +1784,51 @@ function normalizeGroupName(group) {
     return String(group || "").trim().toLowerCase();
 }
 
+function normalizeSearchText(value) {
+    return String(value || "")
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .toLowerCase()
+        .replace(/&/g, " e ")
+        .replace(/[^a-z0-9]+/gi, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function getChannelSearchText(channel) {
+    const fields = [
+        channel.name,
+        channel.group,
+        channel.sourceName,
+        channel.tvgId,
+        channel.description
+    ].filter(Boolean);
+
+    const normalized = normalizeSearchText(fields.join(" "));
+    const compact = normalized.replace(/\s+/g, "");
+
+    return { normalized, compact };
+}
+
+function matchesChannelSearch(channel, rawQuery) {
+    const query = normalizeSearchText(rawQuery);
+    if (!query) return true;
+
+    const { normalized, compact } = getChannelSearchText(channel);
+    const compactQuery = query.replace(/\s+/g, "");
+
+    if (normalized.includes(query)) return true;
+    if (compact.includes(compactQuery)) return true;
+
+    const tokens = query.split(" ").filter(Boolean);
+    if (tokens.length === 0) return true;
+
+    // Robust Stremio search: exact full-string matching can be flaky when the UI
+    // sends spaces/numbers/punctuation differently. Token matching keeps "Canali 2"
+    // discoverable even if the search payload is slightly normalized.
+    return tokens.every(token => normalized.includes(token));
+}
+
 function getExtraParams(extra) {
     const params = {};
     if (!extra) return params;
@@ -1803,19 +2110,22 @@ async function catalogResponse(req, res) {
         const extraParams = getExtraParams(req.params.extra);
         const targetGroup = extraParams.genre || null;
         const targetSource = getCatalogSourceName(req.params.id);
-        const searchQuery = extraParams.search ? String(extraParams.search).toLowerCase().trim() : null;
+        const searchQuery = extraParams.search ? String(extraParams.search).trim() : null;
         const host = getPublicHost(req);
 
         const filteredChannels = sortChannelsByName(channels.filter(channel => {
             const matchesSource = targetSource ? channel.sourceName === targetSource : true;
             const matchesGroup = targetGroup ? normalizeGroupName(channel.group) === normalizeGroupName(targetGroup) : true;
-            const haystack = [channel.name, channel.group, channel.sourceName, channel.description]
-                .filter(Boolean)
-                .join(" ")
-                .toLowerCase();
-            const matchesSearch = searchQuery ? haystack.includes(searchQuery) : true;
+            const matchesSearch = matchesChannelSearch(channel, searchQuery);
             return matchesSource && matchesGroup && matchesSearch;
         }));
+
+        console.log(
+            `[CATALOG] id=${req.params.id}` +
+            `${searchQuery ? ` search="${searchQuery}"` : ""}` +
+            `${targetGroup ? ` genre="${targetGroup}"` : ""}` +
+            ` results=${filteredChannels.length}/${channels.length}`
+        );
 
         const metas = filteredChannels.map(c => toMeta(c, host, configKey, config));
         res.json({ metas });
@@ -1889,6 +2199,8 @@ app.get("/:base64Config/poster/:id.svg", async (req, res) => {
 
 // Main HLS entry point: fetch source manifest, rewrite all URLs through Kronos
 app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
+    let startupToken = null;
+
     try {
         const configKey = req.params.base64Config;
         const config = decodeConfig(configKey);
@@ -1896,8 +2208,15 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         if (!c) return res.status(404).send("#EXTM3U\n");
 
         const host = getPublicHost(req);
+        startupToken = makeStartupCancelToken(c.url, c.name);
 
-        await ensureStreamPrebuffered(c.url, c.name);
+        req.on("close", () => {
+            if (!res.writableEnded && startupToken) {
+                cancelStartupToken(startupToken, "client closed HLS startup request");
+            }
+        });
+
+        await ensureStreamPrebuffered(c.url, c.name, startupToken, { cancelOthers: true });
 
         const { playlist, baseUrl, cacheStatus, age } = await getCachedHLSRaw(c.url);
         const buffered = updateLiveBufferFromPlaylist(c.url, playlist, baseUrl, {
@@ -1925,13 +2244,25 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         res.setHeader("Pragma", "no-cache");
         res.send(rewritten);
     } catch (err) {
+        if (isStartupCancelledError(err)) {
+            console.log("[HLS ROUTE CANCELLED]", err.message);
+            if (!res.headersSent && !res.destroyed) {
+                return res.status(499).send("#EXTM3U\n#EXT-X-ENDLIST\n");
+            }
+            return;
+        }
+
         console.error("[ERROR HLS ROUTE]", err.message);
-        res.status(502).send("#EXTM3U\n#EXT-X-ENDLIST\n");
+        if (!res.headersSent && !res.destroyed) {
+            res.status(502).send("#EXTM3U\n#EXT-X-ENDLIST\n");
+        }
     }
 });
 
 // Nested playlist relay: variant playlists in master playlists, etc.
 app.get("/:base64Config/pl", async (req, res) => {
+    let startupToken = null;
+
     try {
         const configKey = req.params.base64Config;
         decodeConfig(configKey);
@@ -1939,8 +2270,15 @@ app.get("/:base64Config/pl", async (req, res) => {
 
         const sourceUrl = decodeProxyUrl(req.query.u);
         const host = getPublicHost(req);
+        startupToken = makeStartupCancelToken(sourceUrl, "nested-playlist");
 
-        await ensureStreamPrebuffered(sourceUrl, "nested-playlist");
+        req.on("close", () => {
+            if (!res.writableEnded && startupToken) {
+                cancelStartupToken(startupToken, "client closed nested playlist request");
+            }
+        });
+
+        await ensureStreamPrebuffered(sourceUrl, "nested-playlist", startupToken, { cancelOthers: false });
 
         const { playlist, baseUrl, cacheStatus, age } = await getCachedHLSRaw(sourceUrl);
         const buffered = updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl, {
@@ -1967,8 +2305,18 @@ app.get("/:base64Config/pl", async (req, res) => {
         res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, no-transform");
         res.send(rewritten);
     } catch (err) {
+        if (isStartupCancelledError(err)) {
+            console.log("[PL ROUTE CANCELLED]", err.message);
+            if (!res.headersSent && !res.destroyed) {
+                return res.status(499).send("#EXTM3U\n#EXT-X-ENDLIST\n");
+            }
+            return;
+        }
+
         console.error("[ERROR PL ROUTE]", err.message);
-        res.status(502).send("#EXTM3U\n#EXT-X-ENDLIST\n");
+        if (!res.headersSent && !res.destroyed) {
+            res.status(502).send("#EXTM3U\n#EXT-X-ENDLIST\n");
+        }
     }
 });
 
