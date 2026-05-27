@@ -35,6 +35,7 @@ const memoryCache = {
     segmentPrefetchActive: 0,
     segmentCacheBytes: 0,
     playbackStates: {},
+    activeSessions: {},
     logoData: {},
     lastUpdate: {},
     isUpdating: {}
@@ -65,7 +66,7 @@ const SEGMENT_WAIT_FOR_PREFETCH_MS = Number(process.env.SEGMENT_WAIT_FOR_PREFETC
 const PLAYER_SEGMENT_SLOW_MS = Number(process.env.PLAYER_SEGMENT_SLOW_MS || 2500);
 const PLAYER_SEGMENT_GAP_WARN_MS = Number(process.env.PLAYER_SEGMENT_GAP_WARN_MS || 30000);
 const ADDON_TYPE = "kronos";
-const RELEASE_VERSION = "1.6.2";
+const RELEASE_VERSION = "1.6.3";
 
 function decodeConfig(configKey) {
     try {
@@ -339,6 +340,70 @@ function notePlayerSegment(req, sourceUrl, event = {}) {
 
     memoryCache.playbackStates[key] = state;
     return { gapMs, state };
+}
+
+function createCancelledError(message) {
+    const err = new Error(message || "Cancelled because another channel became active");
+    err.code = "KRONOS_SESSION_CANCELLED";
+    return err;
+}
+
+function activatePlaybackSession(req, channel) {
+    const key = getPlaybackKey(req);
+    const previous = memoryCache.activeSessions[key];
+    const channelId = channel?.id || hashKey(channel?.url || "unknown");
+    const channelName = channel?.name || "stream";
+
+    if (previous?.channelId === channelId) {
+        previous.lastSeenAt = Date.now();
+        return previous;
+    }
+
+    const session = {
+        key,
+        id: `${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
+        channelId,
+        channelName,
+        sourceUrl: channel?.url || "",
+        startedAt: Date.now(),
+        lastSeenAt: Date.now()
+    };
+
+    memoryCache.activeSessions[key] = session;
+
+    if (previous) {
+        cancelSessionWork(previous, `channel-switch:${channelName}`);
+        console.log(`[CHANNEL SWITCH] from="${previous.channelName}" to="${channelName}"`);
+    } else {
+        console.log(`[CHANNEL SESSION] channel="${channelName}" active`);
+    }
+
+    return session;
+}
+
+function isSessionActive(session) {
+    if (!session?.key || !session?.id) return true;
+    return memoryCache.activeSessions[session.key]?.id === session.id;
+}
+
+function assertSessionActive(session, label = "stream") {
+    if (isSessionActive(session)) return;
+    console.log(`[STARTUP CANCELLED] channel="${label}" reason=channel-switch`);
+    throw createCancelledError(`Cancelled ${label}: another channel became active`);
+}
+
+function cancelSessionWork(session, reason = "inactive-session") {
+    if (!session) return;
+
+    const before = memoryCache.segmentPrefetchQueue.length;
+    memoryCache.segmentPrefetchQueue = memoryCache.segmentPrefetchQueue.filter(item => {
+        if (typeof item === "string") return true;
+        return item.sessionId !== session.id;
+    });
+    const removed = before - memoryCache.segmentPrefetchQueue.length;
+    if (removed > 0) {
+        console.log(`[PREFETCH CANCELLED] channel="${session.channelName}" reason=${reason} removed=${removed}`);
+    }
 }
 
 function getHLSCacheKey(sourceUrl) {
@@ -703,13 +768,23 @@ async function fetchSegmentToCache(sourceUrl) {
     }
 }
 
-function queueSegmentPrefetch(sourceUrl) {
+function queueSegmentPrefetch(sourceUrl, context = {}) {
     if (!isHttpUrl(sourceUrl)) return;
+    if (context.session && !isSessionActive(context.session)) {
+        console.log(`[PREFETCH SKIP] channel="${context.label || context.session.channelName || "stream"}" reason=inactive-session`);
+        return;
+    }
+
     const key = getSegmentCacheKey(sourceUrl);
     if (getSegmentFromCache(sourceUrl) || memoryCache.segmentInflight[key]) return;
-    if (memoryCache.segmentPrefetchQueue.includes(sourceUrl)) return;
+    if (memoryCache.segmentPrefetchQueue.some(item => (typeof item === "string" ? item : item.sourceUrl) === sourceUrl)) return;
 
-    memoryCache.segmentPrefetchQueue.push(sourceUrl);
+    memoryCache.segmentPrefetchQueue.push({
+        sourceUrl,
+        sessionKey: context.session?.key || null,
+        sessionId: context.session?.id || null,
+        label: context.label || context.session?.channelName || "stream"
+    });
     processSegmentPrefetchQueue();
 }
 
@@ -718,7 +793,16 @@ function processSegmentPrefetchQueue() {
         memoryCache.segmentPrefetchActive < SEGMENT_PREFETCH_CONCURRENCY &&
         memoryCache.segmentPrefetchQueue.length > 0
     ) {
-        const sourceUrl = memoryCache.segmentPrefetchQueue.shift();
+        const item = memoryCache.segmentPrefetchQueue.shift();
+        const sourceUrl = typeof item === "string" ? item : item.sourceUrl;
+        const session = typeof item === "string" || !item.sessionKey ? null : { key: item.sessionKey, id: item.sessionId };
+        const label = typeof item === "string" ? "stream" : item.label;
+
+        if (session && !isSessionActive(session)) {
+            console.log(`[PREFETCH SKIP] channel="${label}" reason=inactive-session`);
+            continue;
+        }
+
         const key = getSegmentCacheKey(sourceUrl);
 
         if (getSegmentFromCache(sourceUrl) || memoryCache.segmentInflight[key]) continue;
@@ -782,7 +866,7 @@ function getLiveBuffer(sourceUrl) {
     return memoryCache.liveBuffers[getHLSCacheKey(sourceUrl)] || null;
 }
 
-function updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl) {
+function updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl, context = {}) {
     const cacheKey = getHLSCacheKey(sourceUrl);
     const parsed = parseHLSMediaPlaylist(playlist, baseUrl);
 
@@ -831,7 +915,7 @@ function updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl) {
         buffer.segmentMap[key] = segment;
     });
 
-    queueDynamicPrefetchForBuffer(buffer);
+    queueDynamicPrefetchForBuffer(buffer, context);
 
     const selected = selectBufferedSegments(buffer);
     const rebuilt = buildPlaylistFromBufferedSegments(buffer, selected.segments);
@@ -888,8 +972,13 @@ function getCachedDurationForSegments(segments) {
     }, 0);
 }
 
-function queueDynamicPrefetchForBuffer(buffer) {
+function queueDynamicPrefetchForBuffer(buffer, context = {}) {
     if (!buffer?.segments?.length) return;
+    if (context.session && !isSessionActive(context.session)) {
+        console.log(`[DYNAMIC BUFFER] status=cancelled channel="${context.label || context.session.channelName || "stream"}" reason=inactive-session`);
+        return;
+    }
+
     const cachedSeconds = getCachedDurationForSegments(buffer.segments);
     if (cachedSeconds >= DYNAMIC_BUFFER_MAX_SECONDS) return;
 
@@ -897,7 +986,7 @@ function queueDynamicPrefetchForBuffer(buffer) {
         .filter(segment => !getCachedSegmentForLogicalSegment(segment))
         .slice(-SEGMENT_PREFETCH_AHEAD);
 
-    candidates.forEach(segment => queueSegmentPrefetch(segment.sourceUrl || segment.url));
+    candidates.forEach(segment => queueSegmentPrefetch(segment.sourceUrl || segment.url, context));
 
     if (candidates.length > 0) {
         console.log(
@@ -912,7 +1001,7 @@ function queueDynamicPrefetchForBuffer(buffer) {
     }
 }
 
-async function acquireInitialHLS(sourceUrl, label = "stream") {
+async function acquireInitialHLS(sourceUrl, label = "stream", context = {}) {
     const started = Date.now();
     let lastErr = null;
     let fetches = 0;
@@ -924,10 +1013,12 @@ async function acquireInitialHLS(sourceUrl, label = "stream") {
     );
 
     while (Date.now() - started < STREAM_ACQUIRE_TIMEOUT) {
+        assertSessionActive(context.session, label);
         fetches += 1;
 
         try {
             const hls = await fetchAndStoreHLSRaw(getHLSCacheKey(sourceUrl), sourceUrl, "acquire");
+            assertSessionActive(context.session, label);
             const info = hls.info || analyzeHLSPlaylist(hls.playlist);
 
             if (info.isMaster || info.segmentCount > 0) {
@@ -949,12 +1040,13 @@ async function acquireInitialHLS(sourceUrl, label = "stream") {
         }
 
         await sleep(Math.min(STREAM_ACQUIRE_POLL_MS, Math.max(0, STREAM_ACQUIRE_TIMEOUT - (Date.now() - started))));
+        assertSessionActive(context.session, label);
     }
 
     throw new Error(lastErr ? `Acquire failed: ${lastErr.message}` : "Acquire failed: timeout");
 }
 
-async function prebufferInitialStream(sourceUrl, label = "stream") {
+async function prebufferInitialStream(sourceUrl, label = "stream", context = {}) {
     const started = Date.now();
 
     console.log(
@@ -965,11 +1057,13 @@ async function prebufferInitialStream(sourceUrl, label = "stream") {
     );
 
     while (Date.now() - started < STREAM_PREBUFFER_TIMEOUT) {
+        assertSessionActive(context.session, label);
         const hls = await fetchAndStoreHLSRaw(getHLSCacheKey(sourceUrl), sourceUrl, "prebuffer");
-        const buffered = updateLiveBufferFromPlaylist(sourceUrl, hls.playlist, hls.baseUrl);
+        assertSessionActive(context.session, label);
+        const buffered = updateLiveBufferFromPlaylist(sourceUrl, hls.playlist, hls.baseUrl, context);
         const candidates = (buffered.segments || []).slice(-SEGMENT_PREFETCH_AHEAD);
 
-        candidates.forEach(segment => queueSegmentPrefetch(segment.sourceUrl || segment.url));
+        candidates.forEach(segment => queueSegmentPrefetch(segment.sourceUrl || segment.url, context));
 
         const cachedSeconds = getCachedDurationForSegments(candidates);
         console.log(
@@ -992,12 +1086,13 @@ async function prebufferInitialStream(sourceUrl, label = "stream") {
         }
 
         await sleep(700);
+        assertSessionActive(context.session, label);
     }
 
     throw new Error(`Prebuffer failed: less than ${STREAM_PREBUFFER_SECONDS}s after ${Date.now() - started}ms`);
 }
 
-async function ensureStreamReady(sourceUrl, label = "stream") {
+async function ensureStreamReady(sourceUrl, label = "stream", context = {}) {
     const cacheKey = getHLSCacheKey(sourceUrl);
     let state = memoryCache.streamStates[cacheKey];
 
@@ -1008,7 +1103,8 @@ async function ensureStreamReady(sourceUrl, label = "stream") {
 
     const buffer = getLiveBuffer(sourceUrl);
     if (state.status === "ready" && getCachedDurationForSegments(buffer?.segments || []) >= STREAM_PREBUFFER_SECONDS) {
-        queueDynamicPrefetchForBuffer(buffer);
+        assertSessionActive(context.session, label);
+        queueDynamicPrefetchForBuffer(buffer, context);
         console.log(
             `[STARTUP REUSE] channel="${label}" ready-cache` +
             ` cached=${formatSeconds(getCachedDurationForSegments(buffer?.segments || []))}`
@@ -1024,7 +1120,8 @@ async function ensureStreamReady(sourceUrl, label = "stream") {
     state.status = "acquiring";
     state.promise = (async () => {
         try {
-            const initial = await acquireInitialHLS(sourceUrl, label);
+            const initial = await acquireInitialHLS(sourceUrl, label, context);
+            assertSessionActive(context.session, label);
             if (initial.info?.isMaster) {
                 state.status = "ready";
                 state.readyAt = Date.now();
@@ -1032,14 +1129,20 @@ async function ensureStreamReady(sourceUrl, label = "stream") {
                 return { status: "ready", master: true };
             }
             state.status = "prebuffering";
-            const ready = await prebufferInitialStream(sourceUrl, label);
+            const ready = await prebufferInitialStream(sourceUrl, label, context);
+            assertSessionActive(context.session, label);
             state.status = "ready";
             state.readyAt = Date.now();
             state.lastError = null;
             return ready;
         } catch (err) {
-            state.status = "failed";
-            state.lastError = err.message;
+            if (err.code === "KRONOS_SESSION_CANCELLED") {
+                state.status = "cancelled";
+                state.lastError = err.message;
+            } else {
+                state.status = "failed";
+                state.lastError = err.message;
+            }
             throw err;
         } finally {
             state.promise = null;
@@ -1063,7 +1166,7 @@ function parseM3UChannels(data, source = {}) {
             const group = (line.match(/group-title="([^"]+)"/) || [, "Altri Canali"])[1].trim();
             const logoMatch = line.match(/tvg-logo="([^"]+)"/);
             const tvgId = (line.match(/tvg-id="([^"]+)"/) || [, null])[1];
-            const logo = logoMatch ? logoMatch[1] : `https://placehold.co/512x512/111827/ffffff?text=${encodeURIComponent(name.substring(0, 5))}`;
+            const logo = logoMatch ? logoMatch[1] : "";
 
             currentChannel = {
                 name,
@@ -1230,7 +1333,7 @@ function buildStream(channel, host, configKey, config) {
 
 function toMeta(channel, host, configKey = "", config = {}) {
     const fallbackLogo = `${host}/logo.svg`;
-    const poster = configKey ? `${host}/${configKey}/poster/${channel.id}.svg` : (channel.logo || fallbackLogo);
+    const poster = configKey ? `${host}/${configKey}/poster/${channel.id}.svg?v=${encodeURIComponent(RELEASE_VERSION)}` : (channel.logo || fallbackLogo);
     const logo = channel.logo || fallbackLogo;
     const stream = configKey ? buildStream(channel, host, configKey, config) : null;
 
@@ -1513,7 +1616,7 @@ app.get("/:base64Config/poster/:id.svg", async (req, res) => {
         const config = decodeConfig(configKey);
         const c = await getChannelById(configKey, config, req.params.id);
         const host = getPublicHost(req);
-        const logoUrl = c?.logo || `${host}/logo.svg`;
+        const logoUrl = c?.logo || "";
         const logoDataUri = await getLogoDataUri(logoUrl);
         const name = stripInitialCountryPrefix(c?.name || "Kronos");
         const initials = name
@@ -1529,7 +1632,7 @@ app.get("/:base64Config/poster/:id.svg", async (req, res) => {
             : `<text x="256" y="274" text-anchor="middle" fill="#111827" font-family="Arial, sans-serif" font-size="86" font-weight="800">${escapeXml(initials)}</text>`;
 
         res.setHeader("Content-Type", "image/svg+xml");
-        res.setHeader("Cache-Control", "public, max-age=604800");
+        res.setHeader("Cache-Control", "public, max-age=3600");
         res.send(`
             <svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
                 <defs>
@@ -1612,10 +1715,12 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         if (!c) return res.status(404).send("#EXTM3U\n");
 
         const host = getPublicHost(req);
-        await ensureStreamReady(c.url, c.name);
+        const session = activatePlaybackSession(req, c);
+        await ensureStreamReady(c.url, c.name, { session, label: c.name });
 
         const hls = await getCachedHLSRaw(c.url);
-        const buffered = updateLiveBufferFromPlaylist(c.url, hls.playlist, hls.baseUrl);
+        assertSessionActive(session, c.name);
+        const buffered = updateLiveBufferFromPlaylist(c.url, hls.playlist, hls.baseUrl, { session, label: c.name });
         const outputPlaylist = buffered.playlist || hls.playlist;
         const rewritten = rewriteHLSPlaylistThroughKronos(outputPlaylist, hls.baseUrl, host, configKey);
 
@@ -1640,6 +1745,10 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         res.setHeader("Pragma", "no-cache");
         res.send(rewritten);
     } catch (err) {
+        if (err.code === "KRONOS_SESSION_CANCELLED") {
+            console.log(`[HLS ROUTE CANCELLED] ${err.message}`);
+            return res.status(204).end();
+        }
         console.error("[ERROR HLS ROUTE]", err.message);
         res.status(502).send("#EXTM3U\n#EXT-X-ENDLIST\n");
     }
@@ -1828,6 +1937,12 @@ app.get("/:base64Config/debug", async (req, res) => {
                 segmentCacheBytes: memoryCache.segmentCacheBytes,
                 segmentPrefetchActive: memoryCache.segmentPrefetchActive,
                 segmentPrefetchQueue: memoryCache.segmentPrefetchQueue.length,
+                activeSessions: Object.values(memoryCache.activeSessions).map(session => ({
+                    channelName: session.channelName,
+                    channelId: session.channelId,
+                    startedAt: session.startedAt,
+                    lastSeenAt: session.lastSeenAt
+                })),
                 playbackStates: Object.entries(memoryCache.playbackStates).map(([key, state]) => ({
                     key,
                     ok: state.ok,
