@@ -27,6 +27,12 @@ const memoryCache = {
     epgData: {},
     hlsData: {},
     hlsInflight: {},
+    liveBuffers: {},
+    segmentData: {},
+    segmentInflight: {},
+    segmentPrefetchQueue: [],
+    segmentPrefetchActive: 0,
+    segmentCacheBytes: 0,
     logoData: {},
     lastUpdate: {},
     isUpdating: {},
@@ -41,9 +47,25 @@ const memoryCache = {
             coalescedFetches: 0,
             backgroundRefreshes: 0
         },
+        liveBuffer: {
+            playlistsBuilt: 0,
+            segmentsStored: 0,
+            prefetchQueued: 0
+        },
+        segmentCache: {
+            hits: 0,
+            misses: 0,
+            stored: 0,
+            evicted: 0,
+            prefetches: 0,
+            prefetchOk: 0,
+            prefetchError: 0,
+            bytes: 0
+        },
         seg: {
             total: 0,
             ok: 0,
+            cache: 0,
             error: 0,
             aborted: 0,
             active: 0,
@@ -55,23 +77,39 @@ const memoryCache = {
 const CACHE_TTL = 30 * 60 * 1000;
 
 // HLS self-relay tuning
-// Live playlist cache must stay short: tokenized IPTV streams can expire quickly.
-const HLS_REFRESH_TTL = Number(process.env.HLS_REFRESH_TTL || 1500);
-const HLS_MASTER_REFRESH_TTL = Number(process.env.HLS_MASTER_REFRESH_TTL || 15000);
-const HLS_STALE_TTL = Number(process.env.HLS_STALE_TTL || 5000);
+// Conservative mode: stability > real-time latency.
+const HLS_REFRESH_TTL = Number(process.env.HLS_REFRESH_TTL || 6000);
+const HLS_MASTER_REFRESH_TTL = Number(process.env.HLS_MASTER_REFRESH_TTL || 30000);
+const HLS_STALE_TTL = Number(process.env.HLS_STALE_TTL || 120000);
+const HLS_LIVE_STALE_REFRESH_TTL = Number(process.env.HLS_LIVE_STALE_REFRESH_TTL || 25000);
 const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 15000);
 const HLS_RETRY_COUNT = Number(process.env.HLS_RETRY_COUNT || 3);
 const HLS_RETRY_BASE_DELAY = Number(process.env.HLS_RETRY_BASE_DELAY || 400);
-const SEG_REQUEST_TIMEOUT = Number(process.env.SEG_REQUEST_TIMEOUT || 30000);
+const SEG_REQUEST_TIMEOUT = Number(process.env.SEG_REQUEST_TIMEOUT || 45000);
 
 // Segment logs: 1 = log every successful segment, 5 = one every 5, 0 = only errors.
 const SEG_LOG_EVERY = Number(process.env.SEG_LOG_EVERY || 1);
 
-// For tokenized live IPTV streams, keep Stremio close to the live edge.
-const LIVE_EDGE_SEGMENTS = Number(process.env.LIVE_EDGE_SEGMENTS || 4);
+// Conservative live buffer.
+// Kronos builds a local rolling DVR-like playlist from upstream HLS windows,
+// drops the newest segment(s), and prefetches segment data in memory.
+const LIVE_BUFFER_SEGMENTS = Number(process.env.LIVE_BUFFER_SEGMENTS || 24);
+const LIVE_PLAYLIST_SEGMENTS = Number(process.env.LIVE_PLAYLIST_SEGMENTS || 10);
+const LIVE_DELAY_SEGMENTS = Number(process.env.LIVE_DELAY_SEGMENTS || 2);
+const MIN_LIVE_SEGMENTS_READY = Number(process.env.MIN_LIVE_SEGMENTS_READY || 3);
+const MIN_LIVE_WARMUP_ATTEMPTS = Number(process.env.MIN_LIVE_WARMUP_ATTEMPTS || 3);
+const MIN_LIVE_WARMUP_DELAY_MS = Number(process.env.MIN_LIVE_WARMUP_DELAY_MS || 1200);
+
+const SEGMENT_CACHE_TTL = Number(process.env.SEGMENT_CACHE_TTL || 10 * 60 * 1000);
+const SEGMENT_CACHE_MAX_BYTES = Number(process.env.SEGMENT_CACHE_MAX_BYTES || 512 * 1024 * 1024);
+const SEGMENT_CACHE_MAX_SEGMENTS = Number(process.env.SEGMENT_CACHE_MAX_SEGMENTS || 80);
+const SEGMENT_CACHE_MAX_ITEM_BYTES = Number(process.env.SEGMENT_CACHE_MAX_ITEM_BYTES || 24 * 1024 * 1024);
+const SEGMENT_PREFETCH_CONCURRENCY = Number(process.env.SEGMENT_PREFETCH_CONCURRENCY || 2);
+const SEGMENT_PREFETCH_AHEAD = Number(process.env.SEGMENT_PREFETCH_AHEAD || 8);
+const SEGMENT_WAIT_FOR_PREFETCH_MS = Number(process.env.SEGMENT_WAIT_FOR_PREFETCH_MS || 2500);
 
 const ADDON_TYPE = "tv";
-const RELEASE_VERSION = "1.6.2";
+const RELEASE_VERSION = "1.6.3";
 
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
@@ -143,6 +181,410 @@ function getHLSRefreshTTL(info) {
         return Math.max(1000, Math.min(HLS_REFRESH_TTL, Math.floor(info.targetDuration * 500)));
     }
     return HLS_REFRESH_TTL;
+}
+
+function getSegmentCacheKey(sourceUrl) {
+    return `seg:${hashKey(sourceUrl)}`;
+}
+
+function getHLSCacheKey(sourceUrl) {
+    return `hls:${hashKey(sourceUrl)}`;
+}
+
+function isLiveMediaPlaylistInfo(info) {
+    return Boolean(info && info.isLive && !info.isMaster);
+}
+
+function normalizeHeaderLineToAbsolute(line, baseUrl) {
+    const trimmed = String(line || "").trim();
+
+    if (!trimmed) return line;
+
+    if (trimmed.startsWith("#")) {
+        return String(line).replace(/URI=("([^\"]+)"|'([^']+)')/g, (match, quoted, doubleUri, singleUri) => {
+            const uri = doubleUri || singleUri;
+            const quote = quoted.startsWith("'") ? "'" : '"';
+            const absUrl = toAbsoluteUrl(uri, baseUrl);
+            return `URI=${quote}${absUrl}${quote}`;
+        });
+    }
+
+    return toAbsoluteUrl(trimmed, baseUrl);
+}
+
+function parseHLSMediaPlaylist(playlist, baseUrl) {
+    const text = String(playlist || "");
+    const info = analyzeHLSPlaylist(text);
+    const lines = text.split(/\r?\n/);
+    const headerLines = [];
+    const segments = [];
+    let pendingSegmentLines = [];
+    const originalMediaSequence = Number.isFinite(info.mediaSequence) ? info.mediaSequence : 0;
+
+    for (const rawLine of lines) {
+        const line = String(rawLine || "");
+        const trimmed = line.trim();
+
+        if (!trimmed) continue;
+        if (trimmed.startsWith("#EXT-X-ENDLIST")) continue;
+
+        if (trimmed.startsWith("#EXTINF")) {
+            pendingSegmentLines = [normalizeHeaderLineToAbsolute(line, baseUrl)];
+            continue;
+        }
+
+        if (pendingSegmentLines.length > 0) {
+            const normalizedLine = normalizeHeaderLineToAbsolute(line, baseUrl);
+            pendingSegmentLines.push(normalizedLine);
+
+            if (!trimmed.startsWith("#")) {
+                const sequence = originalMediaSequence + segments.length;
+                const absoluteUrl = toAbsoluteUrl(trimmed, baseUrl);
+                segments.push({
+                    sequence,
+                    url: absoluteUrl,
+                    lines: pendingSegmentLines,
+                    firstSeenAt: Date.now(),
+                    lastSeenAt: Date.now()
+                });
+                pendingSegmentLines = [];
+            }
+
+            continue;
+        }
+
+        headerLines.push(normalizeHeaderLineToAbsolute(line, baseUrl));
+    }
+
+    return { info, headerLines, segments, originalMediaSequence };
+}
+
+function getSegmentFromCache(sourceUrl) {
+    const key = getSegmentCacheKey(sourceUrl);
+    const cached = memoryCache.segmentData[key];
+
+    if (!cached) return null;
+
+    if (Date.now() - cached.fetchedAt > SEGMENT_CACHE_TTL) {
+        delete memoryCache.segmentData[key];
+        memoryCache.segmentCacheBytes = Math.max(0, memoryCache.segmentCacheBytes - cached.size);
+        memoryCache.stats.segmentCache.evicted += 1;
+        return null;
+    }
+
+    cached.lastAccessedAt = Date.now();
+    return cached;
+}
+
+function evictSegmentCacheIfNeeded() {
+    const entries = Object.entries(memoryCache.segmentData)
+        .map(([key, value]) => ({ key, ...value }))
+        .sort((a, b) => (a.lastAccessedAt || a.fetchedAt || 0) - (b.lastAccessedAt || b.fetchedAt || 0));
+
+    while (
+        memoryCache.segmentCacheBytes > SEGMENT_CACHE_MAX_BYTES ||
+        Object.keys(memoryCache.segmentData).length > SEGMENT_CACHE_MAX_SEGMENTS
+    ) {
+        const victim = entries.shift();
+        if (!victim) break;
+
+        if (memoryCache.segmentData[victim.key]) {
+            memoryCache.segmentCacheBytes = Math.max(0, memoryCache.segmentCacheBytes - memoryCache.segmentData[victim.key].size);
+            delete memoryCache.segmentData[victim.key];
+            memoryCache.stats.segmentCache.evicted += 1;
+        }
+    }
+}
+
+function storeSegmentInCache(sourceUrl, buffer, responseHeaders = {}, status = 200, source = "stream") {
+    if (!Buffer.isBuffer(buffer)) return false;
+    if (buffer.length <= 0 || buffer.length > SEGMENT_CACHE_MAX_ITEM_BYTES) return false;
+
+    const key = getSegmentCacheKey(sourceUrl);
+    const existing = memoryCache.segmentData[key];
+
+    if (existing) {
+        memoryCache.segmentCacheBytes = Math.max(0, memoryCache.segmentCacheBytes - existing.size);
+    }
+
+    const headers = {};
+    [
+        "content-type",
+        "cache-control",
+        "expires",
+        "last-modified",
+        "etag"
+    ].forEach(h => {
+        if (responseHeaders[h]) headers[h] = responseHeaders[h];
+    });
+
+    memoryCache.segmentData[key] = {
+        url: sourceUrl,
+        buffer,
+        size: buffer.length,
+        headers,
+        status,
+        fetchedAt: Date.now(),
+        lastAccessedAt: Date.now(),
+        source
+    };
+
+    memoryCache.segmentCacheBytes += buffer.length;
+    memoryCache.stats.segmentCache.stored += 1;
+    memoryCache.stats.segmentCache.bytes = memoryCache.segmentCacheBytes;
+    evictSegmentCacheIfNeeded();
+
+    return true;
+}
+
+function sendCachedSegment(req, res, cached, segmentNo = null) {
+    const buffer = cached.buffer;
+    const total = buffer.length;
+    const rangeHeader = req.headers.range;
+    let start = 0;
+    let end = total - 1;
+    let status = 200;
+
+    Object.entries(cached.headers || {}).forEach(([key, value]) => {
+        if (value) res.setHeader(key, value);
+    });
+
+    res.setHeader("Accept-Ranges", "bytes");
+    res.setHeader("X-Kronos-Relay", "1");
+    res.setHeader("X-Kronos-Cache", "HIT");
+
+    if (rangeHeader) {
+        const match = String(rangeHeader).match(/bytes=(\d*)-(\d*)/);
+        if (match) {
+            if (match[1] !== "") start = Number(match[1]);
+            if (match[2] !== "") end = Number(match[2]);
+            if (!Number.isFinite(start)) start = 0;
+            if (!Number.isFinite(end) || end >= total) end = total - 1;
+            if (start > end || start >= total) {
+                res.status(416);
+                res.setHeader("Content-Range", `bytes */${total}`);
+                return res.end();
+            }
+            status = 206;
+            res.setHeader("Content-Range", `bytes ${start}-${end}/${total}`);
+        }
+    }
+
+    const chunk = buffer.subarray(start, end + 1);
+    res.status(status);
+    res.setHeader("Content-Length", chunk.length);
+
+    if (!res.getHeader("content-type")) {
+        res.setHeader("Content-Type", cached.headers?.["content-type"] || "video/mp2t");
+    }
+
+    if (segmentNo !== null && shouldLogSegment(segmentNo, true)) {
+        console.log(
+            `[SEG CACHE #${segmentNo}] status=${status} bytes=${formatBytes(chunk.length)} total=${formatBytes(total)}` +
+            `${rangeHeader ? ` range=${rangeHeader}` : ""} url=${sanitizeUrlForLog(cached.url)}`
+        );
+    }
+
+    return res.end(chunk);
+}
+
+async function fetchSegmentToCache(sourceUrl, reason = "prefetch") {
+    const key = getSegmentCacheKey(sourceUrl);
+
+    const cached = getSegmentFromCache(sourceUrl);
+    if (cached) return cached;
+
+    const inflight = memoryCache.segmentInflight[key];
+    if (inflight) return inflight;
+
+    const promise = (async () => {
+        const started = Date.now();
+
+        try {
+            const response = await axios.get(sourceUrl, {
+                responseType: "arraybuffer",
+                timeout: SEG_REQUEST_TIMEOUT,
+                maxRedirects: 5,
+                headers: {
+                    "User-Agent": UPSTREAM_UA,
+                    "Accept": "*/*",
+                    "Accept-Encoding": "identity",
+                    "Connection": "keep-alive"
+                },
+                decompress: false,
+                maxBodyLength: SEGMENT_CACHE_MAX_ITEM_BYTES,
+                maxContentLength: SEGMENT_CACHE_MAX_ITEM_BYTES,
+                validateStatus(status) { return status >= 200 && status < 300; }
+            });
+
+            const buffer = Buffer.from(response.data);
+            storeSegmentInCache(sourceUrl, buffer, response.headers, response.status, reason);
+            memoryCache.stats.segmentCache.prefetchOk += reason === "prefetch" ? 1 : 0;
+
+            console.log(`[SEG PREFETCH OK] bytes=${formatBytes(buffer.length)} time=${Date.now() - started}ms url=${sanitizeUrlForLog(sourceUrl)}`);
+            return getSegmentFromCache(sourceUrl);
+        } catch (err) {
+            if (reason === "prefetch") memoryCache.stats.segmentCache.prefetchError += 1;
+            console.error(`[SEG PREFETCH ERROR] reason=${reason} url=${sanitizeUrlForLog(sourceUrl)} err=${err.message}`);
+            throw err;
+        }
+    })();
+
+    memoryCache.segmentInflight[key] = promise;
+
+    try {
+        return await promise;
+    } finally {
+        delete memoryCache.segmentInflight[key];
+    }
+}
+
+function processSegmentPrefetchQueue() {
+    while (
+        memoryCache.segmentPrefetchActive < SEGMENT_PREFETCH_CONCURRENCY &&
+        memoryCache.segmentPrefetchQueue.length > 0
+    ) {
+        const sourceUrl = memoryCache.segmentPrefetchQueue.shift();
+        const key = getSegmentCacheKey(sourceUrl);
+
+        if (getSegmentFromCache(sourceUrl) || memoryCache.segmentInflight[key]) {
+            continue;
+        }
+
+        memoryCache.segmentPrefetchActive += 1;
+        memoryCache.stats.segmentCache.prefetches += 1;
+
+        fetchSegmentToCache(sourceUrl, "prefetch")
+            .catch(() => {})
+            .finally(() => {
+                memoryCache.segmentPrefetchActive = Math.max(0, memoryCache.segmentPrefetchActive - 1);
+                processSegmentPrefetchQueue();
+            });
+    }
+}
+
+function queueSegmentPrefetch(sourceUrl) {
+    if (!sourceUrl || !isHttpUrl(sourceUrl)) return;
+
+    const key = getSegmentCacheKey(sourceUrl);
+    if (getSegmentFromCache(sourceUrl) || memoryCache.segmentInflight[key]) return;
+    if (memoryCache.segmentPrefetchQueue.includes(sourceUrl)) return;
+
+    memoryCache.segmentPrefetchQueue.push(sourceUrl);
+    memoryCache.stats.liveBuffer.prefetchQueued += 1;
+    processSegmentPrefetchQueue();
+}
+
+async function waitForSegmentPrefetch(sourceUrl, maxWaitMs = SEGMENT_WAIT_FOR_PREFETCH_MS) {
+    const key = getSegmentCacheKey(sourceUrl);
+    const inflight = memoryCache.segmentInflight[key];
+
+    if (!inflight || maxWaitMs <= 0) return null;
+
+    try {
+        return await Promise.race([
+            inflight,
+            sleep(maxWaitMs).then(() => null)
+        ]);
+    } catch (err) {
+        return null;
+    }
+}
+
+function updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl) {
+    const cacheKey = getHLSCacheKey(sourceUrl);
+    const parsed = parseHLSMediaPlaylist(playlist, baseUrl);
+
+    if (parsed.info.isMaster || !parsed.info.isLive || parsed.segments.length === 0) {
+        return { playlist, info: parsed.info, cacheKey, buffered: false };
+    }
+
+    let buffer = memoryCache.liveBuffers[cacheKey];
+
+    if (!buffer) {
+        buffer = {
+            headerLines: [],
+            segments: [],
+            segmentMap: {},
+            lastUpdated: 0
+        };
+        memoryCache.liveBuffers[cacheKey] = buffer;
+    }
+
+    buffer.headerLines = parsed.headerLines;
+    buffer.lastUpdated = Date.now();
+
+    parsed.segments.forEach(segment => {
+        const key = `${segment.sequence}:${segment.url}`;
+
+        if (!buffer.segmentMap[key]) {
+            buffer.segmentMap[key] = {
+                ...segment,
+                firstSeenAt: Date.now(),
+                lastSeenAt: Date.now()
+            };
+            buffer.segments.push(buffer.segmentMap[key]);
+            memoryCache.stats.liveBuffer.segmentsStored += 1;
+        } else {
+            buffer.segmentMap[key].lastSeenAt = Date.now();
+        }
+    });
+
+    buffer.segments = buffer.segments
+        .sort((a, b) => a.sequence - b.sequence)
+        .slice(-LIVE_BUFFER_SEGMENTS);
+
+    buffer.segmentMap = {};
+    buffer.segments.forEach(segment => {
+        buffer.segmentMap[`${segment.sequence}:${segment.url}`] = segment;
+    });
+
+    const prefetchCandidates = buffer.segments.slice(-Math.max(1, SEGMENT_PREFETCH_AHEAD));
+    prefetchCandidates.forEach(segment => queueSegmentPrefetch(segment.url));
+
+    const delayedSegments = LIVE_DELAY_SEGMENTS > 0
+        ? buffer.segments.slice(0, Math.max(0, buffer.segments.length - LIVE_DELAY_SEGMENTS))
+        : buffer.segments.slice();
+
+    const playlistSegments = delayedSegments.slice(-Math.max(1, LIVE_PLAYLIST_SEGMENTS));
+
+    if (playlistSegments.length === 0) {
+        return { playlist, info: parsed.info, cacheKey, buffered: false };
+    }
+
+    const firstSeq = playlistSegments[0].sequence;
+    let hasMediaSequence = false;
+
+    const headerLines = buffer.headerLines
+        .filter(line => !String(line).trim().startsWith("#EXT-X-ENDLIST"))
+        .map(line => {
+            if (String(line).trim().startsWith("#EXT-X-MEDIA-SEQUENCE:")) {
+                hasMediaSequence = true;
+                return `#EXT-X-MEDIA-SEQUENCE:${firstSeq}`;
+            }
+            return line;
+        });
+
+    if (!hasMediaSequence) {
+        headerLines.push(`#EXT-X-MEDIA-SEQUENCE:${firstSeq}`);
+    }
+
+    const rebuilt = [
+        ...headerLines,
+        ...playlistSegments.flatMap(segment => segment.lines)
+    ].join("\n") + "\n";
+
+    memoryCache.stats.liveBuffer.playlistsBuilt += 1;
+
+    return {
+        playlist: rebuilt,
+        info: analyzeHLSPlaylist(rebuilt),
+        cacheKey,
+        buffered: true,
+        bufferSize: buffer.segments.length,
+        delayedSegments: LIVE_DELAY_SEGMENTS,
+        playlistSegments: playlistSegments.length
+    };
 }
 
 function shouldLogSegment(segmentNumber, ok = true) {
@@ -235,6 +677,32 @@ async function fetchHLSManifest(sourceUrl) {
     throw lastErr;
 }
 
+async function fetchHLSManifestWithWarmup(sourceUrl, reason = "request") {
+    let response = await fetchHLSManifest(sourceUrl);
+    let info = analyzeHLSPlaylist(response.data);
+
+    if (!isLiveMediaPlaylistInfo(info) || info.segmentCount >= MIN_LIVE_SEGMENTS_READY) {
+        return response;
+    }
+
+    for (let attempt = 1; attempt <= MIN_LIVE_WARMUP_ATTEMPTS; attempt++) {
+        console.log(`[HLS WARMUP] reason=${reason} segs=${info.segmentCount}/${MIN_LIVE_SEGMENTS_READY} wait=${MIN_LIVE_WARMUP_DELAY_MS}ms`);
+        await sleep(MIN_LIVE_WARMUP_DELAY_MS);
+
+        const nextResponse = await fetchHLSManifest(sourceUrl);
+        const nextInfo = analyzeHLSPlaylist(nextResponse.data);
+
+        response = nextResponse;
+        info = nextInfo;
+
+        if (info.segmentCount >= MIN_LIVE_SEGMENTS_READY) {
+            break;
+        }
+    }
+
+    return response;
+}
+
 async function fetchAndStoreHLSRaw(cacheKey, sourceUrl, reason = "request") {
     const inflight = memoryCache.hlsInflight[cacheKey];
     if (inflight) {
@@ -245,7 +713,7 @@ async function fetchAndStoreHLSRaw(cacheKey, sourceUrl, reason = "request") {
     }
 
     const promise = (async () => {
-        const response = await fetchHLSManifest(sourceUrl);
+        const response = await fetchHLSManifestWithWarmup(sourceUrl, reason);
         const finalUrl = response.request?.res?.responseUrl || sourceUrl;
         const info = analyzeHLSPlaylist(response.data);
         const result = {
@@ -285,7 +753,7 @@ async function refreshHLSInBackground(cacheKey, sourceUrl) {
 }
 
 async function getCachedHLSRaw(sourceUrl) {
-    const cacheKey = `hls:${hashKey(sourceUrl)}`;
+    const cacheKey = getHLSCacheKey(sourceUrl);
     const cached = memoryCache.hlsData[cacheKey];
     const now = Date.now();
 
@@ -305,36 +773,22 @@ async function getCachedHLSRaw(sourceUrl) {
             };
         }
 
-        // Tokenized live IPTV fix:
-        // Do NOT serve stale media playlists while refreshing in background.
-        // If the player receives old segment URLs, it can fall behind the live edge,
-        // buffer for a long time and eventually crash.
-        if (info.isLive && !info.isMaster) {
-            try {
-                return await fetchAndStoreHLSRaw(cacheKey, sourceUrl, "blocking-live-refresh");
-            } catch (err) {
-                const fallbackMaxAge = Math.min(
-                    HLS_STALE_TTL,
-                    Math.max(2500, (info.targetDuration || 6) * 500)
-                );
-
-                if (age <= fallbackMaxAge) {
-                    memoryCache.stats.hls.staleHits += 1;
-                    console.error("[HLS] Live refresh failed; returning very short stale fallback", err.message);
-                    return {
-                        playlist: cached.playlist,
-                        baseUrl: cached.baseUrl,
-                        info,
-                        cacheStatus: "stale-fallback-live",
-                        age
-                    };
-                }
-
-                throw err;
-            }
+        // Conservative live mode:
+        // for live media playlists, serve the existing buffered playlist immediately
+        // and refresh in background. This avoids tiny 1-2s playback stalls caused by
+        // waiting for the upstream m3u8 exactly when Stremio wants the next segment.
+        if (isLiveMediaPlaylistInfo(info) && age <= HLS_LIVE_STALE_REFRESH_TTL) {
+            memoryCache.stats.hls.staleHits += 1;
+            refreshHLSInBackground(cacheKey, sourceUrl);
+            return {
+                playlist: cached.playlist,
+                baseUrl: cached.baseUrl,
+                info,
+                cacheStatus: "stale-refresh-live",
+                age
+            };
         }
 
-        // Master playlists and VOD playlists are less sensitive to stale data.
         if (age <= HLS_STALE_TTL) {
             memoryCache.stats.hls.staleHits += 1;
             refreshHLSInBackground(cacheKey, sourceUrl);
@@ -342,7 +796,7 @@ async function getCachedHLSRaw(sourceUrl) {
                 playlist: cached.playlist,
                 baseUrl: cached.baseUrl,
                 info,
-                cacheStatus: "stale-refresh",
+                cacheStatus: isLiveMediaPlaylistInfo(info) ? "stale-live" : "stale-refresh",
                 age
             };
         }
@@ -381,69 +835,10 @@ function isHlsUrl(url) {
     return /\.m3u8(?:[?#].*)?$/i.test(String(url || ""));
 }
 
-function trimLiveMediaPlaylistToLiveEdge(playlist, keepSegments = LIVE_EDGE_SEGMENTS) {
-    const text = String(playlist || "");
-    const info = analyzeHLSPlaylist(text);
-
-    if (info.isMaster || !info.isLive || info.segmentCount <= keepSegments) {
-        return text;
-    }
-
-    const lines = text.split(/\r?\n/);
-    const headerLines = [];
-    const segments = [];
-    let pendingSegmentLines = [];
-    let originalMediaSequence = Number.isFinite(info.mediaSequence) ? info.mediaSequence : 0;
-
-    for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-
-        if (trimmed.startsWith("#EXT-X-ENDLIST")) {
-            continue;
-        }
-
-        if (trimmed.startsWith("#EXTINF")) {
-            pendingSegmentLines = [line];
-            continue;
-        }
-
-        if (pendingSegmentLines.length > 0) {
-            pendingSegmentLines.push(line);
-
-            if (!trimmed.startsWith("#")) {
-                segments.push(pendingSegmentLines);
-                pendingSegmentLines = [];
-            }
-
-            continue;
-        }
-
-        headerLines.push(line);
-    }
-
-    if (segments.length <= keepSegments) {
-        return text;
-    }
-
-    const skipped = segments.length - keepSegments;
-    const keptSegments = segments.slice(-keepSegments);
-
-    const rebuiltHeader = headerLines.map(line => {
-        if (String(line).trim().startsWith("#EXT-X-MEDIA-SEQUENCE:")) {
-            return `#EXT-X-MEDIA-SEQUENCE:${originalMediaSequence + skipped}`;
-        }
-        return line;
-    });
-
-    if (!rebuiltHeader.some(line => String(line).trim().startsWith("#EXT-X-MEDIA-SEQUENCE:"))) {
-        rebuiltHeader.push(`#EXT-X-MEDIA-SEQUENCE:${originalMediaSequence + skipped}`);
-    }
-
-    return [
-        ...rebuiltHeader,
-        ...keptSegments.flat()
-    ].join("\n") + "\n";
+function trimLiveMediaPlaylistToLiveEdge(playlist) {
+    // Compatibility wrapper retained for older references.
+    // Conservative mode no longer trims to the live edge directly.
+    return String(playlist || "");
 }
 
 function rewriteHLSPlaylistThroughKronos(playlist, baseUrl, hostBase, configKey) {
@@ -1054,16 +1449,18 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         if (!c) return res.status(404).send("#EXTM3U\n");
 
         const host = getPublicHost(req);
-        const { playlist, baseUrl, info, cacheStatus, age } = await getCachedHLSRaw(c.url);
-        const trimmedPlaylist = trimLiveMediaPlaylistToLiveEdge(playlist, LIVE_EDGE_SEGMENTS);
-        const rewritten = rewriteHLSPlaylistThroughKronos(trimmedPlaylist, baseUrl, host, configKey);
+        const { playlist, baseUrl, cacheStatus, age } = await getCachedHLSRaw(c.url);
+        const buffered = updateLiveBufferFromPlaylist(c.url, playlist, baseUrl);
+        const outputPlaylist = buffered.playlist;
+        const rewritten = rewriteHLSPlaylistThroughKronos(outputPlaylist, baseUrl, host, configKey);
 
-        const playlistInfo = analyzeHLSPlaylist(trimmedPlaylist);
+        const playlistInfo = buffered.info || analyzeHLSPlaylist(outputPlaylist);
         console.log(
             `[HLS ROUTE] channel="${c.name}" cache=${cacheStatus}` +
             `${typeof age === "number" ? ` age=${age}ms` : ""}` +
             ` type=${playlistInfo.isMaster ? "master" : "media"} segs=${playlistInfo.segmentCount}` +
-            `${playlistInfo.mediaSequence !== null ? ` seq=${playlistInfo.mediaSequence}` : ""}`
+            `${playlistInfo.mediaSequence !== null ? ` seq=${playlistInfo.mediaSequence}` : ""}` +
+            `${buffered.buffered ? ` buffer=${buffered.bufferSize} delay=${buffered.delayedSegments} out=${buffered.playlistSegments}` : ""}`
         );
 
         res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
@@ -1085,16 +1482,18 @@ app.get("/:base64Config/pl", async (req, res) => {
 
         const sourceUrl = decodeProxyUrl(req.query.u);
         const host = getPublicHost(req);
-        const { playlist, baseUrl, info, cacheStatus, age } = await getCachedHLSRaw(sourceUrl);
-        const trimmedPlaylist = trimLiveMediaPlaylistToLiveEdge(playlist, LIVE_EDGE_SEGMENTS);
-        const rewritten = rewriteHLSPlaylistThroughKronos(trimmedPlaylist, baseUrl, host, configKey);
+        const { playlist, baseUrl, cacheStatus, age } = await getCachedHLSRaw(sourceUrl);
+        const buffered = updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl);
+        const outputPlaylist = buffered.playlist;
+        const rewritten = rewriteHLSPlaylistThroughKronos(outputPlaylist, baseUrl, host, configKey);
 
-        const playlistInfo = analyzeHLSPlaylist(trimmedPlaylist);
+        const playlistInfo = buffered.info || analyzeHLSPlaylist(outputPlaylist);
         console.log(
             `[PL ROUTE] cache=${cacheStatus}` +
             `${typeof age === "number" ? ` age=${age}ms` : ""}` +
             ` type=${playlistInfo.isMaster ? "master" : "media"} segs=${playlistInfo.segmentCount}` +
-            `${playlistInfo.mediaSequence !== null ? ` seq=${playlistInfo.mediaSequence}` : ""}`
+            `${playlistInfo.mediaSequence !== null ? ` seq=${playlistInfo.mediaSequence}` : ""}` +
+            `${buffered.buffered ? ` buffer=${buffered.bufferSize} delay=${buffered.delayedSegments} out=${buffered.playlistSegments}` : ""}`
         );
 
         res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
@@ -1114,6 +1513,10 @@ app.get("/:base64Config/seg", async (req, res) => {
     let started = Date.now();
     let bytes = 0;
     let finalized = false;
+    let cacheChunks = [];
+    let shouldStoreStream = true;
+    let responseHeadersForCache = {};
+    let responseStatusForCache = 200;
 
     function finalizeSegment(result, err = null) {
         if (finalized || segmentNo === null) return;
@@ -1122,17 +1525,18 @@ app.get("/:base64Config/seg", async (req, res) => {
         memoryCache.stats.seg.active = Math.max(0, memoryCache.stats.seg.active - 1);
 
         if (result === "ok") memoryCache.stats.seg.ok += 1;
+        else if (result === "cache") memoryCache.stats.seg.cache += 1;
         else if (result === "aborted") memoryCache.stats.seg.aborted += 1;
         else memoryCache.stats.seg.error += 1;
 
         memoryCache.stats.seg.bytes += bytes;
 
-        const ok = result === "ok";
+        const ok = result === "ok" || result === "cache";
         if (shouldLogSegment(segmentNo, ok)) {
             const duration = Date.now() - started;
             const range = req.headers.range ? ` range=${req.headers.range}` : "";
             const status = res.statusCode || "?";
-            const label = ok ? "SEG OK" : result === "aborted" ? "SEG ABORT" : "SEG ERROR";
+            const label = result === "cache" ? "SEG CACHE" : ok ? "SEG OK" : result === "aborted" ? "SEG ABORT" : "SEG ERROR";
 
             console.log(
                 `[${label} #${segmentNo}] status=${status} bytes=${formatBytes(bytes)} time=${duration}ms active=${memoryCache.stats.seg.active}${range}` +
@@ -1150,6 +1554,26 @@ app.get("/:base64Config/seg", async (req, res) => {
         sourceUrl = decodeProxyUrl(req.query.u);
         segmentNo = ++memoryCache.stats.seg.total;
         memoryCache.stats.seg.active += 1;
+
+        const cached = getSegmentFromCache(sourceUrl);
+        if (cached) {
+            memoryCache.stats.segmentCache.hits += 1;
+            bytes = cached.buffer.length;
+            sendCachedSegment(req, res, cached, segmentNo);
+            finalizeSegment("cache");
+            return;
+        }
+
+        memoryCache.stats.segmentCache.misses += 1;
+
+        const waitedCached = await waitForSegmentPrefetch(sourceUrl, SEGMENT_WAIT_FOR_PREFETCH_MS);
+        if (waitedCached) {
+            memoryCache.stats.segmentCache.hits += 1;
+            bytes = waitedCached.buffer.length;
+            sendCachedSegment(req, res, waitedCached, segmentNo);
+            finalizeSegment("cache");
+            return;
+        }
 
         const headers = {
             "User-Agent": UPSTREAM_UA,
@@ -1172,6 +1596,8 @@ app.get("/:base64Config/seg", async (req, res) => {
         });
 
         upstream = response.data;
+        responseHeadersForCache = response.headers || {};
+        responseStatusForCache = response.status;
 
         const headersToForward = [
             "content-type",
@@ -1189,13 +1615,27 @@ app.get("/:base64Config/seg", async (req, res) => {
         });
 
         res.setHeader("X-Kronos-Relay", "1");
+        res.setHeader("X-Kronos-Cache", "MISS");
         res.status(response.status);
 
         upstream.on("data", chunk => {
             bytes += chunk.length;
+
+            if (shouldStoreStream && bytes <= SEGMENT_CACHE_MAX_ITEM_BYTES) {
+                cacheChunks.push(chunk);
+            } else {
+                shouldStoreStream = false;
+                cacheChunks = [];
+            }
         });
 
-        res.on("finish", () => finalizeSegment("ok"));
+        res.on("finish", () => {
+            if (shouldStoreStream && cacheChunks.length > 0 && (responseStatusForCache === 200 || responseStatusForCache === 206)) {
+                const buffer = Buffer.concat(cacheChunks);
+                storeSegmentInCache(sourceUrl, buffer, responseHeadersForCache, responseStatusForCache, "stream");
+            }
+            finalizeSegment("ok");
+        });
 
         res.on("close", () => {
             if (!res.writableEnded) finalizeSegment("aborted");
@@ -1251,7 +1691,12 @@ app.get("/stats", (req, res) => {
         memory: process.memoryUsage(),
         stats: memoryCache.stats,
         hlsCacheKeys: Object.keys(memoryCache.hlsData).length,
-        hlsInflightKeys: Object.keys(memoryCache.hlsInflight).length
+        hlsInflightKeys: Object.keys(memoryCache.hlsInflight).length,
+        liveBufferKeys: Object.keys(memoryCache.liveBuffers).length,
+        segmentCacheKeys: Object.keys(memoryCache.segmentData).length,
+        segmentCacheBytes: memoryCache.segmentCacheBytes,
+        segmentPrefetchActive: memoryCache.segmentPrefetchActive,
+        segmentPrefetchQueue: memoryCache.segmentPrefetchQueue.length
     });
 });
 
@@ -1274,17 +1719,31 @@ app.get("/:base64Config/debug", async (req, res) => {
                 HLS_REFRESH_TTL,
                 HLS_MASTER_REFRESH_TTL,
                 HLS_STALE_TTL,
+                HLS_LIVE_STALE_REFRESH_TTL,
                 HLS_REQUEST_TIMEOUT,
                 HLS_RETRY_COUNT,
                 SEG_REQUEST_TIMEOUT,
                 SEG_LOG_EVERY,
-                LIVE_EDGE_SEGMENTS
+                LIVE_BUFFER_SEGMENTS,
+                LIVE_PLAYLIST_SEGMENTS,
+                LIVE_DELAY_SEGMENTS,
+                MIN_LIVE_SEGMENTS_READY,
+                SEGMENT_CACHE_TTL,
+                SEGMENT_CACHE_MAX_BYTES,
+                SEGMENT_CACHE_MAX_SEGMENTS,
+                SEGMENT_PREFETCH_CONCURRENCY,
+                SEGMENT_PREFETCH_AHEAD
             },
             cacheInfo: {
                 lastUpdate: memoryCache.lastUpdate[configKey],
                 isUpdating: memoryCache.isUpdating[configKey],
                 hlsCacheKeys: Object.keys(memoryCache.hlsData).length,
-                hlsInflightKeys: Object.keys(memoryCache.hlsInflight).length
+                hlsInflightKeys: Object.keys(memoryCache.hlsInflight).length,
+                liveBufferKeys: Object.keys(memoryCache.liveBuffers).length,
+                segmentCacheKeys: Object.keys(memoryCache.segmentData).length,
+                segmentCacheBytes: memoryCache.segmentCacheBytes,
+                segmentPrefetchActive: memoryCache.segmentPrefetchActive,
+                segmentPrefetchQueue: memoryCache.segmentPrefetchQueue.length
             },
             stats: memoryCache.stats
         });
@@ -1298,8 +1757,9 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`K.R.O.N.O.S. ${RELEASE_VERSION} - Self-Relay Mode`);
     console.log(`${"=".repeat(60)}`);
     console.log(`Server: http://0.0.0.0:${PORT}`);
-    console.log(`HLS live refresh: ${HLS_REFRESH_TTL}ms | master refresh: ${HLS_MASTER_REFRESH_TTL}ms | stale fallback: ${HLS_STALE_TTL}ms`);
-    console.log(`Live edge segments: ${LIVE_EDGE_SEGMENTS}`);
+    console.log(`HLS live refresh: ${HLS_REFRESH_TTL}ms | live stale refresh: ${HLS_LIVE_STALE_REFRESH_TTL}ms | stale fallback: ${HLS_STALE_TTL}ms`);
+    console.log(`Live buffer: keep=${LIVE_BUFFER_SEGMENTS} | playlist=${LIVE_PLAYLIST_SEGMENTS} | delay=${LIVE_DELAY_SEGMENTS} | minReady=${MIN_LIVE_SEGMENTS_READY}`);
+    console.log(`Segment cache: max=${formatBytes(SEGMENT_CACHE_MAX_BYTES)} | maxSegments=${SEGMENT_CACHE_MAX_SEGMENTS} | prefetchConcurrency=${SEGMENT_PREFETCH_CONCURRENCY}`);
     console.log(`Segment timeout: ${SEG_REQUEST_TIMEOUT}ms | segment log every: ${SEG_LOG_EVERY}`);
     console.log(`Node: ${process.version}`);
     console.log(`${"=".repeat(60)}\n`);
