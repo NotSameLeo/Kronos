@@ -1056,40 +1056,59 @@ async function prebufferInitialStream(sourceUrl, label = "stream", context = {})
         ` dynamicTarget=${formatSeconds(DYNAMIC_BUFFER_TARGET_SECONDS)}`
     );
 
+    let lastErr = null;
+    let attempt = 0;
+
     while (Date.now() - started < STREAM_PREBUFFER_TIMEOUT) {
         assertSessionActive(context.session, label);
-        const hls = await fetchAndStoreHLSRaw(getHLSCacheKey(sourceUrl), sourceUrl, "prebuffer");
-        assertSessionActive(context.session, label);
-        const buffered = updateLiveBufferFromPlaylist(sourceUrl, hls.playlist, hls.baseUrl, context);
-        const candidates = (buffered.segments || []).slice(-SEGMENT_PREFETCH_AHEAD);
+        attempt += 1;
 
-        candidates.forEach(segment => queueSegmentPrefetch(segment.sourceUrl || segment.url, context));
+        try {
+            const hls = await fetchAndStoreHLSRaw(getHLSCacheKey(sourceUrl), sourceUrl, "prebuffer");
+            assertSessionActive(context.session, label);
+            const buffered = updateLiveBufferFromPlaylist(sourceUrl, hls.playlist, hls.baseUrl, context);
+            const candidates = (buffered.segments || []).slice(-SEGMENT_PREFETCH_AHEAD);
 
-        const cachedSeconds = getCachedDurationForSegments(candidates);
-        console.log(
-            `[STARTUP PHASE 2 PROGRESS] channel="${label}"` +
-            ` cached=${formatSeconds(cachedSeconds)}/${formatSeconds(STREAM_PREBUFFER_SECONDS)}` +
-            ` status=${getBufferStatus(cachedSeconds)}` +
-            ` candidateSegs=${candidates.length}` +
-            ` prefetchActive=${memoryCache.segmentPrefetchActive}` +
-            ` prefetchQueue=${memoryCache.segmentPrefetchQueue.length}`
-        );
+            candidates.forEach(segment => queueSegmentPrefetch(segment.sourceUrl || segment.url, context));
 
-        if (cachedSeconds >= STREAM_PREBUFFER_SECONDS) {
+            const cachedSeconds = getCachedDurationForSegments(candidates);
             console.log(
-                `[STARTUP COMPLETE] channel="${label}" stream-ready` +
-                ` startBuffer=${formatSeconds(cachedSeconds)}` +
-                ` target=${formatSeconds(STREAM_PREBUFFER_SECONDS)}` +
-                ` elapsed=${Date.now() - started}ms`
+                `[STARTUP PHASE 2 PROGRESS] channel="${label}"` +
+                ` cached=${formatSeconds(cachedSeconds)}/${formatSeconds(STREAM_PREBUFFER_SECONDS)}` +
+                ` status=${getBufferStatus(cachedSeconds)}` +
+                ` candidateSegs=${candidates.length}` +
+                ` prefetchActive=${memoryCache.segmentPrefetchActive}` +
+                ` prefetchQueue=${memoryCache.segmentPrefetchQueue.length}`
             );
-            return { status: "ready", cachedSeconds };
+
+            if (cachedSeconds >= STREAM_PREBUFFER_SECONDS) {
+                console.log(
+                    `[STARTUP COMPLETE] channel="${label}" stream-ready` +
+                    ` startBuffer=${formatSeconds(cachedSeconds)}` +
+                    ` target=${formatSeconds(STREAM_PREBUFFER_SECONDS)}` +
+                    ` elapsed=${Date.now() - started}ms`
+                );
+                return { status: "ready", cachedSeconds };
+            }
+
+            lastErr = null;
+        } catch (err) {
+            if (err.code === "KRONOS_SESSION_CANCELLED") throw err;
+            lastErr = err;
+            console.warn(
+                `[STARTUP PHASE 2 RETRY] channel="${label}" attempt=${attempt}` +
+                ` err=${err.message} elapsed=${Date.now() - started}ms - continuing until timeout`
+            );
         }
 
         await sleep(700);
         assertSessionActive(context.session, label);
     }
 
-    throw new Error(`Prebuffer failed: less than ${STREAM_PREBUFFER_SECONDS}s after ${Date.now() - started}ms`);
+    throw new Error(
+        `Prebuffer failed after ${Date.now() - started}ms` +
+        `${lastErr ? ` lastError=${lastErr.message}` : ` (less than ${STREAM_PREBUFFER_SECONDS}s buffered)`}`
+    );
 }
 
 async function ensureStreamReady(sourceUrl, label = "stream", context = {}) {
