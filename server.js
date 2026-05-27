@@ -86,52 +86,65 @@ const memoryCache = {
 const CACHE_TTL = 30 * 60 * 1000;
 
 // HLS self-relay tuning
-// Conservative mode: stability > real-time latency.
+// Dynamic-buffer mode: quick start + progressive server-side buffer.
 const HLS_REFRESH_TTL = Number(process.env.HLS_REFRESH_TTL || 6000);
 const HLS_MASTER_REFRESH_TTL = Number(process.env.HLS_MASTER_REFRESH_TTL || 30000);
 const HLS_STALE_TTL = Number(process.env.HLS_STALE_TTL || 120000);
 const HLS_LIVE_STALE_REFRESH_TTL = Number(process.env.HLS_LIVE_STALE_REFRESH_TTL || 25000);
-const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 15000);
-const HLS_RETRY_COUNT = Number(process.env.HLS_RETRY_COUNT || 3);
-const HLS_RETRY_BASE_DELAY = Number(process.env.HLS_RETRY_BASE_DELAY || 400);
+const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 12000);
+
+// Keep HLS retries simple: the stream-acquire loop is now the real retry controller.
+const HLS_RETRY_COUNT = Number(process.env.HLS_RETRY_COUNT || 1);
+const HLS_RETRY_BASE_DELAY = Number(process.env.HLS_RETRY_BASE_DELAY || 300);
 const SEG_REQUEST_TIMEOUT = Number(process.env.SEG_REQUEST_TIMEOUT || 45000);
 
 // Segment logs: 1 = log every successful segment, 5 = one every 5, 0 = only errors.
 const SEG_LOG_EVERY = Number(process.env.SEG_LOG_EVERY || 1);
 
-// Conservative live buffer.
-// Kronos builds a local rolling DVR-like playlist from upstream HLS windows,
-// drops the newest segment(s), and prefetches segment data in memory.
-const LIVE_BUFFER_SEGMENTS = Number(process.env.LIVE_BUFFER_SEGMENTS || 24);
+// Dynamic live buffer.
+// Phase 1: acquire a valid playlist for max 25s.
+// Phase 2: start as soon as Kronos has enough real seconds cached.
+// Phase 3: while playing, keep filling the buffer toward the target.
+const LIVE_BUFFER_SEGMENTS = Number(process.env.LIVE_BUFFER_SEGMENTS || 32);
 const LIVE_PLAYLIST_SEGMENTS = Number(process.env.LIVE_PLAYLIST_SEGMENTS || 10);
 const LIVE_DELAY_SEGMENTS = Number(process.env.LIVE_DELAY_SEGMENTS || 2);
-const MIN_LIVE_SEGMENTS_READY = Number(process.env.MIN_LIVE_SEGMENTS_READY || 3);
-const MIN_LIVE_WARMUP_ATTEMPTS = Number(process.env.MIN_LIVE_WARMUP_ATTEMPTS || 4);
-const MIN_LIVE_WARMUP_DELAY_MS = Number(process.env.MIN_LIVE_WARMUP_DELAY_MS || 4000);
+const MIN_LIVE_SEGMENTS_READY = Number(process.env.MIN_LIVE_SEGMENTS_READY || 2);
+const MIN_LIVE_WARMUP_ATTEMPTS = Number(process.env.MIN_LIVE_WARMUP_ATTEMPTS || 2);
+const MIN_LIVE_WARMUP_DELAY_MS = Number(process.env.MIN_LIVE_WARMUP_DELAY_MS || 2500);
 
-// Startup prebuffer method 1:
-// Stremio waits while Kronos acquires the stream and caches enough .ts chunks.
+// Startup and dynamic-buffer parameters.
 const STREAM_STARTUP_PREBUFFER_ENABLED = String(process.env.STREAM_STARTUP_PREBUFFER_ENABLED || "1") !== "0";
-const STREAM_ACQUIRE_ATTEMPTS = Number(process.env.STREAM_ACQUIRE_ATTEMPTS || 5);
-const STREAM_ACQUIRE_TOTAL_TIMEOUT = Number(process.env.STREAM_ACQUIRE_TOTAL_TIMEOUT || 45000);
-const STREAM_ACQUIRE_RETRY_DELAY_MS = Number(process.env.STREAM_ACQUIRE_RETRY_DELAY_MS || 9000);
-const PREBUFFER_MIN_SEGMENTS = Number(process.env.PREBUFFER_MIN_SEGMENTS || 4);
-const PREBUFFER_TARGET_SEGMENTS = Number(process.env.PREBUFFER_TARGET_SEGMENTS || 5);
-const PREBUFFER_MIN_SECONDS = Number(process.env.PREBUFFER_MIN_SECONDS || 35);
-const PREBUFFER_WAIT_FOR_SEGMENTS_MS = Number(process.env.PREBUFFER_WAIT_FOR_SEGMENTS_MS || 18000);
+const STREAM_ACQUIRE_TIMEOUT = Number(process.env.STREAM_ACQUIRE_TIMEOUT || 25000);
+const STREAM_ACQUIRE_POLL_MS = Number(process.env.STREAM_ACQUIRE_POLL_MS || 2500);
+
+const STREAM_PREBUFFER_START_SECONDS = Number(process.env.STREAM_PREBUFFER_START_SECONDS || 24);
+const STREAM_PREBUFFER_START_MIN_SEGMENTS = Number(process.env.STREAM_PREBUFFER_START_MIN_SEGMENTS || 2);
+const STREAM_PREBUFFER_TIMEOUT = Number(process.env.STREAM_PREBUFFER_TIMEOUT || 35000);
+
+const DYNAMIC_BUFFER_CRITICAL_SECONDS = Number(process.env.DYNAMIC_BUFFER_CRITICAL_SECONDS || 10);
+const DYNAMIC_BUFFER_LOW_SECONDS = Number(process.env.DYNAMIC_BUFFER_LOW_SECONDS || 20);
+const DYNAMIC_BUFFER_TARGET_SECONDS = Number(process.env.DYNAMIC_BUFFER_TARGET_SECONDS || 45);
+const DYNAMIC_BUFFER_MAX_SECONDS = Number(process.env.DYNAMIC_BUFFER_MAX_SECONDS || 60);
+
 const STREAM_READY_TTL = Number(process.env.STREAM_READY_TTL || 5 * 60 * 1000);
-const MIN_PLAYLIST_OUTPUT_SEGMENTS = Number(process.env.MIN_PLAYLIST_OUTPUT_SEGMENTS || 4);
+const MIN_PLAYLIST_OUTPUT_SEGMENTS = Number(process.env.MIN_PLAYLIST_OUTPUT_SEGMENTS || STREAM_PREBUFFER_START_MIN_SEGMENTS);
+
+// Compatibility aliases used by existing debug/stat code paths.
+const PREBUFFER_MIN_SEGMENTS = STREAM_PREBUFFER_START_MIN_SEGMENTS;
+const PREBUFFER_TARGET_SEGMENTS = Number(process.env.PREBUFFER_TARGET_SEGMENTS || 4);
+const PREBUFFER_MIN_SECONDS = STREAM_PREBUFFER_START_SECONDS;
+const PREBUFFER_WAIT_FOR_SEGMENTS_MS = STREAM_PREBUFFER_TIMEOUT;
 
 const SEGMENT_CACHE_TTL = Number(process.env.SEGMENT_CACHE_TTL || 10 * 60 * 1000);
 const SEGMENT_CACHE_MAX_BYTES = Number(process.env.SEGMENT_CACHE_MAX_BYTES || 512 * 1024 * 1024);
-const SEGMENT_CACHE_MAX_SEGMENTS = Number(process.env.SEGMENT_CACHE_MAX_SEGMENTS || 80);
+const SEGMENT_CACHE_MAX_SEGMENTS = Number(process.env.SEGMENT_CACHE_MAX_SEGMENTS || 100);
 const SEGMENT_CACHE_MAX_ITEM_BYTES = Number(process.env.SEGMENT_CACHE_MAX_ITEM_BYTES || 24 * 1024 * 1024);
 const SEGMENT_PREFETCH_CONCURRENCY = Number(process.env.SEGMENT_PREFETCH_CONCURRENCY || 2);
 const SEGMENT_PREFETCH_AHEAD = Number(process.env.SEGMENT_PREFETCH_AHEAD || 8);
 const SEGMENT_WAIT_FOR_PREFETCH_MS = Number(process.env.SEGMENT_WAIT_FOR_PREFETCH_MS || 2500);
 
 const ADDON_TYPE = "tv";
-const RELEASE_VERSION = "1.6.4";
+const RELEASE_VERSION = "1.6.5";
 
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
@@ -558,7 +571,42 @@ function getCachedCountForSegments(segments) {
     return (segments || []).filter(segment => getSegmentFromCache(segment.url)).length;
 }
 
-async function waitForCachedSegments(segments, minCachedSegments, maxWaitMs, label = "startup") {
+function getCachedDurationForSegments(segments) {
+    return (segments || []).reduce((sum, segment) => {
+        return sum + (getSegmentFromCache(segment.url) ? (Number(segment.duration) || 0) : 0);
+    }, 0);
+}
+
+function getSegmentDurationSum(segments) {
+    return (segments || []).reduce((sum, segment) => sum + (Number(segment.duration) || 0), 0);
+}
+
+function getDynamicBufferMode(cachedSeconds) {
+    if (cachedSeconds < DYNAMIC_BUFFER_CRITICAL_SECONDS) return "critical";
+    if (cachedSeconds < DYNAMIC_BUFFER_LOW_SECONDS) return "low";
+    if (cachedSeconds < DYNAMIC_BUFFER_TARGET_SECONDS) return "filling";
+    if (cachedSeconds >= DYNAMIC_BUFFER_MAX_SECONDS) return "full";
+    return "target";
+}
+
+function selectSegmentsUntilSeconds(segments, targetSeconds, maxSegments = SEGMENT_PREFETCH_AHEAD) {
+    const selected = [];
+    let total = 0;
+
+    for (const segment of segments || []) {
+        if (!segment?.url) continue;
+        selected.push(segment);
+        total += Number(segment.duration) || 0;
+
+        if (total >= targetSeconds || selected.length >= maxSegments) {
+            break;
+        }
+    }
+
+    return selected;
+}
+
+async function waitForCachedBufferSeconds(segments, minSeconds, minSegments, maxWaitMs, label = "startup") {
     const uniqueSegments = [];
     const seen = new Set();
 
@@ -574,9 +622,15 @@ async function waitForCachedSegments(segments, minCachedSegments, maxWaitMs, lab
 
     while (Date.now() - started <= maxWaitMs) {
         const cachedCount = getCachedCountForSegments(uniqueSegments);
+        const cachedSeconds = getCachedDurationForSegments(uniqueSegments);
 
-        if (cachedCount >= Math.min(minCachedSegments, uniqueSegments.length)) {
-            return { cachedCount, total: uniqueSegments.length, waitedMs: Date.now() - started };
+        if (cachedCount >= Math.min(minSegments, uniqueSegments.length) && cachedSeconds >= minSeconds) {
+            return {
+                cachedCount,
+                total: uniqueSegments.length,
+                cachedSeconds,
+                waitedMs: Date.now() - started
+            };
         }
 
         await sleep(300);
@@ -585,8 +639,44 @@ async function waitForCachedSegments(segments, minCachedSegments, maxWaitMs, lab
     return {
         cachedCount: getCachedCountForSegments(uniqueSegments),
         total: uniqueSegments.length,
+        cachedSeconds: getCachedDurationForSegments(uniqueSegments),
         waitedMs: Date.now() - started
     };
+}
+
+function queueDynamicPrefetchForBuffer(buffer, label = "stream") {
+    if (!buffer || !Array.isArray(buffer.segments) || buffer.segments.length === 0) {
+        return { mode: "empty", cachedSeconds: 0, queued: 0 };
+    }
+
+    const cachedSeconds = getCachedDurationForSegments(buffer.segments);
+    const mode = getDynamicBufferMode(cachedSeconds);
+
+    if (cachedSeconds >= DYNAMIC_BUFFER_MAX_SECONDS) {
+        return { mode, cachedSeconds, queued: 0 };
+    }
+
+    const uncachedSegments = buffer.segments
+        .filter(segment => !getSegmentFromCache(segment.url))
+        .slice(-Math.max(1, SEGMENT_PREFETCH_AHEAD));
+
+    const neededSeconds = Math.max(0, DYNAMIC_BUFFER_TARGET_SECONDS - cachedSeconds);
+    const candidates = selectSegmentsUntilSeconds(
+        uncachedSegments,
+        Math.max(neededSeconds, DYNAMIC_BUFFER_LOW_SECONDS),
+        SEGMENT_PREFETCH_AHEAD
+    );
+
+    candidates.forEach(segment => queueSegmentPrefetch(segment.url));
+
+    if (candidates.length > 0) {
+        console.log(
+            `[DYNAMIC BUFFER] channel="${label}" mode=${mode} cached≈${Math.round(cachedSeconds)}s` +
+            ` target=${DYNAMIC_BUFFER_TARGET_SECONDS}s queued=${candidates.length}`
+        );
+    }
+
+    return { mode, cachedSeconds, queued: candidates.length };
 }
 
 function buildPlaylistFromBufferedSegments(buffer, selectedSegments, effectiveDelay = LIVE_DELAY_SEGMENTS) {
@@ -617,6 +707,131 @@ function buildPlaylistFromBufferedSegments(buffer, selectedSegments, effectiveDe
     ].join("\n") + "\n";
 }
 
+async function acquireInitialHLS(sourceUrl, label = "stream") {
+    const cacheKey = getHLSCacheKey(sourceUrl);
+    const started = Date.now();
+    let fetches = 0;
+    let lastErr = null;
+
+    console.log(`[STREAM ACQUIRE] channel="${label}" timeout=${STREAM_ACQUIRE_TIMEOUT}ms`);
+
+    while (Date.now() - started < STREAM_ACQUIRE_TIMEOUT) {
+        fetches += 1;
+
+        try {
+            const hls = await fetchAndStoreHLSRaw(cacheKey, sourceUrl, "acquire");
+            const info = hls.info || analyzeHLSPlaylist(hls.playlist);
+
+            if (isLiveMediaPlaylistInfo(info) && info.segmentCount > 0) {
+                updateLiveBufferFromPlaylist(sourceUrl, hls.playlist, hls.baseUrl, {
+                    minOutputSegments: 1,
+                    maxPlaylistSegments: LIVE_PLAYLIST_SEGMENTS,
+                    label
+                });
+
+                console.log(
+                    `[STREAM ACQUIRE OK] channel="${label}" fetches=${fetches}` +
+                    ` segs=${info.segmentCount}` +
+                    `${info.targetDuration ? ` target=${info.targetDuration}s` : ""}` +
+                    ` time=${Date.now() - started}ms`
+                );
+
+                return hls;
+            }
+
+            if (info.isMaster) {
+                console.log(`[STREAM ACQUIRE OK] channel="${label}" master-playlist time=${Date.now() - started}ms`);
+                return hls;
+            }
+
+            lastErr = new Error("Playlist valid but without playable segments");
+        } catch (err) {
+            lastErr = err;
+            console.error(`[STREAM ACQUIRE ERROR] channel="${label}" fetch=${fetches} err=${err.message}`);
+        }
+
+        const remaining = STREAM_ACQUIRE_TIMEOUT - (Date.now() - started);
+        if (remaining > 0) await sleep(Math.min(STREAM_ACQUIRE_POLL_MS, remaining));
+    }
+
+    throw new Error(lastErr ? `Acquire failed: ${lastErr.message}` : "Acquire failed: timeout");
+}
+
+async function prebufferInitialStream(sourceUrl, label = "stream") {
+    const cacheKey = getHLSCacheKey(sourceUrl);
+    const started = Date.now();
+
+    console.log(
+        `[STREAM PREBUFFER START] channel="${label}" start=${STREAM_PREBUFFER_START_SECONDS}s` +
+        ` minSegments=${STREAM_PREBUFFER_START_MIN_SEGMENTS} timeout=${STREAM_PREBUFFER_TIMEOUT}ms`
+    );
+
+    while (Date.now() - started < STREAM_PREBUFFER_TIMEOUT) {
+        const hls = await fetchAndStoreHLSRaw(cacheKey, sourceUrl, "prebuffer");
+        const buffered = updateLiveBufferFromPlaylist(sourceUrl, hls.playlist, hls.baseUrl, {
+            minOutputSegments: 1,
+            maxPlaylistSegments: LIVE_PLAYLIST_SEGMENTS,
+            delaySegments: 0,
+            label
+        });
+
+        const buffer = getLiveBuffer(sourceUrl);
+        const selection = selectBufferedSegments(buffer, {
+            minOutputSegments: 1,
+            maxPlaylistSegments: LIVE_PLAYLIST_SEGMENTS,
+            delaySegments: 0
+        });
+
+        const neededSegments = selectSegmentsUntilSeconds(
+            selection.segments,
+            STREAM_PREBUFFER_START_SECONDS,
+            LIVE_PLAYLIST_SEGMENTS
+        );
+
+        const prebuffer = await waitForCachedBufferSeconds(
+            neededSegments,
+            STREAM_PREBUFFER_START_SECONDS,
+            STREAM_PREBUFFER_START_MIN_SEGMENTS,
+            Math.min(3500, Math.max(500, STREAM_PREBUFFER_TIMEOUT - (Date.now() - started))),
+            label
+        );
+
+        const totalDuration = getSegmentDurationSum(selection.segments);
+        const cachedSeconds = getCachedDurationForSegments(selection.segments);
+        const ready =
+            prebuffer.cachedSeconds >= STREAM_PREBUFFER_START_SECONDS &&
+            prebuffer.cachedCount >= STREAM_PREBUFFER_START_MIN_SEGMENTS;
+
+        console.log(
+            `[STREAM PREBUFFER] channel="${label}" cached≈${Math.round(cachedSeconds)}s/${STREAM_PREBUFFER_START_SECONDS}s` +
+            ` cachedSegs=${prebuffer.cachedCount}/${selection.segments.length}` +
+            ` playlist≈${Math.round(totalDuration)}s` +
+            ` waited=${prebuffer.waitedMs}ms`
+        );
+
+        if (ready) {
+            queueDynamicPrefetchForBuffer(buffer, label);
+
+            console.log(
+                `[STREAM READY] channel="${label}" startBuffer≈${Math.round(prebuffer.cachedSeconds)}s` +
+                ` segs=${prebuffer.cachedCount} total=${Date.now() - started}ms` +
+                ` dynamicTarget=${DYNAMIC_BUFFER_TARGET_SECONDS}s`
+            );
+
+            return {
+                status: "ready",
+                cachedSegments: prebuffer.cachedCount,
+                cachedSeconds: prebuffer.cachedSeconds,
+                totalMs: Date.now() - started
+            };
+        }
+
+        await sleep(700);
+    }
+
+    throw new Error(`Prebuffer failed: cached less than ${STREAM_PREBUFFER_START_SECONDS}s after ${Date.now() - started}ms`);
+}
+
 async function ensureStreamPrebuffered(sourceUrl, label = "stream") {
     if (!STREAM_STARTUP_PREBUFFER_ENABLED) {
         return { skipped: true };
@@ -639,24 +854,29 @@ async function ensureStreamPrebuffered(sourceUrl, label = "stream") {
 
     const existingBuffer = getLiveBuffer(sourceUrl);
     const existingSelection = selectBufferedSegments(existingBuffer, {
-        minOutputSegments: PREBUFFER_MIN_SEGMENTS,
-        maxPlaylistSegments: LIVE_PLAYLIST_SEGMENTS
+        minOutputSegments: STREAM_PREBUFFER_START_MIN_SEGMENTS,
+        maxPlaylistSegments: LIVE_PLAYLIST_SEGMENTS,
+        delaySegments: 0
     });
+
+    const existingCachedSeconds = getCachedDurationForSegments(existingSelection.segments);
+    const existingCachedSegments = getCachedCountForSegments(existingSelection.segments);
 
     if (
         state.status === "ready" &&
         Date.now() - state.readyAt <= STREAM_READY_TTL &&
-        existingSelection.ready &&
-        getCachedCountForSegments(existingSelection.segments) >= PREBUFFER_MIN_SEGMENTS
+        existingCachedSeconds >= STREAM_PREBUFFER_START_SECONDS &&
+        existingCachedSegments >= STREAM_PREBUFFER_START_MIN_SEGMENTS
     ) {
         memoryCache.stats.startup.reusedReady += 1;
+        queueDynamicPrefetchForBuffer(existingBuffer, label);
+
         return {
             skipped: false,
             status: "ready",
             reused: true,
-            cachedSegments: getCachedCountForSegments(existingSelection.segments),
-            playlistSegments: existingSelection.segments.length,
-            duration: existingSelection.totalDuration
+            cachedSegments: existingCachedSegments,
+            cachedSeconds: existingCachedSeconds
         };
     }
 
@@ -673,103 +893,40 @@ async function ensureStreamPrebuffered(sourceUrl, label = "stream") {
     state.lastError = null;
 
     state.promise = (async () => {
-        memoryCache.stats.startup.acquiring += 1;
-
         const started = Date.now();
-        let attempts = 0;
-        let lastErr = null;
-        let bestInfo = null;
 
-        console.log(
-            `[STREAM ACQUIRE] channel="${label}" attempts=${STREAM_ACQUIRE_ATTEMPTS} timeout=${STREAM_ACQUIRE_TOTAL_TIMEOUT}ms target=${PREBUFFER_TARGET_SEGMENTS} min=${PREBUFFER_MIN_SEGMENTS}`
-        );
+        try {
+            memoryCache.stats.startup.acquiring += 1;
 
-        while (attempts < STREAM_ACQUIRE_ATTEMPTS && Date.now() - started < STREAM_ACQUIRE_TOTAL_TIMEOUT) {
-            attempts += 1;
+            await acquireInitialHLS(sourceUrl, label);
 
-            try {
-                state.status = "acquiring";
-                state.updatedAt = Date.now();
+            state.status = "prebuffering";
+            state.updatedAt = Date.now();
 
-                const hls = await fetchAndStoreHLSRaw(cacheKey, sourceUrl, `startup-${attempts}`);
-                const buffered = updateLiveBufferFromPlaylist(sourceUrl, hls.playlist, hls.baseUrl, {
-                    minOutputSegments: PREBUFFER_MIN_SEGMENTS,
-                    maxPlaylistSegments: LIVE_PLAYLIST_SEGMENTS,
-                    forcePrefetch: true
-                });
+            const ready = await prebufferInitialStream(sourceUrl, label);
 
-                bestInfo = buffered.info || analyzeHLSPlaylist(hls.playlist);
+            state.status = "ready";
+            state.readyAt = Date.now();
+            state.updatedAt = Date.now();
+            state.lastError = null;
+            memoryCache.stats.startup.ready += 1;
 
-                const buffer = getLiveBuffer(sourceUrl);
-                const selection = selectBufferedSegments(buffer, {
-                    minOutputSegments: PREBUFFER_MIN_SEGMENTS,
-                    maxPlaylistSegments: LIVE_PLAYLIST_SEGMENTS
-                });
+            return {
+                ...ready,
+                totalStartupMs: Date.now() - started
+            };
+        } catch (err) {
+            state.status = "failed";
+            state.updatedAt = Date.now();
+            state.lastError = err.message;
+            memoryCache.stats.startup.failed += 1;
 
-                const wantedSegments = selection.segments.slice(-Math.max(PREBUFFER_TARGET_SEGMENTS, PREBUFFER_MIN_SEGMENTS));
-                const prefetch = await waitForCachedSegments(
-                    wantedSegments,
-                    PREBUFFER_MIN_SEGMENTS,
-                    PREBUFFER_WAIT_FOR_SEGMENTS_MS,
-                    label
-                );
+            console.error(
+                `[STREAM FAILED] channel="${label}" total=${Date.now() - started}ms reason=${err.message}`
+            );
 
-                const selectedDuration = selection.totalDuration || ((bestInfo?.targetDuration || 10) * selection.segments.length);
-                const ready =
-                    selection.segments.length >= PREBUFFER_MIN_SEGMENTS &&
-                    prefetch.cachedCount >= PREBUFFER_MIN_SEGMENTS &&
-                    selectedDuration >= PREBUFFER_MIN_SECONDS;
-
-                console.log(
-                    `[STREAM PREBUFFER] channel="${label}" attempt=${attempts}/${STREAM_ACQUIRE_ATTEMPTS}` +
-                    ` playlistSegs=${selection.segments.length} cached=${prefetch.cachedCount}/${prefetch.total}` +
-                    ` duration≈${Math.round(selectedDuration)}s waited=${prefetch.waitedMs}ms` +
-                    ` buffer=${selection.totalBufferSegments} delay=${selection.effectiveDelay}`
-                );
-
-                if (ready) {
-                    state.status = "ready";
-                    state.readyAt = Date.now();
-                    state.updatedAt = Date.now();
-                    memoryCache.stats.startup.ready += 1;
-
-                    console.log(
-                        `[STREAM READY] channel="${label}" attempts=${attempts} cached=${prefetch.cachedCount}` +
-                        ` playlistSegs=${selection.segments.length} duration≈${Math.round(selectedDuration)}s total=${Date.now() - started}ms`
-                    );
-
-                    return {
-                        status: "ready",
-                        attempts,
-                        cachedSegments: prefetch.cachedCount,
-                        playlistSegments: selection.segments.length,
-                        duration: selectedDuration,
-                        totalMs: Date.now() - started
-                    };
-                }
-            } catch (err) {
-                lastErr = err;
-                state.lastError = err.message;
-                console.error(`[STREAM ACQUIRE ERROR] channel="${label}" attempt=${attempts}/${STREAM_ACQUIRE_ATTEMPTS} err=${err.message}`);
-            }
-
-            const remaining = STREAM_ACQUIRE_TOTAL_TIMEOUT - (Date.now() - started);
-            if (attempts < STREAM_ACQUIRE_ATTEMPTS && remaining > 0) {
-                await sleep(Math.min(STREAM_ACQUIRE_RETRY_DELAY_MS, remaining));
-            }
+            throw err;
         }
-
-        state.status = "failed";
-        state.updatedAt = Date.now();
-        memoryCache.stats.startup.failed += 1;
-
-        const message = lastErr
-            ? `Stream prebuffer failed: ${lastErr.message}`
-            : `Stream prebuffer failed: not enough cached segments after ${attempts} attempts`;
-
-        console.error(`[STREAM FAILED] channel="${label}" attempts=${attempts} total=${Date.now() - started}ms reason=${message}`);
-
-        throw new Error(message);
     })();
 
     try {
@@ -835,12 +992,11 @@ function updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl, options = {}
         delaySegments: options.delaySegments ?? LIVE_DELAY_SEGMENTS
     });
 
-    const prefetchCandidates = [
-        ...selection.segments,
-        ...buffer.segments.slice(-Math.max(0, SEGMENT_PREFETCH_AHEAD))
-    ];
+    const dynamic = queueDynamicPrefetchForBuffer(buffer, options.label || "stream");
 
-    prefetchCandidates.forEach(segment => queueSegmentPrefetch(segment.url));
+    // Always make sure the visible playlist is being cached, but do not over-prefetch
+    // beyond the dynamic target/max buffer.
+    selection.segments.forEach(segment => queueSegmentPrefetch(segment.url));
 
     if (!selection.segments.length) {
         return { playlist, info: parsed.info, cacheKey, buffered: false };
@@ -854,6 +1010,9 @@ function updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl, options = {}
 
     memoryCache.stats.liveBuffer.playlistsBuilt += 1;
 
+    const cachedSeconds = getCachedDurationForSegments(selection.segments);
+    const cachedSegments = getCachedCountForSegments(selection.segments);
+
     return {
         playlist: rebuilt,
         info: analyzeHLSPlaylist(rebuilt),
@@ -862,8 +1021,12 @@ function updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl, options = {}
         bufferSize: buffer.segments.length,
         delayedSegments: selection.effectiveDelay,
         playlistSegments: selection.segments.length,
-        cachedSegments: getCachedCountForSegments(selection.segments),
+        cachedSegments,
+        cachedSeconds,
         duration: selection.totalDuration,
+        dynamicMode: dynamic.mode,
+        dynamicCachedSeconds: dynamic.cachedSeconds,
+        dynamicQueued: dynamic.queued,
         segments: selection.segments
     };
 }
@@ -914,7 +1077,6 @@ async function fetchHLSManifest(sourceUrl) {
         const started = Date.now();
         try {
             memoryCache.stats.hls.totalFetches += 1;
-            console.log(`[HLS FETCH] Attempt ${attempt}/${HLS_RETRY_COUNT}:`, sanitizeUrlForLog(sourceUrl));
 
             const response = await axios.get(sourceUrl, {
                 timeout: HLS_REQUEST_TIMEOUT,
@@ -949,7 +1111,8 @@ async function fetchHLSManifest(sourceUrl) {
             lastErr = err;
             memoryCache.stats.hls.failedFetches += 1;
             const status = getErrorStatus(err);
-            console.error(`[HLS FETCH ERROR] Attempt ${attempt}/${HLS_RETRY_COUNT}`, status ? `status=${status}` : "", err.message);
+            const attemptInfo = HLS_RETRY_COUNT > 1 ? ` try=${attempt}/${HLS_RETRY_COUNT}` : "";
+            console.error(`[HLS ERROR]${attemptInfo}`, status ? `status=${status}` : "", err.message);
             if (attempt >= HLS_RETRY_COUNT || !shouldRetryHLS(err)) break;
             await sleep(HLS_RETRY_BASE_DELAY * attempt);
         }
@@ -994,7 +1157,8 @@ async function fetchAndStoreHLSRaw(cacheKey, sourceUrl, reason = "request") {
     }
 
     const promise = (async () => {
-        const response = String(reason).startsWith("startup-")
+        const shouldSkipWarmup = ["acquire", "prebuffer"].includes(String(reason)) || String(reason).startsWith("startup-");
+        const response = shouldSkipWarmup
             ? await fetchHLSManifest(sourceUrl)
             : await fetchHLSManifestWithWarmup(sourceUrl, reason);
         const finalUrl = response.request?.res?.responseUrl || sourceUrl;
@@ -1738,7 +1902,8 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         const { playlist, baseUrl, cacheStatus, age } = await getCachedHLSRaw(c.url);
         const buffered = updateLiveBufferFromPlaylist(c.url, playlist, baseUrl, {
             minOutputSegments: MIN_PLAYLIST_OUTPUT_SEGMENTS,
-            maxPlaylistSegments: LIVE_PLAYLIST_SEGMENTS
+            maxPlaylistSegments: LIVE_PLAYLIST_SEGMENTS,
+            label: c.name
         });
         const outputPlaylist = buffered.playlist;
         const rewritten = rewriteHLSPlaylistThroughKronos(outputPlaylist, baseUrl, host, configKey);
@@ -1750,7 +1915,9 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
             ` type=${playlistInfo.isMaster ? "master" : "media"} segs=${playlistInfo.segmentCount}` +
             `${playlistInfo.mediaSequence !== null ? ` seq=${playlistInfo.mediaSequence}` : ""}` +
             `${buffered.buffered ? ` buffer=${buffered.bufferSize} delay=${buffered.delayedSegments} out=${buffered.playlistSegments}` : ""}` +
-            `${buffered.cachedSegments !== undefined ? ` cached=${buffered.cachedSegments}` : ""}`
+            `${buffered.cachedSegments !== undefined ? ` cached=${buffered.cachedSegments}` : ""}` +
+            `${buffered.cachedSeconds !== undefined ? ` cached≈${Math.round(buffered.cachedSeconds)}s` : ""}` +
+            `${buffered.dynamicMode ? ` mode=${buffered.dynamicMode}` : ""}`
         );
 
         res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
@@ -1778,7 +1945,8 @@ app.get("/:base64Config/pl", async (req, res) => {
         const { playlist, baseUrl, cacheStatus, age } = await getCachedHLSRaw(sourceUrl);
         const buffered = updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl, {
             minOutputSegments: MIN_PLAYLIST_OUTPUT_SEGMENTS,
-            maxPlaylistSegments: LIVE_PLAYLIST_SEGMENTS
+            maxPlaylistSegments: LIVE_PLAYLIST_SEGMENTS,
+            label: "nested-playlist"
         });
         const outputPlaylist = buffered.playlist;
         const rewritten = rewriteHLSPlaylistThroughKronos(outputPlaylist, baseUrl, host, configKey);
@@ -1790,7 +1958,9 @@ app.get("/:base64Config/pl", async (req, res) => {
             ` type=${playlistInfo.isMaster ? "master" : "media"} segs=${playlistInfo.segmentCount}` +
             `${playlistInfo.mediaSequence !== null ? ` seq=${playlistInfo.mediaSequence}` : ""}` +
             `${buffered.buffered ? ` buffer=${buffered.bufferSize} delay=${buffered.delayedSegments} out=${buffered.playlistSegments}` : ""}` +
-            `${buffered.cachedSegments !== undefined ? ` cached=${buffered.cachedSegments}` : ""}`
+            `${buffered.cachedSegments !== undefined ? ` cached=${buffered.cachedSegments}` : ""}` +
+            `${buffered.cachedSeconds !== undefined ? ` cached≈${Math.round(buffered.cachedSeconds)}s` : ""}` +
+            `${buffered.dynamicMode ? ` mode=${buffered.dynamicMode}` : ""}`
         );
 
         res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
@@ -2035,13 +2205,15 @@ app.get("/:base64Config/debug", async (req, res) => {
                 MIN_LIVE_WARMUP_ATTEMPTS,
                 MIN_LIVE_WARMUP_DELAY_MS,
                 STREAM_STARTUP_PREBUFFER_ENABLED,
-                STREAM_ACQUIRE_ATTEMPTS,
-                STREAM_ACQUIRE_TOTAL_TIMEOUT,
-                STREAM_ACQUIRE_RETRY_DELAY_MS,
-                PREBUFFER_MIN_SEGMENTS,
-                PREBUFFER_TARGET_SEGMENTS,
-                PREBUFFER_MIN_SECONDS,
-                PREBUFFER_WAIT_FOR_SEGMENTS_MS,
+                STREAM_ACQUIRE_TIMEOUT,
+                STREAM_ACQUIRE_POLL_MS,
+                STREAM_PREBUFFER_START_SECONDS,
+                STREAM_PREBUFFER_START_MIN_SEGMENTS,
+                STREAM_PREBUFFER_TIMEOUT,
+                DYNAMIC_BUFFER_CRITICAL_SECONDS,
+                DYNAMIC_BUFFER_LOW_SECONDS,
+                DYNAMIC_BUFFER_TARGET_SECONDS,
+                DYNAMIC_BUFFER_MAX_SECONDS,
                 STREAM_READY_TTL,
                 MIN_PLAYLIST_OUTPUT_SEGMENTS,
                 SEGMENT_CACHE_TTL,
@@ -2076,7 +2248,8 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server: http://0.0.0.0:${PORT}`);
     console.log(`HLS live refresh: ${HLS_REFRESH_TTL}ms | live stale refresh: ${HLS_LIVE_STALE_REFRESH_TTL}ms | stale fallback: ${HLS_STALE_TTL}ms`);
     console.log(`Live buffer: keep=${LIVE_BUFFER_SEGMENTS} | playlist=${LIVE_PLAYLIST_SEGMENTS} | delay=${LIVE_DELAY_SEGMENTS} | minReady=${MIN_LIVE_SEGMENTS_READY}`);
-    console.log(`Startup prebuffer: enabled=${STREAM_STARTUP_PREBUFFER_ENABLED} | attempts=${STREAM_ACQUIRE_ATTEMPTS} | timeout=${STREAM_ACQUIRE_TOTAL_TIMEOUT}ms | min=${PREBUFFER_MIN_SEGMENTS} | target=${PREBUFFER_TARGET_SEGMENTS} | minSeconds=${PREBUFFER_MIN_SECONDS}`);
+    console.log(`Startup dynamic buffer: enabled=${STREAM_STARTUP_PREBUFFER_ENABLED} | acquire=${STREAM_ACQUIRE_TIMEOUT}ms | start=${STREAM_PREBUFFER_START_SECONDS}s/${STREAM_PREBUFFER_START_MIN_SEGMENTS}seg | prebufferTimeout=${STREAM_PREBUFFER_TIMEOUT}ms`);
+    console.log(`Dynamic buffer: critical=${DYNAMIC_BUFFER_CRITICAL_SECONDS}s | low=${DYNAMIC_BUFFER_LOW_SECONDS}s | target=${DYNAMIC_BUFFER_TARGET_SECONDS}s | max=${DYNAMIC_BUFFER_MAX_SECONDS}s`);
     console.log(`Segment cache: max=${formatBytes(SEGMENT_CACHE_MAX_BYTES)} | maxSegments=${SEGMENT_CACHE_MAX_SEGMENTS} | prefetchConcurrency=${SEGMENT_PREFETCH_CONCURRENCY}`);
     console.log(`Segment timeout: ${SEG_REQUEST_TIMEOUT}ms | segment log every: ${SEG_LOG_EVERY}`);
     console.log(`Node: ${process.version}`);
