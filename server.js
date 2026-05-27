@@ -56,9 +56,9 @@ const CACHE_TTL = 30 * 60 * 1000;
 
 // HLS self-relay tuning
 // Live playlist cache must stay short: tokenized IPTV streams can expire quickly.
-const HLS_REFRESH_TTL = Number(process.env.HLS_REFRESH_TTL || 2000);
+const HLS_REFRESH_TTL = Number(process.env.HLS_REFRESH_TTL || 1500);
 const HLS_MASTER_REFRESH_TTL = Number(process.env.HLS_MASTER_REFRESH_TTL || 15000);
-const HLS_STALE_TTL = Number(process.env.HLS_STALE_TTL || 15000);
+const HLS_STALE_TTL = Number(process.env.HLS_STALE_TTL || 5000);
 const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 15000);
 const HLS_RETRY_COUNT = Number(process.env.HLS_RETRY_COUNT || 3);
 const HLS_RETRY_BASE_DELAY = Number(process.env.HLS_RETRY_BASE_DELAY || 400);
@@ -67,8 +67,11 @@ const SEG_REQUEST_TIMEOUT = Number(process.env.SEG_REQUEST_TIMEOUT || 30000);
 // Segment logs: 1 = log every successful segment, 5 = one every 5, 0 = only errors.
 const SEG_LOG_EVERY = Number(process.env.SEG_LOG_EVERY || 1);
 
+// For tokenized live IPTV streams, keep Stremio close to the live edge.
+const LIVE_EDGE_SEGMENTS = Number(process.env.LIVE_EDGE_SEGMENTS || 4);
+
 const ADDON_TYPE = "tv";
-const RELEASE_VERSION = "1.6.1";
+const RELEASE_VERSION = "1.6.2";
 
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
@@ -288,17 +291,60 @@ async function getCachedHLSRaw(sourceUrl) {
 
     if (cached?.playlist) {
         const age = now - cached.updatedAt;
-        const refreshTtl = getHLSRefreshTTL(cached.info || analyzeHLSPlaylist(cached.playlist));
+        const info = cached.info || analyzeHLSPlaylist(cached.playlist);
+        const refreshTtl = getHLSRefreshTTL(info);
 
         if (age <= refreshTtl) {
             memoryCache.stats.hls.cacheHits += 1;
-            return { playlist: cached.playlist, baseUrl: cached.baseUrl, info: cached.info, cacheStatus: "hit", age };
+            return {
+                playlist: cached.playlist,
+                baseUrl: cached.baseUrl,
+                info,
+                cacheStatus: "hit",
+                age
+            };
         }
 
+        // Tokenized live IPTV fix:
+        // Do NOT serve stale media playlists while refreshing in background.
+        // If the player receives old segment URLs, it can fall behind the live edge,
+        // buffer for a long time and eventually crash.
+        if (info.isLive && !info.isMaster) {
+            try {
+                return await fetchAndStoreHLSRaw(cacheKey, sourceUrl, "blocking-live-refresh");
+            } catch (err) {
+                const fallbackMaxAge = Math.min(
+                    HLS_STALE_TTL,
+                    Math.max(2500, (info.targetDuration || 6) * 500)
+                );
+
+                if (age <= fallbackMaxAge) {
+                    memoryCache.stats.hls.staleHits += 1;
+                    console.error("[HLS] Live refresh failed; returning very short stale fallback", err.message);
+                    return {
+                        playlist: cached.playlist,
+                        baseUrl: cached.baseUrl,
+                        info,
+                        cacheStatus: "stale-fallback-live",
+                        age
+                    };
+                }
+
+                throw err;
+            }
+        }
+
+        // Master playlists and VOD playlists are less sensitive to stale data.
         if (age <= HLS_STALE_TTL) {
             memoryCache.stats.hls.staleHits += 1;
             refreshHLSInBackground(cacheKey, sourceUrl);
-            return { playlist: cached.playlist, baseUrl: cached.baseUrl, info: cached.info, cacheStatus: "stale-refresh", age };
+            return {
+                playlist: cached.playlist,
+                baseUrl: cached.baseUrl,
+                info,
+                cacheStatus: "stale-refresh",
+                age
+            };
         }
 
         try {
@@ -306,7 +352,13 @@ async function getCachedHLSRaw(sourceUrl) {
         } catch (err) {
             memoryCache.stats.hls.staleHits += 1;
             console.error("[HLS] Upstream failed; returning last cached playlist", err.message);
-            return { playlist: cached.playlist, baseUrl: cached.baseUrl, info: cached.info, cacheStatus: "stale-fallback", age };
+            return {
+                playlist: cached.playlist,
+                baseUrl: cached.baseUrl,
+                info,
+                cacheStatus: "stale-fallback",
+                age
+            };
         }
     }
 
@@ -327,6 +379,71 @@ function isHttpUrl(value) {
 
 function isHlsUrl(url) {
     return /\.m3u8(?:[?#].*)?$/i.test(String(url || ""));
+}
+
+function trimLiveMediaPlaylistToLiveEdge(playlist, keepSegments = LIVE_EDGE_SEGMENTS) {
+    const text = String(playlist || "");
+    const info = analyzeHLSPlaylist(text);
+
+    if (info.isMaster || !info.isLive || info.segmentCount <= keepSegments) {
+        return text;
+    }
+
+    const lines = text.split(/\r?\n/);
+    const headerLines = [];
+    const segments = [];
+    let pendingSegmentLines = [];
+    let originalMediaSequence = Number.isFinite(info.mediaSequence) ? info.mediaSequence : 0;
+
+    for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+
+        if (trimmed.startsWith("#EXT-X-ENDLIST")) {
+            continue;
+        }
+
+        if (trimmed.startsWith("#EXTINF")) {
+            pendingSegmentLines = [line];
+            continue;
+        }
+
+        if (pendingSegmentLines.length > 0) {
+            pendingSegmentLines.push(line);
+
+            if (!trimmed.startsWith("#")) {
+                segments.push(pendingSegmentLines);
+                pendingSegmentLines = [];
+            }
+
+            continue;
+        }
+
+        headerLines.push(line);
+    }
+
+    if (segments.length <= keepSegments) {
+        return text;
+    }
+
+    const skipped = segments.length - keepSegments;
+    const keptSegments = segments.slice(-keepSegments);
+
+    const rebuiltHeader = headerLines.map(line => {
+        if (String(line).trim().startsWith("#EXT-X-MEDIA-SEQUENCE:")) {
+            return `#EXT-X-MEDIA-SEQUENCE:${originalMediaSequence + skipped}`;
+        }
+        return line;
+    });
+
+    if (!rebuiltHeader.some(line => String(line).trim().startsWith("#EXT-X-MEDIA-SEQUENCE:"))) {
+        rebuiltHeader.push(`#EXT-X-MEDIA-SEQUENCE:${originalMediaSequence + skipped}`);
+    }
+
+    return [
+        ...rebuiltHeader,
+        ...keptSegments.flat()
+    ].join("\n") + "\n";
 }
 
 function rewriteHLSPlaylistThroughKronos(playlist, baseUrl, hostBase, configKey) {
@@ -938,9 +1055,10 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
 
         const host = getPublicHost(req);
         const { playlist, baseUrl, info, cacheStatus, age } = await getCachedHLSRaw(c.url);
-        const rewritten = rewriteHLSPlaylistThroughKronos(playlist, baseUrl, host, configKey);
+        const trimmedPlaylist = trimLiveMediaPlaylistToLiveEdge(playlist, LIVE_EDGE_SEGMENTS);
+        const rewritten = rewriteHLSPlaylistThroughKronos(trimmedPlaylist, baseUrl, host, configKey);
 
-        const playlistInfo = info || analyzeHLSPlaylist(playlist);
+        const playlistInfo = analyzeHLSPlaylist(trimmedPlaylist);
         console.log(
             `[HLS ROUTE] channel="${c.name}" cache=${cacheStatus}` +
             `${typeof age === "number" ? ` age=${age}ms` : ""}` +
@@ -968,9 +1086,10 @@ app.get("/:base64Config/pl", async (req, res) => {
         const sourceUrl = decodeProxyUrl(req.query.u);
         const host = getPublicHost(req);
         const { playlist, baseUrl, info, cacheStatus, age } = await getCachedHLSRaw(sourceUrl);
-        const rewritten = rewriteHLSPlaylistThroughKronos(playlist, baseUrl, host, configKey);
+        const trimmedPlaylist = trimLiveMediaPlaylistToLiveEdge(playlist, LIVE_EDGE_SEGMENTS);
+        const rewritten = rewriteHLSPlaylistThroughKronos(trimmedPlaylist, baseUrl, host, configKey);
 
-        const playlistInfo = info || analyzeHLSPlaylist(playlist);
+        const playlistInfo = analyzeHLSPlaylist(trimmedPlaylist);
         console.log(
             `[PL ROUTE] cache=${cacheStatus}` +
             `${typeof age === "number" ? ` age=${age}ms` : ""}` +
@@ -1158,7 +1277,8 @@ app.get("/:base64Config/debug", async (req, res) => {
                 HLS_REQUEST_TIMEOUT,
                 HLS_RETRY_COUNT,
                 SEG_REQUEST_TIMEOUT,
-                SEG_LOG_EVERY
+                SEG_LOG_EVERY,
+                LIVE_EDGE_SEGMENTS
             },
             cacheInfo: {
                 lastUpdate: memoryCache.lastUpdate[configKey],
@@ -1178,7 +1298,8 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`K.R.O.N.O.S. ${RELEASE_VERSION} - Self-Relay Mode`);
     console.log(`${"=".repeat(60)}`);
     console.log(`Server: http://0.0.0.0:${PORT}`);
-    console.log(`HLS live refresh: ${HLS_REFRESH_TTL}ms | master refresh: ${HLS_MASTER_REFRESH_TTL}ms | stale: ${HLS_STALE_TTL}ms`);
+    console.log(`HLS live refresh: ${HLS_REFRESH_TTL}ms | master refresh: ${HLS_MASTER_REFRESH_TTL}ms | stale fallback: ${HLS_STALE_TTL}ms`);
+    console.log(`Live edge segments: ${LIVE_EDGE_SEGMENTS}`);
     console.log(`Segment timeout: ${SEG_REQUEST_TIMEOUT}ms | segment log every: ${SEG_LOG_EVERY}`);
     console.log(`Node: ${process.version}`);
     console.log(`${"=".repeat(60)}\n`);
