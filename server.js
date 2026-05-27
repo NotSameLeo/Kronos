@@ -110,7 +110,7 @@ const SEG_LOG_EVERY = Number(process.env.SEG_LOG_EVERY || 1);
 // Phase 3: while playing, keep filling the buffer toward the target.
 const LIVE_BUFFER_SEGMENTS = Number(process.env.LIVE_BUFFER_SEGMENTS || 32);
 const LIVE_PLAYLIST_SEGMENTS = Number(process.env.LIVE_PLAYLIST_SEGMENTS || 10);
-const LIVE_DELAY_SEGMENTS = Number(process.env.LIVE_DELAY_SEGMENTS || 2);
+const LIVE_DELAY_SEGMENTS = Number(process.env.LIVE_DELAY_SEGMENTS || 0);
 const MIN_LIVE_SEGMENTS_READY = Number(process.env.MIN_LIVE_SEGMENTS_READY || 2);
 const MIN_LIVE_WARMUP_ATTEMPTS = Number(process.env.MIN_LIVE_WARMUP_ATTEMPTS || 2);
 const MIN_LIVE_WARMUP_DELAY_MS = Number(process.env.MIN_LIVE_WARMUP_DELAY_MS || 2500);
@@ -120,8 +120,8 @@ const STREAM_STARTUP_PREBUFFER_ENABLED = String(process.env.STREAM_STARTUP_PREBU
 const STREAM_ACQUIRE_TIMEOUT = Number(process.env.STREAM_ACQUIRE_TIMEOUT || 25000);
 const STREAM_ACQUIRE_POLL_MS = Number(process.env.STREAM_ACQUIRE_POLL_MS || 2500);
 
-const STREAM_PREBUFFER_START_SECONDS = Number(process.env.STREAM_PREBUFFER_START_SECONDS || 24);
-const STREAM_PREBUFFER_START_MIN_SEGMENTS = Number(process.env.STREAM_PREBUFFER_START_MIN_SEGMENTS || 2);
+const STREAM_PREBUFFER_START_SECONDS = Number(process.env.STREAM_PREBUFFER_START_SECONDS || 30);
+const STREAM_PREBUFFER_START_MIN_SEGMENTS = Number(process.env.STREAM_PREBUFFER_START_MIN_SEGMENTS || 3);
 const STREAM_PREBUFFER_TIMEOUT = Number(process.env.STREAM_PREBUFFER_TIMEOUT || 35000);
 
 const DYNAMIC_BUFFER_CRITICAL_SECONDS = Number(process.env.DYNAMIC_BUFFER_CRITICAL_SECONDS || 10);
@@ -130,7 +130,7 @@ const DYNAMIC_BUFFER_TARGET_SECONDS = Number(process.env.DYNAMIC_BUFFER_TARGET_S
 const DYNAMIC_BUFFER_MAX_SECONDS = Number(process.env.DYNAMIC_BUFFER_MAX_SECONDS || 60);
 
 const STREAM_READY_TTL = Number(process.env.STREAM_READY_TTL || 5 * 60 * 1000);
-const MIN_PLAYLIST_OUTPUT_SEGMENTS = Number(process.env.MIN_PLAYLIST_OUTPUT_SEGMENTS || STREAM_PREBUFFER_START_MIN_SEGMENTS);
+const MIN_PLAYLIST_OUTPUT_SEGMENTS = Number(process.env.MIN_PLAYLIST_OUTPUT_SEGMENTS || 4);
 
 // Compatibility aliases used by existing debug/stat code paths.
 const PREBUFFER_MIN_SEGMENTS = STREAM_PREBUFFER_START_MIN_SEGMENTS;
@@ -147,7 +147,7 @@ const SEGMENT_PREFETCH_AHEAD = Number(process.env.SEGMENT_PREFETCH_AHEAD || 8);
 const SEGMENT_WAIT_FOR_PREFETCH_MS = Number(process.env.SEGMENT_WAIT_FOR_PREFETCH_MS || 2500);
 
 const ADDON_TYPE = "tv";
-const RELEASE_VERSION = "1.6.6";
+const RELEASE_VERSION = "1.6.7";
 
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
@@ -725,9 +725,20 @@ function selectBufferedSegments(buffer, options = {}) {
     const maxPlaylistSegments = Number(options.maxPlaylistSegments || LIVE_PLAYLIST_SEGMENTS);
 
     let effectiveDelay = Math.max(0, Number(options.delaySegments ?? LIVE_DELAY_SEGMENTS));
+    const bufferSize = buffer.segments.length;
 
-    // Do not let delay destroy the visible playlist during startup.
-    // Example: buffer=3 delay=2 out=1 was too fragile.
+    // Dynamic delay:
+    // - if the buffer is small, expose everything to Stremio;
+    // - once the buffer is wider, keep a small live delay.
+    // This avoids the bad case: buffer=3/4 but only 2 chunks visible to the player.
+    if (bufferSize <= 4) {
+        effectiveDelay = 0;
+    } else if (bufferSize === 5) {
+        effectiveDelay = Math.min(effectiveDelay, 1);
+    } else {
+        effectiveDelay = Math.min(effectiveDelay, 2);
+    }
+
     while (effectiveDelay > 0 && buffer.segments.length - effectiveDelay < minOutputSegments) {
         effectiveDelay -= 1;
     }
@@ -1225,11 +1236,9 @@ function updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl, options = {}
             memoryCache.stats.liveBuffer.segmentsUpdated += 1;
 
             if (beforeUrl && segment.url && beforeUrl !== segment.url) {
+                // Dedupe is expected with tokenized IPTV streams.
+                // Keep the counter, but avoid noisy per-segment logs.
                 memoryCache.stats.liveBuffer.segmentsDeduped += 1;
-                console.log(
-                    `[LIVE DEDUPE] channel="${options.label || "stream"}"` +
-                    ` key=${key} keeping=${sanitizeUrlForLog(existing.url)} incoming=${sanitizeUrlForLog(segment.url)}`
-                );
             }
         }
     });
