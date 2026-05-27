@@ -67,7 +67,7 @@ const SEGMENT_WAIT_FOR_PREFETCH_MS = Number(process.env.SEGMENT_WAIT_FOR_PREFETC
 const PLAYER_SEGMENT_SLOW_MS = Number(process.env.PLAYER_SEGMENT_SLOW_MS || 2500);
 const PLAYER_SEGMENT_GAP_WARN_MS = Number(process.env.PLAYER_SEGMENT_GAP_WARN_MS || 30000);
 const ADDON_TYPE = "tv";
-const RELEASE_VERSION = "1.6.4";
+const RELEASE_VERSION = "1.6.5";
 
 function decodeConfig(configKey) {
     try {
@@ -1392,7 +1392,7 @@ function buildStream(channel, host, configKey, config) {
 function toMeta(channel, host, configKey = "", config = {}) {
     const fallbackLogo = `${host}/logo.svg`;
     const poster = configKey ? `${host}/${configKey}/poster/${channel.id}.svg?v=${encodeURIComponent(RELEASE_VERSION)}` : (channel.logo || fallbackLogo);
-    const logo = channel.logo || fallbackLogo;
+    const logo = channel.logo || poster || fallbackLogo;
     const stream = configKey ? buildStream(channel, host, configKey, config) : null;
 
     return {
