@@ -23,6 +23,7 @@ app.use(express.static(path.join(__dirname, "public")));
 const memoryCache = {
     channelItems: {},
     channelIndex: {},
+    channelInflight: {},
     epgData: {},
     hlsData: {},
     hlsInflight: {},
@@ -39,29 +40,29 @@ const memoryCache = {
 };
 const CACHE_TTL = 30 * 60 * 1000;
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const HLS_REFRESH_TTL = Number(process.env.HLS_REFRESH_TTL || 2500);
+const HLS_REFRESH_TTL = Number(process.env.HLS_REFRESH_TTL || 2000);
 const HLS_MASTER_REFRESH_TTL = Number(process.env.HLS_MASTER_REFRESH_TTL || 30000);
 const HLS_STALE_TTL = Number(process.env.HLS_STALE_TTL || 120000);
 const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 12000);
 const STREAM_ACQUIRE_TIMEOUT = Number(process.env.STREAM_ACQUIRE_TIMEOUT || 25000);
-const STREAM_ACQUIRE_POLL_MS = Number(process.env.STREAM_ACQUIRE_POLL_MS || 1500);
-const STREAM_PREBUFFER_SECONDS = Number(process.env.STREAM_PREBUFFER_SECONDS || 25);
-const STREAM_PREBUFFER_TIMEOUT = Number(process.env.STREAM_PREBUFFER_TIMEOUT || 60000);
-const DYNAMIC_BUFFER_TARGET_SECONDS = Number(process.env.DYNAMIC_BUFFER_TARGET_SECONDS || 55);
-const DYNAMIC_BUFFER_MAX_SECONDS = Number(process.env.DYNAMIC_BUFFER_MAX_SECONDS || 65);
-const LIVE_BUFFER_SEGMENTS = Number(process.env.LIVE_BUFFER_SEGMENTS || 24);
-const LIVE_PLAYLIST_SEGMENTS = Number(process.env.LIVE_PLAYLIST_SEGMENTS || 8);
+const STREAM_ACQUIRE_POLL_MS = Number(process.env.STREAM_ACQUIRE_POLL_MS || 1000);
+const STREAM_PREBUFFER_SECONDS = Number(process.env.STREAM_PREBUFFER_SECONDS || 30);
+const STREAM_PREBUFFER_TIMEOUT = Number(process.env.STREAM_PREBUFFER_TIMEOUT || 70000);
+const DYNAMIC_BUFFER_TARGET_SECONDS = Number(process.env.DYNAMIC_BUFFER_TARGET_SECONDS || 70);
+const DYNAMIC_BUFFER_MAX_SECONDS = Number(process.env.DYNAMIC_BUFFER_MAX_SECONDS || 90);
+const LIVE_BUFFER_SEGMENTS = Number(process.env.LIVE_BUFFER_SEGMENTS || 36);
+const LIVE_PLAYLIST_SEGMENTS = Number(process.env.LIVE_PLAYLIST_SEGMENTS || 10);
 const LIVE_DELAY_SEGMENTS = Number(process.env.LIVE_DELAY_SEGMENTS || 1);
 const SEG_REQUEST_TIMEOUT = Number(process.env.SEG_REQUEST_TIMEOUT || 45000);
 const SEGMENT_CACHE_TTL = Number(process.env.SEGMENT_CACHE_TTL || 10 * 60 * 1000);
-const SEGMENT_CACHE_MAX_BYTES = Number(process.env.SEGMENT_CACHE_MAX_BYTES || 512 * 1024 * 1024);
-const SEGMENT_CACHE_MAX_SEGMENTS = Number(process.env.SEGMENT_CACHE_MAX_SEGMENTS || 120);
+const SEGMENT_CACHE_MAX_BYTES = Number(process.env.SEGMENT_CACHE_MAX_BYTES || 768 * 1024 * 1024);
+const SEGMENT_CACHE_MAX_SEGMENTS = Number(process.env.SEGMENT_CACHE_MAX_SEGMENTS || 180);
 const SEGMENT_CACHE_MAX_ITEM_BYTES = Number(process.env.SEGMENT_CACHE_MAX_ITEM_BYTES || 24 * 1024 * 1024);
-const SEGMENT_PREFETCH_CONCURRENCY = Number(process.env.SEGMENT_PREFETCH_CONCURRENCY || 3);
-const SEGMENT_PREFETCH_AHEAD = Number(process.env.SEGMENT_PREFETCH_AHEAD || 10);
-const SEGMENT_WAIT_FOR_PREFETCH_MS = Number(process.env.SEGMENT_WAIT_FOR_PREFETCH_MS || 2500);
+const SEGMENT_PREFETCH_CONCURRENCY = Number(process.env.SEGMENT_PREFETCH_CONCURRENCY || 4);
+const SEGMENT_PREFETCH_AHEAD = Number(process.env.SEGMENT_PREFETCH_AHEAD || 14);
+const SEGMENT_WAIT_FOR_PREFETCH_MS = Number(process.env.SEGMENT_WAIT_FOR_PREFETCH_MS || 3000);
 const ADDON_TYPE = "kronos";
-const RELEASE_VERSION = "1.6.0";
+const RELEASE_VERSION = "1.6.1";
 
 function decodeConfig(configKey) {
     try {
@@ -271,6 +272,17 @@ function formatBytes(bytes) {
     if (value < 1024) return `${value}B`;
     if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)}KB`;
     return `${(value / 1024 / 1024).toFixed(2)}MB`;
+}
+
+function formatSeconds(value) {
+    return `${Math.round(Number(value || 0))}s`;
+}
+
+function getBufferStatus(cachedSeconds) {
+    if (cachedSeconds < STREAM_PREBUFFER_SECONDS) return "warming";
+    if (cachedSeconds < DYNAMIC_BUFFER_TARGET_SECONDS) return "filling";
+    if (cachedSeconds >= DYNAMIC_BUFFER_MAX_SECONDS) return "full";
+    return "healthy";
 }
 
 function getHLSCacheKey(sourceUrl) {
@@ -825,10 +837,23 @@ function queueDynamicPrefetchForBuffer(buffer) {
     const cachedSeconds = getCachedDurationForSegments(buffer.segments);
     if (cachedSeconds >= DYNAMIC_BUFFER_MAX_SECONDS) return;
 
-    buffer.segments
+    const candidates = buffer.segments
         .filter(segment => !getCachedSegmentForLogicalSegment(segment))
-        .slice(-SEGMENT_PREFETCH_AHEAD)
-        .forEach(segment => queueSegmentPrefetch(segment.sourceUrl || segment.url));
+        .slice(-SEGMENT_PREFETCH_AHEAD);
+
+    candidates.forEach(segment => queueSegmentPrefetch(segment.sourceUrl || segment.url));
+
+    if (candidates.length > 0) {
+        console.log(
+            `[DYNAMIC BUFFER] status=${getBufferStatus(cachedSeconds)}` +
+            ` cached=${formatSeconds(cachedSeconds)}` +
+            ` target=${formatSeconds(DYNAMIC_BUFFER_TARGET_SECONDS)}` +
+            ` max=${formatSeconds(DYNAMIC_BUFFER_MAX_SECONDS)}` +
+            ` queued=${candidates.length}` +
+            ` active=${memoryCache.segmentPrefetchActive}` +
+            ` queue=${memoryCache.segmentPrefetchQueue.length}`
+        );
+    }
 }
 
 async function acquireInitialHLS(sourceUrl, label = "stream") {
@@ -836,7 +861,11 @@ async function acquireInitialHLS(sourceUrl, label = "stream") {
     let lastErr = null;
     let fetches = 0;
 
-    console.log(`[STREAM ACQUIRE] channel="${label}" timeout=${STREAM_ACQUIRE_TIMEOUT}ms`);
+    console.log(
+        `[STARTUP PHASE 1] channel="${label}" acquiring-stream` +
+        ` maxWait=${formatSeconds(STREAM_ACQUIRE_TIMEOUT / 1000)}` +
+        ` poll=${STREAM_ACQUIRE_POLL_MS}ms`
+    );
 
     while (Date.now() - started < STREAM_ACQUIRE_TIMEOUT) {
         fetches += 1;
@@ -846,14 +875,21 @@ async function acquireInitialHLS(sourceUrl, label = "stream") {
             const info = hls.info || analyzeHLSPlaylist(hls.playlist);
 
             if (info.isMaster || info.segmentCount > 0) {
-                console.log(`[STREAM ACQUIRE OK] channel="${label}" fetches=${fetches} time=${Date.now() - started}ms`);
+                console.log(
+                    `[STARTUP PHASE 1 OK] channel="${label}" acquired` +
+                    ` fetches=${fetches}` +
+                    ` elapsed=${Date.now() - started}ms` +
+                    ` type=${info.isMaster ? "master" : "media"}` +
+                    ` segs=${info.segmentCount}` +
+                    `${info.targetDuration ? ` targetDuration=${formatSeconds(info.targetDuration)}` : ""}`
+                );
                 return hls;
             }
 
             lastErr = new Error("Playlist valid but without playable segments");
         } catch (err) {
             lastErr = err;
-            console.error(`[STREAM ACQUIRE ERROR] channel="${label}" fetch=${fetches} err=${err.message}`);
+            console.error(`[STARTUP PHASE 1 RETRY] channel="${label}" fetch=${fetches} err=${err.message}`);
         }
 
         await sleep(Math.min(STREAM_ACQUIRE_POLL_MS, Math.max(0, STREAM_ACQUIRE_TIMEOUT - (Date.now() - started))));
@@ -865,7 +901,12 @@ async function acquireInitialHLS(sourceUrl, label = "stream") {
 async function prebufferInitialStream(sourceUrl, label = "stream") {
     const started = Date.now();
 
-    console.log(`[STREAM PREBUFFER START] channel="${label}" target=${STREAM_PREBUFFER_SECONDS}s timeout=${STREAM_PREBUFFER_TIMEOUT}ms`);
+    console.log(
+        `[STARTUP PHASE 2] channel="${label}" prebuffering` +
+        ` target=${formatSeconds(STREAM_PREBUFFER_SECONDS)}` +
+        ` timeout=${formatSeconds(STREAM_PREBUFFER_TIMEOUT / 1000)}` +
+        ` dynamicTarget=${formatSeconds(DYNAMIC_BUFFER_TARGET_SECONDS)}`
+    );
 
     while (Date.now() - started < STREAM_PREBUFFER_TIMEOUT) {
         const hls = await fetchAndStoreHLSRaw(getHLSCacheKey(sourceUrl), sourceUrl, "prebuffer");
@@ -875,10 +916,22 @@ async function prebufferInitialStream(sourceUrl, label = "stream") {
         candidates.forEach(segment => queueSegmentPrefetch(segment.sourceUrl || segment.url));
 
         const cachedSeconds = getCachedDurationForSegments(candidates);
-        console.log(`[STREAM PREBUFFER] channel="${label}" cached≈${Math.round(cachedSeconds)}s/${STREAM_PREBUFFER_SECONDS}s segs=${candidates.length}`);
+        console.log(
+            `[STARTUP PHASE 2 PROGRESS] channel="${label}"` +
+            ` cached=${formatSeconds(cachedSeconds)}/${formatSeconds(STREAM_PREBUFFER_SECONDS)}` +
+            ` status=${getBufferStatus(cachedSeconds)}` +
+            ` candidateSegs=${candidates.length}` +
+            ` prefetchActive=${memoryCache.segmentPrefetchActive}` +
+            ` prefetchQueue=${memoryCache.segmentPrefetchQueue.length}`
+        );
 
         if (cachedSeconds >= STREAM_PREBUFFER_SECONDS) {
-            console.log(`[STREAM READY] channel="${label}" startBuffer≈${Math.round(cachedSeconds)}s total=${Date.now() - started}ms`);
+            console.log(
+                `[STARTUP COMPLETE] channel="${label}" stream-ready` +
+                ` startBuffer=${formatSeconds(cachedSeconds)}` +
+                ` target=${formatSeconds(STREAM_PREBUFFER_SECONDS)}` +
+                ` elapsed=${Date.now() - started}ms`
+            );
             return { status: "ready", cachedSeconds };
         }
 
@@ -900,10 +953,17 @@ async function ensureStreamReady(sourceUrl, label = "stream") {
     const buffer = getLiveBuffer(sourceUrl);
     if (state.status === "ready" && getCachedDurationForSegments(buffer?.segments || []) >= STREAM_PREBUFFER_SECONDS) {
         queueDynamicPrefetchForBuffer(buffer);
+        console.log(
+            `[STARTUP REUSE] channel="${label}" ready-cache` +
+            ` cached=${formatSeconds(getCachedDurationForSegments(buffer?.segments || []))}`
+        );
         return { status: "ready", reused: true };
     }
 
-    if (state.promise) return state.promise;
+    if (state.promise) {
+        console.log(`[STARTUP WAIT] channel="${label}" existingPhase=${state.status}`);
+        return state.promise;
+    }
 
     state.status = "acquiring";
     state.promise = (async () => {
@@ -912,6 +972,7 @@ async function ensureStreamReady(sourceUrl, label = "stream") {
             if (initial.info?.isMaster) {
                 state.status = "ready";
                 state.readyAt = Date.now();
+                console.log(`[STARTUP COMPLETE] channel="${label}" master-playlist-ready`);
                 return { status: "ready", master: true };
             }
             state.status = "prebuffering";
@@ -974,9 +1035,14 @@ function parseM3UChannels(data, source = {}) {
 }
 
 function decorateChannelName(channel, totalLists, mode) {
-    if (totalLists <= 1 || mode !== "filter") return channel.name;
-    const baseName = channel.name.replace(/\s*\([^)]*\)\s*$/g, "").trim();
+    const displayName = stripInitialCountryPrefix(channel.name);
+    if (totalLists <= 1 || mode !== "filter") return displayName;
+    const baseName = displayName.replace(/\s*\([^)]*\)\s*$/g, "").trim();
     return `${baseName} (${getListAbbreviation(channel.sourceName)})`;
+}
+
+function stripInitialCountryPrefix(name) {
+    return String(name || "").replace(/^\s*IT:\s*/i, "").trim();
 }
 
 function getListAbbreviation(name) {
@@ -988,25 +1054,58 @@ function normalizeGroupName(group) {
     return String(group || "").trim().toLowerCase();
 }
 
+function normalizeSearchText(value) {
+    return String(value || "")
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .toLowerCase()
+        .replace(/&/g, " e ")
+        .replace(/[^a-z0-9]+/gi, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function matchesChannelSearch(channel, rawQuery) {
+    const query = normalizeSearchText(rawQuery);
+    if (!query) return true;
+
+    const haystack = normalizeSearchText([
+        channel.name,
+        channel.group,
+        channel.sourceName,
+        channel.tvgId,
+        channel.description
+    ].filter(Boolean).join(" "));
+
+    const compactHaystack = haystack.replace(/\s+/g, "");
+    const compactQuery = query.replace(/\s+/g, "");
+
+    if (haystack.includes(query)) return true;
+    if (compactHaystack.includes(compactQuery)) return true;
+
+    return query.split(" ").filter(Boolean).every(token => haystack.includes(token));
+}
+
 function getExtraParams(extra) {
     const params = {};
     if (!extra) return params;
-    const cleanExtra = decodeURIComponent(extra).replace(/\.json$/i, "");
+    const cleanExtra = decodeURIComponent(String(extra)).replace(/\.json$/i, "");
     cleanExtra.split("&").forEach(pair => {
-        const [name, value] = pair.split("=");
-        if (name && value) params[name] = value;
+        const eqIndex = pair.indexOf("=");
+        if (eqIndex === -1) return;
+        const name = pair.slice(0, eqIndex);
+        const value = pair.slice(eqIndex + 1);
+        if (name) params[name] = decodeURIComponent(value || "");
     });
     return params;
 }
 
 function getCatalogSourceName(catalogId) {
-    if (catalogId === "kronos_all") return null;
     if (!String(catalogId || "").startsWith("kronos_list_")) return null;
     return Buffer.from(catalogId.replace("kronos_list_", ""), "hex").toString("utf8");
 }
 
 function toCatalogId(name) {
-    if (name === "TUTTI") return "kronos_all";
     return `kronos_list_${Buffer.from(name).toString("hex")}`;
 }
 
@@ -1106,30 +1205,29 @@ function toMeta(channel, host, configKey = "", config = {}) {
 }
 
 async function fetchAndProcessChannels(configKey, config, options = {}) {
-    if (memoryCache.isUpdating[configKey] && !options.force) return;
-    memoryCache.isUpdating[configKey] = true;
+    if (memoryCache.channelInflight[configKey] && !options.force) {
+        console.log(`[CATALOG CACHE] Waiting existing playlist load config=${configKey.substring(0, 12)}...`);
+        return memoryCache.channelInflight[configKey];
+    }
 
-    try {
-        console.log('[DEBUG FETCH] Starting channel fetch for config:', configKey.substring(0, 20) + '...');
-        console.log('[DEBUG FETCH] Config mode:', config.gm);
+    const promise = (async () => {
+        memoryCache.isUpdating[configKey] = true;
+        console.log(`[CATALOG LOAD] Start config=${configKey.substring(0, 12)}... force=${Boolean(options.force)}`);
         const epgMap = config.e ? await updateEPGCache(config.e) : {};
         const configuredLists = getConfiguredLists(config);
-        console.log('[DEBUG FETCH] Configured lists:', configuredLists.length);
+        console.log(`[CATALOG LOAD] Lists=${configuredLists.length} mode=${config.gm || "default"}`);
         
         const selectedGroups = Array.isArray(config.g) ? config.g : [];
-        console.log('[DEBUG FETCH] Selected groups:', selectedGroups);
+        console.log(`[CATALOG LOAD] SelectedGroups=${selectedGroups.length ? selectedGroups.join(", ") : "all"}`);
         
         const selectedGroupSet = new Set(selectedGroups.map(normalizeGroupName));
         const bucketGroup = selectedGroups[0] || "Kronos";
         
         const parsedChannelGroups = await Promise.all(configuredLists.map(async list => {
-            console.log('[DEBUG FETCH] Fetching playlist:', list.url);
+            console.log(`[CATALOG LOAD] Fetch playlist name="${list.name}"`);
             const playlistData = await fetchPlaylist(list.url);
             const parsed = parseM3UChannels(playlistData, list);
-            console.log(`[DEBUG FETCH] Parsed ${parsed.length} channels from ${list.name}`);
-            if (parsed.length > 0) {
-                console.log('[DEBUG FETCH] Sample parsed channel:', JSON.stringify(parsed[0], null, 2));
-            }
+            console.log(`[CATALOG LOAD] Parsed list="${list.name}" channels=${parsed.length}`);
             return parsed;
         }));
 
@@ -1138,11 +1236,7 @@ async function fetchAndProcessChannels(configKey, config, options = {}) {
                 if (config.gm === "list") return true;
                 if (config.gm === "bucket") return true;
                 if (selectedGroupSet.size === 0) return true;
-                const matches = selectedGroupSet.has(normalizeGroupName(channel.group));
-                if (!matches) {
-                    console.log(`[DEBUG FETCH] Filtering out channel "${channel.name}" with group "${channel.group}"`);
-                }
-                return matches;
+                return selectedGroupSet.has(normalizeGroupName(channel.group));
             })
             .map(channel => ({
                 ...channel,
@@ -1153,19 +1247,27 @@ async function fetchAndProcessChannels(configKey, config, options = {}) {
                     : "K.R.O.N.O.S. - Nessun dato guida oraria"
             }));
 
-        console.log('[DEBUG FETCH] Final channel count:', channels.length);
+        console.log(`[CATALOG LOAD OK] FinalChannels=${channels.length}`);
         if (channels.length > 0) {
             const uniqueGroups = [...new Set(channels.map(c => c.group))];
-            console.log('[DEBUG FETCH] Unique groups in final channels:', uniqueGroups);
+            console.log(`[CATALOG LOAD OK] Groups=${uniqueGroups.length}`);
         }
 
         memoryCache.channelItems[configKey] = channels;
         memoryCache.channelIndex[configKey] = buildChannelIndex(channels);
         memoryCache.lastUpdate[configKey] = Date.now();
+        return channels;
+    })();
+
+    memoryCache.channelInflight[configKey] = promise;
+
+    try {
+        return await promise;
     } catch (err) {
-        console.error("[KRONOS ERROR]", err.message);
-        console.error("[KRONOS ERROR STACK]", err.stack);
+        console.error("[CATALOG LOAD ERROR]", err.message);
+        throw err;
     } finally {
+        delete memoryCache.channelInflight[configKey];
         memoryCache.isUpdating[configKey] = false;
     }
 }
@@ -1173,19 +1275,20 @@ async function fetchAndProcessChannels(configKey, config, options = {}) {
 async function getChannelsFromCache(configKey, config) {
     const cachedData = memoryCache.channelItems[configKey];
     if (!cachedData) {
-        console.log('[CACHE] No cached data found, fetching channels...');
-        await fetchAndProcessChannels(configKey, config);
-        const result = memoryCache.channelItems[configKey] || [];
-        console.log('[CACHE] After fetch, channels count:', result.length);
-        return result;
+        console.log(`[CATALOG CACHE MISS] config=${configKey.substring(0, 12)}...`);
+        return await fetchAndProcessChannels(configKey, config);
     }
     if (!memoryCache.channelIndex[configKey]) {
-        console.log('[CACHE] Rebuilding channel index...');
+        console.log('[CATALOG CACHE] Rebuilding channel index');
         memoryCache.channelIndex[configKey] = buildChannelIndex(cachedData);
     }
     if (Date.now() - (memoryCache.lastUpdate[configKey] || 0) > CACHE_TTL) {
-        console.log('[CACHE] Cache expired, refreshing in background...');
-        fetchAndProcessChannels(configKey, config);
+        console.log('[CATALOG CACHE STALE] Serving cached catalog and refreshing in background');
+        fetchAndProcessChannels(configKey, config).catch(err => {
+            console.error("[CATALOG BACKGROUND REFRESH ERROR]", err.message);
+        });
+    } else {
+        console.log(`[CATALOG CACHE HIT] channels=${cachedData.length}`);
     }
     return cachedData;
 }
@@ -1200,42 +1303,32 @@ app.get("/:base64Config/manifest.json", async (req, res) => {
     try {
         const configKey = req.params.base64Config;
         const config = decodeConfig(configKey);
-        console.log('[DEBUG] Config decoded:', JSON.stringify(config, null, 2));
         
         const channels = await getChannelsFromCache(configKey, config);
-        console.log('[DEBUG] Total channels loaded:', channels.length);
-        
-        if (channels.length > 0) {
-            console.log('[DEBUG] Sample channel:', JSON.stringify(channels[0], null, 2));
-            const uniqueGroups = [...new Set(channels.map(c => c.group))];
-            console.log('[DEBUG] Unique groups found:', uniqueGroups);
-        }
         
         const host = getPublicHost(req);
-        console.log('[DEBUG] Public host:', host);
 
-        const catalogs = ["TUTTI", ...getConfiguredLists(config).map(list => list.name)].map(listName => {
-            const catalogChannels = listName === "TUTTI"
-                ? channels
-                : channels.filter(channel => channel.sourceName === listName);
-            
-            console.log(`[DEBUG] Catalog "${listName}" has ${catalogChannels.length} channels`);
+        const catalogs = getConfiguredLists(config).map(list => {
+            const catalogChannels = channels.filter(channel => channel.sourceName === list.name);
             
             const catalogGroups = [...new Set(catalogChannels.map(c => c.group))]
                 .filter(g => g && g.trim())
                 .sort((a, b) => a.localeCompare(b, "it", { sensitivity: "base" }));
-            
-            console.log(`[DEBUG] Catalog "${listName}" groups:`, catalogGroups);
 
-            return {
-                id: toCatalogId(listName),
-                type: ADDON_TYPE,
-                name: listName,
-                extra: catalogGroups.length > 0 ? [{
+            const extra = [{ name: "search", isRequired: false }];
+            if (catalogGroups.length > 0) {
+                extra.push({
                     name: "genre",
                     options: catalogGroups,
                     isRequired: false
-                }] : []
+                });
+            }
+
+            return {
+                id: toCatalogId(list.name),
+                type: ADDON_TYPE,
+                name: list.name,
+                extra
             };
         });
 
@@ -1255,7 +1348,7 @@ app.get("/:base64Config/manifest.json", async (req, res) => {
             catalogs
         };
         
-        console.log('[DEBUG] Manifest catalogs:', JSON.stringify(manifest.catalogs, null, 2));
+        console.log(`[MANIFEST] catalogs=${catalogs.length} channels=${channels.length} search=enabled allCatalog=removed`);
         res.json(manifest);
     } catch (err) {
         console.error('[ERROR] Manifest generation failed:', err);
@@ -1321,26 +1414,22 @@ async function catalogResponse(req, res) {
         const extraParams = getExtraParams(req.params.extra);
         const targetGroup = extraParams.genre || null;
         const targetSource = getCatalogSourceName(req.params.id);
+        const searchQuery = extraParams.search ? String(extraParams.search).trim() : null;
         const host = getPublicHost(req);
-        
-        console.log('[DEBUG CATALOG] Request params:', {
-            catalogId: req.params.id,
-            extra: req.params.extra,
-            targetGroup,
-            targetSource,
-            totalChannels: channels.length
-        });
         
         const filteredChannels = sortChannelsByName(channels.filter(channel => {
             const matchesSource = targetSource ? channel.sourceName === targetSource : true;
             const matchesGroup = targetGroup ? normalizeGroupName(channel.group) === normalizeGroupName(targetGroup) : true;
-            return matchesSource && matchesGroup;
+            const matchesSearch = matchesChannelSearch(channel, searchQuery);
+            return matchesSource && matchesGroup && matchesSearch;
         }));
         
-        console.log('[DEBUG CATALOG] Filtered channels:', filteredChannels.length);
-        if (filteredChannels.length > 0) {
-            console.log('[DEBUG CATALOG] Sample filtered channel:', JSON.stringify(filteredChannels[0], null, 2));
-        }
+        console.log(
+            `[CATALOG ROUTE] id=${req.params.id}` +
+            `${targetGroup ? ` genre="${targetGroup}"` : ""}` +
+            `${searchQuery ? ` search="${searchQuery}"` : ""}` +
+            ` results=${filteredChannels.length}/${channels.length}`
+        );
 
         const metas = filteredChannels.map(c => toMeta(c, host, configKey, config));
         res.json({ metas });
