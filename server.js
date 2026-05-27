@@ -31,11 +31,26 @@ const memoryCache = {
 };
 
 const CACHE_TTL = 30 * 60 * 1000;
-const HLS_REFRESH_TTL = 8 * 1000;
-const HLS_STALE_TTL = 5 * 60 * 1000;
+
+/*
+    HLS tuning:
+    - Kronos serve subito l’ultima manifest valida.
+    - Se la manifest è vecchia, viene aggiornata in background.
+    - Se MediaFlowProxy/EasyProxy restituisce una risposta non valida, Kronos non la salva.
+    - Al primo avvio fa più tentativi prima di fallire.
+*/
+const HLS_REFRESH_TTL = 25 * 1000;
+const HLS_STALE_TTL = 20 * 60 * 1000;
+const HLS_REQUEST_TIMEOUT = 20000;
+const HLS_RETRY_COUNT = 4;
+const HLS_RETRY_BASE_DELAY = 500;
 
 const ADDON_TYPE = "tv";
 const RELEASE_VERSION = "1.5.7";
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 function decodeConfig(configKey) {
     try {
@@ -73,6 +88,78 @@ function sanitizeUrlForLog(value) {
     } catch (err) {
         return String(value || "").replace(/api_password=[^&]+/g, "api_password=***");
     }
+}
+
+function isValidHLSManifest(data) {
+    const text = String(data || "").trim();
+
+    return text.startsWith("#EXTM3U") && (
+        text.includes("#EXTINF") ||
+        text.includes("#EXT-X-STREAM-INF") ||
+        text.includes("#EXT-X-TARGETDURATION") ||
+        text.includes("#EXT-X-MEDIA-SEQUENCE")
+    );
+}
+
+function getErrorStatus(err) {
+    return err?.response?.status || null;
+}
+
+function shouldRetryHLS(err) {
+    const status = getErrorStatus(err);
+
+    if (!status) return true;
+
+    return [408, 425, 429, 500, 502, 503, 504].includes(status);
+}
+
+async function fetchHLSManifestWithRetry(fetchUrl) {
+    let lastErr = null;
+
+    for (let attempt = 1; attempt <= HLS_RETRY_COUNT; attempt++) {
+        try {
+            console.log(`[HLS FETCH] Attempt ${attempt}/${HLS_RETRY_COUNT}:`, sanitizeUrlForLog(fetchUrl));
+
+            const response = await axios.get(fetchUrl, {
+                timeout: HLS_REQUEST_TIMEOUT,
+                maxRedirects: 5,
+                headers: {
+                    "User-Agent": "Kronos/1.5.7",
+                    "Accept": "application/x-mpegURL, application/vnd.apple.mpegurl, audio/mpegurl, text/plain, */*",
+                    "Accept-Encoding": "gzip, deflate",
+                    "Connection": "keep-alive"
+                },
+                validateStatus(status) {
+                    return status >= 200 && status < 300;
+                }
+            });
+
+            if (!isValidHLSManifest(response.data)) {
+                const invalidErr = new Error("Invalid HLS manifest returned by proxy/upstream");
+                invalidErr.response = response;
+                throw invalidErr;
+            }
+
+            return response;
+        } catch (err) {
+            lastErr = err;
+
+            const status = getErrorStatus(err);
+            console.error(
+                `[HLS FETCH ERROR] Attempt ${attempt}/${HLS_RETRY_COUNT}`,
+                status ? `status=${status}` : "",
+                err.message
+            );
+
+            if (attempt >= HLS_RETRY_COUNT || !shouldRetryHLS(err)) {
+                break;
+            }
+
+            await sleep(HLS_RETRY_BASE_DELAY * attempt);
+        }
+    }
+
+    throw lastErr;
 }
 
 app.get("/logo.svg", (req, res) => {
@@ -404,42 +491,82 @@ async function getLogoDataUri(logoUrl) {
     }
 }
 
-async function getCachedHLS(cacheKey, sourceUrl, config = {}) {
+async function refreshHLSInBackground(cacheKey, sourceUrl, config = {}) {
     const cached = memoryCache.hlsData[cacheKey];
-    const now = Date.now();
-    const fetchUrl = getStreamFetchUrl(config, sourceUrl);
 
-    if (cached && now - cached.updatedAt < HLS_REFRESH_TTL) {
-        return cached.playlist;
-    }
+    if (cached?.refreshing) return;
+
+    memoryCache.hlsData[cacheKey] = {
+        ...(cached || {}),
+        refreshing: true
+    };
 
     try {
-        console.log("[HLS FETCH] Fetching:", sanitizeUrlForLog(fetchUrl));
-
-        const response = await axios.get(fetchUrl, {
-            timeout: 15000,
-            headers: {
-                "User-Agent": "Kronos/1.5.7",
-                "Accept": "application/x-mpegURL, application/vnd.apple.mpegurl, audio/mpegurl, text/plain, */*"
-            },
-            validateStatus(status) {
-                return status >= 200 && status < 300;
-            }
-        });
-
+        const fetchUrl = getStreamFetchUrl(config, sourceUrl);
+        const response = await fetchHLSManifestWithRetry(fetchUrl);
         const finalUrl = response.request?.res?.responseUrl || fetchUrl;
         const playlist = rewriteHLSPlaylist(response.data, finalUrl);
 
         memoryCache.hlsData[cacheKey] = {
             playlist,
-            updatedAt: now
+            updatedAt: Date.now(),
+            lastGoodAt: Date.now(),
+            sourceUrl,
+            fetchUrl,
+            refreshing: false
+        };
+
+        console.log("[HLS BACKGROUND REFRESH] Updated manifest:", sanitizeUrlForLog(fetchUrl));
+    } catch (err) {
+        console.error("[HLS BACKGROUND REFRESH ERROR]", err.message);
+
+        if (memoryCache.hlsData[cacheKey]) {
+            memoryCache.hlsData[cacheKey].refreshing = false;
+            memoryCache.hlsData[cacheKey].lastError = err.message;
+        }
+    }
+}
+
+async function getCachedHLS(cacheKey, sourceUrl, config = {}) {
+    const cached = memoryCache.hlsData[cacheKey];
+    const now = Date.now();
+    const fetchUrl = getStreamFetchUrl(config, sourceUrl);
+
+    if (cached?.playlist) {
+        const age = now - cached.updatedAt;
+
+        if (age > HLS_REFRESH_TTL) {
+            refreshHLSInBackground(cacheKey, sourceUrl, config);
+        }
+
+        return cached.playlist;
+    }
+
+    try {
+        const response = await fetchHLSManifestWithRetry(fetchUrl);
+        const finalUrl = response.request?.res?.responseUrl || fetchUrl;
+        const playlist = rewriteHLSPlaylist(response.data, finalUrl);
+
+        memoryCache.hlsData[cacheKey] = {
+            playlist,
+            updatedAt: now,
+            lastGoodAt: now,
+            sourceUrl,
+            fetchUrl,
+            refreshing: false
         };
 
         return playlist;
     } catch (err) {
-        console.error("[HLS FETCH ERROR]", err.message);
+        const status = getErrorStatus(err);
 
-        if (cached && now - cached.updatedAt < HLS_STALE_TTL) {
+        console.error(
+            "[HLS FETCH FINAL ERROR]",
+            status ? `status=${status}` : "",
+            err.message
+        );
+
+        if (cached?.playlist && now - cached.updatedAt < HLS_STALE_TTL) {
             console.log("[HLS FETCH] Returning stale cached playlist");
             return cached.playlist;
         }
@@ -1130,6 +1257,13 @@ app.get("/:base64Config/debug", async (req, res) => {
                 name: list.name,
                 type: ADDON_TYPE
             })),
+            hlsSettings: {
+                HLS_REFRESH_TTL,
+                HLS_STALE_TTL,
+                HLS_REQUEST_TIMEOUT,
+                HLS_RETRY_COUNT,
+                HLS_RETRY_BASE_DELAY
+            },
             cacheInfo: {
                 lastUpdate: memoryCache.lastUpdate[configKey],
                 isUpdating: memoryCache.isUpdating[configKey],
@@ -1152,6 +1286,9 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`${"=".repeat(60)}`);
     console.log(`Server URL: http://0.0.0.0:${PORT}`);
     console.log(`Addon type: ${ADDON_TYPE}`);
+    console.log(`HLS refresh TTL: ${HLS_REFRESH_TTL}ms`);
+    console.log(`HLS stale TTL: ${HLS_STALE_TTL}ms`);
+    console.log(`HLS retry count: ${HLS_RETRY_COUNT}`);
     console.log(`Node version: ${process.version}`);
     console.log(`Environment: ${process.env.NODE_ENV || "development"}`);
     console.log(`Memory: ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`);
