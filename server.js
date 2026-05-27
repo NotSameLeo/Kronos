@@ -27,6 +27,7 @@ const memoryCache = {
     epgData: {},
     hlsData: {},
     hlsInflight: {},
+    streamStates: {},
     liveBuffers: {},
     segmentData: {},
     segmentInflight: {},
@@ -51,6 +52,14 @@ const memoryCache = {
             playlistsBuilt: 0,
             segmentsStored: 0,
             prefetchQueued: 0
+        },
+        startup: {
+            requested: 0,
+            acquiring: 0,
+            ready: 0,
+            failed: 0,
+            reusedReady: 0,
+            waitedExisting: 0
         },
         segmentCache: {
             hits: 0,
@@ -97,8 +106,21 @@ const LIVE_BUFFER_SEGMENTS = Number(process.env.LIVE_BUFFER_SEGMENTS || 24);
 const LIVE_PLAYLIST_SEGMENTS = Number(process.env.LIVE_PLAYLIST_SEGMENTS || 10);
 const LIVE_DELAY_SEGMENTS = Number(process.env.LIVE_DELAY_SEGMENTS || 2);
 const MIN_LIVE_SEGMENTS_READY = Number(process.env.MIN_LIVE_SEGMENTS_READY || 3);
-const MIN_LIVE_WARMUP_ATTEMPTS = Number(process.env.MIN_LIVE_WARMUP_ATTEMPTS || 3);
-const MIN_LIVE_WARMUP_DELAY_MS = Number(process.env.MIN_LIVE_WARMUP_DELAY_MS || 1200);
+const MIN_LIVE_WARMUP_ATTEMPTS = Number(process.env.MIN_LIVE_WARMUP_ATTEMPTS || 4);
+const MIN_LIVE_WARMUP_DELAY_MS = Number(process.env.MIN_LIVE_WARMUP_DELAY_MS || 4000);
+
+// Startup prebuffer method 1:
+// Stremio waits while Kronos acquires the stream and caches enough .ts chunks.
+const STREAM_STARTUP_PREBUFFER_ENABLED = String(process.env.STREAM_STARTUP_PREBUFFER_ENABLED || "1") !== "0";
+const STREAM_ACQUIRE_ATTEMPTS = Number(process.env.STREAM_ACQUIRE_ATTEMPTS || 5);
+const STREAM_ACQUIRE_TOTAL_TIMEOUT = Number(process.env.STREAM_ACQUIRE_TOTAL_TIMEOUT || 45000);
+const STREAM_ACQUIRE_RETRY_DELAY_MS = Number(process.env.STREAM_ACQUIRE_RETRY_DELAY_MS || 9000);
+const PREBUFFER_MIN_SEGMENTS = Number(process.env.PREBUFFER_MIN_SEGMENTS || 4);
+const PREBUFFER_TARGET_SEGMENTS = Number(process.env.PREBUFFER_TARGET_SEGMENTS || 5);
+const PREBUFFER_MIN_SECONDS = Number(process.env.PREBUFFER_MIN_SECONDS || 35);
+const PREBUFFER_WAIT_FOR_SEGMENTS_MS = Number(process.env.PREBUFFER_WAIT_FOR_SEGMENTS_MS || 18000);
+const STREAM_READY_TTL = Number(process.env.STREAM_READY_TTL || 5 * 60 * 1000);
+const MIN_PLAYLIST_OUTPUT_SEGMENTS = Number(process.env.MIN_PLAYLIST_OUTPUT_SEGMENTS || 4);
 
 const SEGMENT_CACHE_TTL = Number(process.env.SEGMENT_CACHE_TTL || 10 * 60 * 1000);
 const SEGMENT_CACHE_MAX_BYTES = Number(process.env.SEGMENT_CACHE_MAX_BYTES || 512 * 1024 * 1024);
@@ -109,7 +131,7 @@ const SEGMENT_PREFETCH_AHEAD = Number(process.env.SEGMENT_PREFETCH_AHEAD || 8);
 const SEGMENT_WAIT_FOR_PREFETCH_MS = Number(process.env.SEGMENT_WAIT_FOR_PREFETCH_MS || 2500);
 
 const ADDON_TYPE = "tv";
-const RELEASE_VERSION = "1.6.3";
+const RELEASE_VERSION = "1.6.4";
 
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
@@ -219,6 +241,7 @@ function parseHLSMediaPlaylist(playlist, baseUrl) {
     const headerLines = [];
     const segments = [];
     let pendingSegmentLines = [];
+    let pendingDuration = null;
     const originalMediaSequence = Number.isFinite(info.mediaSequence) ? info.mediaSequence : 0;
 
     for (const rawLine of lines) {
@@ -230,6 +253,8 @@ function parseHLSMediaPlaylist(playlist, baseUrl) {
 
         if (trimmed.startsWith("#EXTINF")) {
             pendingSegmentLines = [normalizeHeaderLineToAbsolute(line, baseUrl)];
+            const durationMatch = trimmed.match(/^#EXTINF:([0-9.]+)/);
+            pendingDuration = durationMatch ? Number(durationMatch[1]) : null;
             continue;
         }
 
@@ -244,10 +269,12 @@ function parseHLSMediaPlaylist(playlist, baseUrl) {
                     sequence,
                     url: absoluteUrl,
                     lines: pendingSegmentLines,
+                    duration: Number.isFinite(pendingDuration) ? pendingDuration : (info.targetDuration || 10),
                     firstSeenAt: Date.now(),
                     lastSeenAt: Date.now()
                 });
                 pendingSegmentLines = [];
+                pendingDuration = null;
             }
 
             continue;
@@ -378,13 +405,7 @@ function sendCachedSegment(req, res, cached, segmentNo = null) {
         res.setHeader("Content-Type", cached.headers?.["content-type"] || "video/mp2t");
     }
 
-    if (segmentNo !== null && shouldLogSegment(segmentNo, true)) {
-        console.log(
-            `[SEG CACHE #${segmentNo}] status=${status} bytes=${formatBytes(chunk.length)} total=${formatBytes(total)}` +
-            `${rangeHeader ? ` range=${rangeHeader}` : ""} url=${sanitizeUrlForLog(cached.url)}`
-        );
-    }
-
+    // Detailed segment timing is logged once in finalizeSegment().
     return res.end(chunk);
 }
 
@@ -491,7 +512,274 @@ async function waitForSegmentPrefetch(sourceUrl, maxWaitMs = SEGMENT_WAIT_FOR_PR
     }
 }
 
-function updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl) {
+function getLiveBuffer(sourceUrl) {
+    return memoryCache.liveBuffers[getHLSCacheKey(sourceUrl)] || null;
+}
+
+function selectBufferedSegments(buffer, options = {}) {
+    if (!buffer || !Array.isArray(buffer.segments) || buffer.segments.length === 0) {
+        return {
+            ready: false,
+            segments: [],
+            effectiveDelay: 0,
+            totalBufferSegments: 0,
+            totalDuration: 0
+        };
+    }
+
+    const minOutputSegments = Number(options.minOutputSegments || MIN_PLAYLIST_OUTPUT_SEGMENTS);
+    const maxPlaylistSegments = Number(options.maxPlaylistSegments || LIVE_PLAYLIST_SEGMENTS);
+
+    let effectiveDelay = Math.max(0, Number(options.delaySegments ?? LIVE_DELAY_SEGMENTS));
+
+    // Do not let delay destroy the visible playlist during startup.
+    // Example: buffer=3 delay=2 out=1 was too fragile.
+    while (effectiveDelay > 0 && buffer.segments.length - effectiveDelay < minOutputSegments) {
+        effectiveDelay -= 1;
+    }
+
+    const delayedSegments = effectiveDelay > 0
+        ? buffer.segments.slice(0, Math.max(0, buffer.segments.length - effectiveDelay))
+        : buffer.segments.slice();
+
+    const selected = delayedSegments.slice(-Math.max(1, maxPlaylistSegments));
+    const totalDuration = selected.reduce((sum, segment) => sum + (Number(segment.duration) || 0), 0);
+
+    return {
+        ready: selected.length >= minOutputSegments,
+        segments: selected,
+        effectiveDelay,
+        totalBufferSegments: buffer.segments.length,
+        totalDuration
+    };
+}
+
+function getCachedCountForSegments(segments) {
+    return (segments || []).filter(segment => getSegmentFromCache(segment.url)).length;
+}
+
+async function waitForCachedSegments(segments, minCachedSegments, maxWaitMs, label = "startup") {
+    const uniqueSegments = [];
+    const seen = new Set();
+
+    (segments || []).forEach(segment => {
+        if (!segment?.url || seen.has(segment.url)) return;
+        seen.add(segment.url);
+        uniqueSegments.push(segment);
+    });
+
+    uniqueSegments.forEach(segment => queueSegmentPrefetch(segment.url));
+
+    const started = Date.now();
+
+    while (Date.now() - started <= maxWaitMs) {
+        const cachedCount = getCachedCountForSegments(uniqueSegments);
+
+        if (cachedCount >= Math.min(minCachedSegments, uniqueSegments.length)) {
+            return { cachedCount, total: uniqueSegments.length, waitedMs: Date.now() - started };
+        }
+
+        await sleep(300);
+    }
+
+    return {
+        cachedCount: getCachedCountForSegments(uniqueSegments),
+        total: uniqueSegments.length,
+        waitedMs: Date.now() - started
+    };
+}
+
+function buildPlaylistFromBufferedSegments(buffer, selectedSegments, effectiveDelay = LIVE_DELAY_SEGMENTS) {
+    if (!buffer || !Array.isArray(selectedSegments) || selectedSegments.length === 0) {
+        return null;
+    }
+
+    const firstSeq = selectedSegments[0].sequence;
+    let hasMediaSequence = false;
+
+    const headerLines = (buffer.headerLines || [])
+        .filter(line => !String(line).trim().startsWith("#EXT-X-ENDLIST"))
+        .map(line => {
+            if (String(line).trim().startsWith("#EXT-X-MEDIA-SEQUENCE:")) {
+                hasMediaSequence = true;
+                return `#EXT-X-MEDIA-SEQUENCE:${firstSeq}`;
+            }
+            return line;
+        });
+
+    if (!hasMediaSequence) {
+        headerLines.push(`#EXT-X-MEDIA-SEQUENCE:${firstSeq}`);
+    }
+
+    return [
+        ...headerLines,
+        ...selectedSegments.flatMap(segment => segment.lines)
+    ].join("\n") + "\n";
+}
+
+async function ensureStreamPrebuffered(sourceUrl, label = "stream") {
+    if (!STREAM_STARTUP_PREBUFFER_ENABLED) {
+        return { skipped: true };
+    }
+
+    const cacheKey = getHLSCacheKey(sourceUrl);
+    let state = memoryCache.streamStates[cacheKey];
+
+    if (!state) {
+        state = {
+            status: "idle",
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            readyAt: 0,
+            promise: null,
+            lastError: null
+        };
+        memoryCache.streamStates[cacheKey] = state;
+    }
+
+    const existingBuffer = getLiveBuffer(sourceUrl);
+    const existingSelection = selectBufferedSegments(existingBuffer, {
+        minOutputSegments: PREBUFFER_MIN_SEGMENTS,
+        maxPlaylistSegments: LIVE_PLAYLIST_SEGMENTS
+    });
+
+    if (
+        state.status === "ready" &&
+        Date.now() - state.readyAt <= STREAM_READY_TTL &&
+        existingSelection.ready &&
+        getCachedCountForSegments(existingSelection.segments) >= PREBUFFER_MIN_SEGMENTS
+    ) {
+        memoryCache.stats.startup.reusedReady += 1;
+        return {
+            skipped: false,
+            status: "ready",
+            reused: true,
+            cachedSegments: getCachedCountForSegments(existingSelection.segments),
+            playlistSegments: existingSelection.segments.length,
+            duration: existingSelection.totalDuration
+        };
+    }
+
+    if (state.promise) {
+        memoryCache.stats.startup.waitedExisting += 1;
+        console.log(`[STREAM WAIT] channel="${label}" status=${state.status}`);
+        return state.promise;
+    }
+
+    memoryCache.stats.startup.requested += 1;
+
+    state.status = "acquiring";
+    state.updatedAt = Date.now();
+    state.lastError = null;
+
+    state.promise = (async () => {
+        memoryCache.stats.startup.acquiring += 1;
+
+        const started = Date.now();
+        let attempts = 0;
+        let lastErr = null;
+        let bestInfo = null;
+
+        console.log(
+            `[STREAM ACQUIRE] channel="${label}" attempts=${STREAM_ACQUIRE_ATTEMPTS} timeout=${STREAM_ACQUIRE_TOTAL_TIMEOUT}ms target=${PREBUFFER_TARGET_SEGMENTS} min=${PREBUFFER_MIN_SEGMENTS}`
+        );
+
+        while (attempts < STREAM_ACQUIRE_ATTEMPTS && Date.now() - started < STREAM_ACQUIRE_TOTAL_TIMEOUT) {
+            attempts += 1;
+
+            try {
+                state.status = "acquiring";
+                state.updatedAt = Date.now();
+
+                const hls = await fetchAndStoreHLSRaw(cacheKey, sourceUrl, `startup-${attempts}`);
+                const buffered = updateLiveBufferFromPlaylist(sourceUrl, hls.playlist, hls.baseUrl, {
+                    minOutputSegments: PREBUFFER_MIN_SEGMENTS,
+                    maxPlaylistSegments: LIVE_PLAYLIST_SEGMENTS,
+                    forcePrefetch: true
+                });
+
+                bestInfo = buffered.info || analyzeHLSPlaylist(hls.playlist);
+
+                const buffer = getLiveBuffer(sourceUrl);
+                const selection = selectBufferedSegments(buffer, {
+                    minOutputSegments: PREBUFFER_MIN_SEGMENTS,
+                    maxPlaylistSegments: LIVE_PLAYLIST_SEGMENTS
+                });
+
+                const wantedSegments = selection.segments.slice(-Math.max(PREBUFFER_TARGET_SEGMENTS, PREBUFFER_MIN_SEGMENTS));
+                const prefetch = await waitForCachedSegments(
+                    wantedSegments,
+                    PREBUFFER_MIN_SEGMENTS,
+                    PREBUFFER_WAIT_FOR_SEGMENTS_MS,
+                    label
+                );
+
+                const selectedDuration = selection.totalDuration || ((bestInfo?.targetDuration || 10) * selection.segments.length);
+                const ready =
+                    selection.segments.length >= PREBUFFER_MIN_SEGMENTS &&
+                    prefetch.cachedCount >= PREBUFFER_MIN_SEGMENTS &&
+                    selectedDuration >= PREBUFFER_MIN_SECONDS;
+
+                console.log(
+                    `[STREAM PREBUFFER] channel="${label}" attempt=${attempts}/${STREAM_ACQUIRE_ATTEMPTS}` +
+                    ` playlistSegs=${selection.segments.length} cached=${prefetch.cachedCount}/${prefetch.total}` +
+                    ` duration≈${Math.round(selectedDuration)}s waited=${prefetch.waitedMs}ms` +
+                    ` buffer=${selection.totalBufferSegments} delay=${selection.effectiveDelay}`
+                );
+
+                if (ready) {
+                    state.status = "ready";
+                    state.readyAt = Date.now();
+                    state.updatedAt = Date.now();
+                    memoryCache.stats.startup.ready += 1;
+
+                    console.log(
+                        `[STREAM READY] channel="${label}" attempts=${attempts} cached=${prefetch.cachedCount}` +
+                        ` playlistSegs=${selection.segments.length} duration≈${Math.round(selectedDuration)}s total=${Date.now() - started}ms`
+                    );
+
+                    return {
+                        status: "ready",
+                        attempts,
+                        cachedSegments: prefetch.cachedCount,
+                        playlistSegments: selection.segments.length,
+                        duration: selectedDuration,
+                        totalMs: Date.now() - started
+                    };
+                }
+            } catch (err) {
+                lastErr = err;
+                state.lastError = err.message;
+                console.error(`[STREAM ACQUIRE ERROR] channel="${label}" attempt=${attempts}/${STREAM_ACQUIRE_ATTEMPTS} err=${err.message}`);
+            }
+
+            const remaining = STREAM_ACQUIRE_TOTAL_TIMEOUT - (Date.now() - started);
+            if (attempts < STREAM_ACQUIRE_ATTEMPTS && remaining > 0) {
+                await sleep(Math.min(STREAM_ACQUIRE_RETRY_DELAY_MS, remaining));
+            }
+        }
+
+        state.status = "failed";
+        state.updatedAt = Date.now();
+        memoryCache.stats.startup.failed += 1;
+
+        const message = lastErr
+            ? `Stream prebuffer failed: ${lastErr.message}`
+            : `Stream prebuffer failed: not enough cached segments after ${attempts} attempts`;
+
+        console.error(`[STREAM FAILED] channel="${label}" attempts=${attempts} total=${Date.now() - started}ms reason=${message}`);
+
+        throw new Error(message);
+    })();
+
+    try {
+        return await state.promise;
+    } finally {
+        state.promise = null;
+    }
+}
+
+function updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl, options = {}) {
     const cacheKey = getHLSCacheKey(sourceUrl);
     const parsed = parseHLSMediaPlaylist(playlist, baseUrl);
 
@@ -527,6 +815,8 @@ function updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl) {
             memoryCache.stats.liveBuffer.segmentsStored += 1;
         } else {
             buffer.segmentMap[key].lastSeenAt = Date.now();
+            buffer.segmentMap[key].duration = segment.duration || buffer.segmentMap[key].duration;
+            buffer.segmentMap[key].lines = segment.lines || buffer.segmentMap[key].lines;
         }
     });
 
@@ -539,40 +829,28 @@ function updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl) {
         buffer.segmentMap[`${segment.sequence}:${segment.url}`] = segment;
     });
 
-    const prefetchCandidates = buffer.segments.slice(-Math.max(1, SEGMENT_PREFETCH_AHEAD));
+    const selection = selectBufferedSegments(buffer, {
+        minOutputSegments: options.minOutputSegments || MIN_PLAYLIST_OUTPUT_SEGMENTS,
+        maxPlaylistSegments: options.maxPlaylistSegments || LIVE_PLAYLIST_SEGMENTS,
+        delaySegments: options.delaySegments ?? LIVE_DELAY_SEGMENTS
+    });
+
+    const prefetchCandidates = [
+        ...selection.segments,
+        ...buffer.segments.slice(-Math.max(0, SEGMENT_PREFETCH_AHEAD))
+    ];
+
     prefetchCandidates.forEach(segment => queueSegmentPrefetch(segment.url));
 
-    const delayedSegments = LIVE_DELAY_SEGMENTS > 0
-        ? buffer.segments.slice(0, Math.max(0, buffer.segments.length - LIVE_DELAY_SEGMENTS))
-        : buffer.segments.slice();
-
-    const playlistSegments = delayedSegments.slice(-Math.max(1, LIVE_PLAYLIST_SEGMENTS));
-
-    if (playlistSegments.length === 0) {
+    if (!selection.segments.length) {
         return { playlist, info: parsed.info, cacheKey, buffered: false };
     }
 
-    const firstSeq = playlistSegments[0].sequence;
-    let hasMediaSequence = false;
+    const rebuilt = buildPlaylistFromBufferedSegments(buffer, selection.segments, selection.effectiveDelay);
 
-    const headerLines = buffer.headerLines
-        .filter(line => !String(line).trim().startsWith("#EXT-X-ENDLIST"))
-        .map(line => {
-            if (String(line).trim().startsWith("#EXT-X-MEDIA-SEQUENCE:")) {
-                hasMediaSequence = true;
-                return `#EXT-X-MEDIA-SEQUENCE:${firstSeq}`;
-            }
-            return line;
-        });
-
-    if (!hasMediaSequence) {
-        headerLines.push(`#EXT-X-MEDIA-SEQUENCE:${firstSeq}`);
+    if (!rebuilt) {
+        return { playlist, info: parsed.info, cacheKey, buffered: false };
     }
-
-    const rebuilt = [
-        ...headerLines,
-        ...playlistSegments.flatMap(segment => segment.lines)
-    ].join("\n") + "\n";
 
     memoryCache.stats.liveBuffer.playlistsBuilt += 1;
 
@@ -582,8 +860,11 @@ function updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl) {
         cacheKey,
         buffered: true,
         bufferSize: buffer.segments.length,
-        delayedSegments: LIVE_DELAY_SEGMENTS,
-        playlistSegments: playlistSegments.length
+        delayedSegments: selection.effectiveDelay,
+        playlistSegments: selection.segments.length,
+        cachedSegments: getCachedCountForSegments(selection.segments),
+        duration: selection.totalDuration,
+        segments: selection.segments
     };
 }
 
@@ -713,7 +994,9 @@ async function fetchAndStoreHLSRaw(cacheKey, sourceUrl, reason = "request") {
     }
 
     const promise = (async () => {
-        const response = await fetchHLSManifestWithWarmup(sourceUrl, reason);
+        const response = String(reason).startsWith("startup-")
+            ? await fetchHLSManifest(sourceUrl)
+            : await fetchHLSManifestWithWarmup(sourceUrl, reason);
         const finalUrl = response.request?.res?.responseUrl || sourceUrl;
         const info = analyzeHLSPlaylist(response.data);
         const result = {
@@ -1449,8 +1732,14 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         if (!c) return res.status(404).send("#EXTM3U\n");
 
         const host = getPublicHost(req);
+
+        await ensureStreamPrebuffered(c.url, c.name);
+
         const { playlist, baseUrl, cacheStatus, age } = await getCachedHLSRaw(c.url);
-        const buffered = updateLiveBufferFromPlaylist(c.url, playlist, baseUrl);
+        const buffered = updateLiveBufferFromPlaylist(c.url, playlist, baseUrl, {
+            minOutputSegments: MIN_PLAYLIST_OUTPUT_SEGMENTS,
+            maxPlaylistSegments: LIVE_PLAYLIST_SEGMENTS
+        });
         const outputPlaylist = buffered.playlist;
         const rewritten = rewriteHLSPlaylistThroughKronos(outputPlaylist, baseUrl, host, configKey);
 
@@ -1460,7 +1749,8 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
             `${typeof age === "number" ? ` age=${age}ms` : ""}` +
             ` type=${playlistInfo.isMaster ? "master" : "media"} segs=${playlistInfo.segmentCount}` +
             `${playlistInfo.mediaSequence !== null ? ` seq=${playlistInfo.mediaSequence}` : ""}` +
-            `${buffered.buffered ? ` buffer=${buffered.bufferSize} delay=${buffered.delayedSegments} out=${buffered.playlistSegments}` : ""}`
+            `${buffered.buffered ? ` buffer=${buffered.bufferSize} delay=${buffered.delayedSegments} out=${buffered.playlistSegments}` : ""}` +
+            `${buffered.cachedSegments !== undefined ? ` cached=${buffered.cachedSegments}` : ""}`
         );
 
         res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
@@ -1482,8 +1772,14 @@ app.get("/:base64Config/pl", async (req, res) => {
 
         const sourceUrl = decodeProxyUrl(req.query.u);
         const host = getPublicHost(req);
+
+        await ensureStreamPrebuffered(sourceUrl, "nested-playlist");
+
         const { playlist, baseUrl, cacheStatus, age } = await getCachedHLSRaw(sourceUrl);
-        const buffered = updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl);
+        const buffered = updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl, {
+            minOutputSegments: MIN_PLAYLIST_OUTPUT_SEGMENTS,
+            maxPlaylistSegments: LIVE_PLAYLIST_SEGMENTS
+        });
         const outputPlaylist = buffered.playlist;
         const rewritten = rewriteHLSPlaylistThroughKronos(outputPlaylist, baseUrl, host, configKey);
 
@@ -1493,7 +1789,8 @@ app.get("/:base64Config/pl", async (req, res) => {
             `${typeof age === "number" ? ` age=${age}ms` : ""}` +
             ` type=${playlistInfo.isMaster ? "master" : "media"} segs=${playlistInfo.segmentCount}` +
             `${playlistInfo.mediaSequence !== null ? ` seq=${playlistInfo.mediaSequence}` : ""}` +
-            `${buffered.buffered ? ` buffer=${buffered.bufferSize} delay=${buffered.delayedSegments} out=${buffered.playlistSegments}` : ""}`
+            `${buffered.buffered ? ` buffer=${buffered.bufferSize} delay=${buffered.delayedSegments} out=${buffered.playlistSegments}` : ""}` +
+            `${buffered.cachedSegments !== undefined ? ` cached=${buffered.cachedSegments}` : ""}`
         );
 
         res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
@@ -1696,7 +1993,14 @@ app.get("/stats", (req, res) => {
         segmentCacheKeys: Object.keys(memoryCache.segmentData).length,
         segmentCacheBytes: memoryCache.segmentCacheBytes,
         segmentPrefetchActive: memoryCache.segmentPrefetchActive,
-        segmentPrefetchQueue: memoryCache.segmentPrefetchQueue.length
+        segmentPrefetchQueue: memoryCache.segmentPrefetchQueue.length,
+        streamStates: Object.entries(memoryCache.streamStates).map(([key, state]) => ({
+            key,
+            status: state.status,
+            readyAt: state.readyAt,
+            updatedAt: state.updatedAt,
+            lastError: state.lastError
+        }))
     });
 });
 
@@ -1728,6 +2032,18 @@ app.get("/:base64Config/debug", async (req, res) => {
                 LIVE_PLAYLIST_SEGMENTS,
                 LIVE_DELAY_SEGMENTS,
                 MIN_LIVE_SEGMENTS_READY,
+                MIN_LIVE_WARMUP_ATTEMPTS,
+                MIN_LIVE_WARMUP_DELAY_MS,
+                STREAM_STARTUP_PREBUFFER_ENABLED,
+                STREAM_ACQUIRE_ATTEMPTS,
+                STREAM_ACQUIRE_TOTAL_TIMEOUT,
+                STREAM_ACQUIRE_RETRY_DELAY_MS,
+                PREBUFFER_MIN_SEGMENTS,
+                PREBUFFER_TARGET_SEGMENTS,
+                PREBUFFER_MIN_SECONDS,
+                PREBUFFER_WAIT_FOR_SEGMENTS_MS,
+                STREAM_READY_TTL,
+                MIN_PLAYLIST_OUTPUT_SEGMENTS,
                 SEGMENT_CACHE_TTL,
                 SEGMENT_CACHE_MAX_BYTES,
                 SEGMENT_CACHE_MAX_SEGMENTS,
@@ -1743,7 +2059,8 @@ app.get("/:base64Config/debug", async (req, res) => {
                 segmentCacheKeys: Object.keys(memoryCache.segmentData).length,
                 segmentCacheBytes: memoryCache.segmentCacheBytes,
                 segmentPrefetchActive: memoryCache.segmentPrefetchActive,
-                segmentPrefetchQueue: memoryCache.segmentPrefetchQueue.length
+                segmentPrefetchQueue: memoryCache.segmentPrefetchQueue.length,
+                streamStateKeys: Object.keys(memoryCache.streamStates).length
             },
             stats: memoryCache.stats
         });
@@ -1759,6 +2076,7 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server: http://0.0.0.0:${PORT}`);
     console.log(`HLS live refresh: ${HLS_REFRESH_TTL}ms | live stale refresh: ${HLS_LIVE_STALE_REFRESH_TTL}ms | stale fallback: ${HLS_STALE_TTL}ms`);
     console.log(`Live buffer: keep=${LIVE_BUFFER_SEGMENTS} | playlist=${LIVE_PLAYLIST_SEGMENTS} | delay=${LIVE_DELAY_SEGMENTS} | minReady=${MIN_LIVE_SEGMENTS_READY}`);
+    console.log(`Startup prebuffer: enabled=${STREAM_STARTUP_PREBUFFER_ENABLED} | attempts=${STREAM_ACQUIRE_ATTEMPTS} | timeout=${STREAM_ACQUIRE_TOTAL_TIMEOUT}ms | min=${PREBUFFER_MIN_SEGMENTS} | target=${PREBUFFER_TARGET_SEGMENTS} | minSeconds=${PREBUFFER_MIN_SECONDS}`);
     console.log(`Segment cache: max=${formatBytes(SEGMENT_CACHE_MAX_BYTES)} | maxSegments=${SEGMENT_CACHE_MAX_SEGMENTS} | prefetchConcurrency=${SEGMENT_PREFETCH_CONCURRENCY}`);
     console.log(`Segment timeout: ${SEG_REQUEST_TIMEOUT}ms | segment log every: ${SEG_LOG_EVERY}`);
     console.log(`Node: ${process.version}`);
