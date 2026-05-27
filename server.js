@@ -175,14 +175,14 @@ function getResolverPlaylistUrl(config, sourceUrl) {
     proxy.pathname = `${cleanPath}/playlist`;
     proxy.search = "";
     proxy.searchParams.set("url", sourceUrl);
-
-    if (config.pp && proxy.username) {
-        proxy.password = config.pp;
+    if (config.pp) {
+        proxy.searchParams.set("d_api_password", config.pp);
     }
 
     return proxy.toString();
 }
 
+// FIX 1: la password viene ora aggiunta come query param d_api_password
 function getStreamFetchUrl(config, sourceUrl) {
     if (!config.p) return sourceUrl;
 
@@ -193,6 +193,9 @@ function getStreamFetchUrl(config, sourceUrl) {
             proxy.pathname = `${cleanPath}/proxy/manifest.m3u8`;
             proxy.search = "";
             proxy.searchParams.set("url", sourceUrl);
+            if (config.pp) {
+                proxy.searchParams.set("d_api_password", config.pp);
+            }
             return proxy.toString();
         } catch (err) {
             return sourceUrl;
@@ -408,7 +411,7 @@ function getExtraParams(extra) {
     const cleanExtra = decodeURIComponent(extra).replace(/\.json$/i, "");
     cleanExtra.split("&").forEach(pair => {
         const [name, value] = pair.split("=");
-        if (name && value) params[name] = value;
+        if (name && value) params[name] = decodeURIComponent(value);
     });
     return params;
 }
@@ -630,6 +633,7 @@ app.get("/:base64Config/manifest.json", async (req, res) => {
         const host = getPublicHost(req);
         console.log('[DEBUG] Public host:', host);
 
+        // FIX 2: aggiunto "search" come extra supportato in ogni catalog
         const catalogs = ["TUTTI", ...getConfiguredLists(config).map(list => list.name)].map(listName => {
             const catalogChannels = listName === "TUTTI"
                 ? channels
@@ -643,15 +647,24 @@ app.get("/:base64Config/manifest.json", async (req, res) => {
             
             console.log(`[DEBUG] Catalog "${listName}" groups:`, catalogGroups);
 
+            const extras = [];
+            if (catalogGroups.length > 0) {
+                extras.push({
+                    name: "genre",
+                    options: catalogGroups,
+                    isRequired: false
+                });
+            }
+            extras.push({
+                name: "search",
+                isRequired: false
+            });
+
             return {
                 id: toCatalogId(listName),
                 type: ADDON_TYPE,
                 name: listName,
-                extra: catalogGroups.length > 0 ? [{
-                    name: "genre",
-                    options: catalogGroups,
-                    isRequired: false
-                }] : []
+                extra: extras
             };
         });
 
@@ -737,6 +750,7 @@ app.post("/api/analyze-lists", async (req, res) => {
     }
 });
 
+// FIX 2: catalogResponse ora filtra anche per search
 async function catalogResponse(req, res) {
     try {
         const configKey = req.params.base64Config;
@@ -744,6 +758,7 @@ async function catalogResponse(req, res) {
         const channels = await getChannelsFromCache(configKey, config);
         const extraParams = getExtraParams(req.params.extra);
         const targetGroup = extraParams.genre || null;
+        const searchQuery = extraParams.search ? extraParams.search.toLowerCase().trim() : null;
         const targetSource = getCatalogSourceName(req.params.id);
         const host = getPublicHost(req);
         
@@ -751,6 +766,7 @@ async function catalogResponse(req, res) {
             catalogId: req.params.id,
             extra: req.params.extra,
             targetGroup,
+            searchQuery,
             targetSource,
             totalChannels: channels.length
         });
@@ -758,7 +774,8 @@ async function catalogResponse(req, res) {
         const filteredChannels = sortChannelsByName(channels.filter(channel => {
             const matchesSource = targetSource ? channel.sourceName === targetSource : true;
             const matchesGroup = targetGroup ? normalizeGroupName(channel.group) === normalizeGroupName(targetGroup) : true;
-            return matchesSource && matchesGroup;
+            const matchesSearch = searchQuery ? channel.name.toLowerCase().includes(searchQuery) : true;
+            return matchesSource && matchesGroup && matchesSearch;
         }));
         
         console.log('[DEBUG CATALOG] Filtered channels:', filteredChannels.length);
