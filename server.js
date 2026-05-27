@@ -3,6 +3,8 @@ const axios = require("axios");
 const xml2js = require("xml2js");
 const path = require("path");
 const crypto = require("crypto");
+const fs = require("fs");
+const { execFileSync } = require("child_process");
 
 const app = express();
 const PORT = process.env.PORT || 7000;
@@ -68,6 +70,45 @@ const PLAYER_SEGMENT_GAP_WARN_MS = Number(process.env.PLAYER_SEGMENT_GAP_WARN_MS
 const ADDON_TYPE = "kronos";
 const RELEASE_VERSION = "1.6.3";
 
+const PLACEHOLDER_DIR = path.join(__dirname, "static");
+const PLACEHOLDER_TS_PATH = path.join(PLACEHOLDER_DIR, "black.ts");
+const PLACEHOLDER_SEGMENT_DURATION = Number(process.env.PLACEHOLDER_SEGMENT_DURATION || 2);
+
+function ensurePlaceholderSegment() {
+    try {
+        if (fs.existsSync(PLACEHOLDER_TS_PATH) && fs.statSync(PLACEHOLDER_TS_PATH).size > 0) {
+            console.log(`[PLACEHOLDER] black.ts found (${fs.statSync(PLACEHOLDER_TS_PATH).size} bytes)`);
+            return true;
+        }
+    } catch (err) {
+        // continue to generation attempt
+    }
+
+    console.log(`[PLACEHOLDER] black.ts missing — attempting ffmpeg generation`);
+    try {
+        fs.mkdirSync(PLACEHOLDER_DIR, { recursive: true });
+        execFileSync("ffmpeg", [
+            "-y", "-loglevel", "error",
+            "-f", "lavfi", "-i", `color=c=black:s=1920x1080:r=25:d=${PLACEHOLDER_SEGMENT_DURATION}`,
+            "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+            "-shortest",
+            "-c:v", "libx264", "-profile:v", "main", "-level", "4.0", "-preset", "veryfast",
+            "-pix_fmt", "yuv420p", "-g", "25", "-keyint_min", "25",
+            "-c:a", "aac", "-b:a", "64k", "-ar", "48000", "-ac", "2",
+            "-f", "mpegts", "-mpegts_flags", "resend_headers+initial_discontinuity",
+            PLACEHOLDER_TS_PATH
+        ], { stdio: ["ignore", "pipe", "pipe"] });
+        console.log(`[PLACEHOLDER] black.ts generated (${fs.statSync(PLACEHOLDER_TS_PATH).size} bytes)`);
+        return true;
+    } catch (err) {
+        console.warn(`[PLACEHOLDER] ffmpeg generation failed: ${err.message}`);
+        console.warn(`[PLACEHOLDER] Falling back to blocking startup. Install ffmpeg in the container or place a pre-generated static/black.ts to enable placeholder mode.`);
+        return false;
+    }
+}
+
+const PLACEHOLDER_AVAILABLE = ensurePlaceholderSegment();
+
 function decodeConfig(configKey) {
     try {
         const normalized = String(configKey || "")
@@ -100,6 +141,14 @@ app.get("/logo.svg", (req, res) => {
             </defs>
         </svg>
     `);
+});
+
+app.get("/static/black.ts", (req, res) => {
+    if (!PLACEHOLDER_AVAILABLE) return res.status(404).end();
+    res.setHeader("Content-Type", "video/mp2t");
+    res.setHeader("Cache-Control", "public, max-age=86400");
+    res.setHeader("Accept-Ranges", "bytes");
+    res.sendFile(PLACEHOLDER_TS_PATH);
 });
 
 app.get("/health", (req, res) => {
@@ -1159,16 +1208,14 @@ async function ensureStreamReady(sourceUrl, label = "stream", context = {}) {
 
             // After startup, immediately do a background refresh cycle so the cache
             // is in the optimal state for the player's first actual playlist poll.
-            // This mimics what happens on a "second entry" (exit + re-enter),
-            // which is always instant because the cache is already warm.
             setImmediate(async () => {
                 try {
                     await sleep(400);
                     const hls = await getCachedHLSRaw(sourceUrl);
-                    const buffer = getLiveBuffer(sourceUrl);
-                    if (buffer) {
+                    const buf = getLiveBuffer(sourceUrl);
+                    if (buf) {
                         updateLiveBufferFromPlaylist(sourceUrl, hls.playlist, hls.baseUrl);
-                        queueDynamicPrefetchForBuffer(buffer, { label });
+                        queueDynamicPrefetchForBuffer(buf, { label });
                     }
                     console.log(`[STARTUP POST-WARM] channel="${label}" cache refreshed after startup`);
                 } catch (err) {
@@ -1780,6 +1827,56 @@ function sendCachedSegment(req, res, cached, source = "cache", started = Date.no
     return res.end(chunk);
 }
 
+function buildPlaceholderPlaylist(host, seq, discontinuitySeq) {
+    const lines = [
+        "#EXTM3U",
+        "#EXT-X-VERSION:6",
+        `#EXT-X-TARGETDURATION:${PLACEHOLDER_SEGMENT_DURATION}`,
+        `#EXT-X-MEDIA-SEQUENCE:${seq}`
+    ];
+    if (discontinuitySeq > 0) {
+        lines.push(`#EXT-X-DISCONTINUITY-SEQUENCE:${discontinuitySeq}`);
+    }
+    lines.push(`#EXTINF:${PLACEHOLDER_SEGMENT_DURATION}.000,`);
+    lines.push(`${host}/static/black.ts?n=${seq}`);
+    lines.push("");
+    return lines.join("\n");
+}
+
+// Rewrite #EXT-X-MEDIA-SEQUENCE with offset applied; ensure #EXT-X-DISCONTINUITY-SEQUENCE
+// is present so the player knows to reset its decoder at the placeholder→real boundary.
+function applyPlaylistSequenceAdjustments(playlist, mediaSeqOffset, discontinuitySeq) {
+    if (!mediaSeqOffset && !discontinuitySeq) return playlist;
+
+    const lines = playlist.split("\n");
+    let mediaSeqLineIdx = -1;
+    let hasDiscSeq = false;
+
+    for (let i = 0; i < lines.length; i++) {
+        const m1 = lines[i].match(/^(\s*#EXT-X-MEDIA-SEQUENCE:)(\d+)(.*)$/);
+        if (m1) {
+            const newSeq = Number(m1[2]) + (mediaSeqOffset || 0);
+            lines[i] = `${m1[1]}${newSeq}${m1[3] || ""}`;
+            mediaSeqLineIdx = i;
+            continue;
+        }
+        const m2 = lines[i].match(/^(\s*#EXT-X-DISCONTINUITY-SEQUENCE:)(\d+)(.*)$/);
+        if (m2) {
+            lines[i] = `${m2[1]}${discontinuitySeq || 0}${m2[3] || ""}`;
+            hasDiscSeq = true;
+        }
+    }
+
+    if (!hasDiscSeq && (discontinuitySeq || 0) > 0) {
+        const insertAt = mediaSeqLineIdx >= 0
+            ? mediaSeqLineIdx + 1
+            : Math.max(0, lines.findIndex(l => l.trim().startsWith("#EXTM3U")) + 1);
+        lines.splice(insertAt, 0, `#EXT-X-DISCONTINUITY-SEQUENCE:${discontinuitySeq}`);
+    }
+
+    return lines.join("\n");
+}
+
 app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
     try {
         const configKey = req.params.base64Config;
@@ -1789,7 +1886,58 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
 
         const host = getPublicHost(req);
         const session = activatePlaybackSession(req, c);
+        const cacheKey = getHLSCacheKey(c.url);
 
+        const existingBuffer = getLiveBuffer(c.url);
+        const cachedSeconds = getCachedDurationForSegments(existingBuffer?.segments || []);
+        const existingState = memoryCache.streamStates[cacheKey];
+        const realReady = existingState?.status === "ready" && cachedSeconds >= STREAM_PREBUFFER_SECONDS;
+
+        // PLACEHOLDER PATH: Phase 2 still in progress (or not yet started). Serve a
+        // short black .ts segment so the player has something to render while the
+        // background startup keeps prebuffering. Next poll either gets another
+        // placeholder or the real playlist if Phase 2 has completed.
+        if (!realReady && PLACEHOLDER_AVAILABLE) {
+            let state = existingState;
+            if (!state) {
+                state = {
+                    status: "idle", promise: null, readyAt: 0, lastError: null, generation: 0,
+                    maxServedSeq: 0, placeholderActive: false, realOffset: 0, discontinuitySeq: 0
+                };
+                memoryCache.streamStates[cacheKey] = state;
+            }
+
+            // Kick off the real startup in background if not already running. The
+            // generation counter + state machine in ensureStreamReady takes care of
+            // dedup'ing concurrent attempts.
+            if (!state.promise && state.status !== "acquiring" && state.status !== "prebuffering") {
+                ensureStreamReady(c.url, c.name, { session, label: c.name }).catch(err => {
+                    if (err.code !== "KRONOS_SESSION_CANCELLED") {
+                        console.warn(`[STARTUP BG WARN] channel="${c.name}" ${err.message}`);
+                    }
+                });
+            }
+
+            // Use a single monotonic counter (maxServedSeq) for all serves so the
+            // sequence never goes backwards across placeholder/real transitions.
+            state.maxServedSeq = (state.maxServedSeq || 0) + 1;
+            state.placeholderActive = true;
+            const playlist = buildPlaceholderPlaylist(host, state.maxServedSeq, state.discontinuitySeq || 0);
+
+            console.log(
+                `[HLS PLACEHOLDER] channel="${c.name}" seq=${state.maxServedSeq}` +
+                ` startupStatus=${state.status}` +
+                ` cached=${formatSeconds(cachedSeconds)}/${formatSeconds(STREAM_PREBUFFER_SECONDS)}`
+            );
+
+            res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+            res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+            res.setHeader("Pragma", "no-cache");
+            return res.send(playlist);
+        }
+
+        // REAL PATH: either Phase 2 is already done (fast path inside ensureStreamReady)
+        // or the placeholder is unavailable (blocking fallback).
         let startupDone = false;
         req.on("close", () => {
             if (startupDone) return;
@@ -1798,11 +1946,6 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
             delete memoryCache.activeSessions[session.key];
             cancelSessionWork(session, "player-closed");
 
-            // Force-reset the stream state so a subsequent re-open of the same channel
-            // starts a fresh startup instead of attaching to the about-to-fail promise.
-            // Bumping the generation also prevents the old promise from corrupting any
-            // newer state when it finally throws.
-            const cacheKey = getHLSCacheKey(c.url);
             const state = memoryCache.streamStates[cacheKey];
             if (state && state.status !== "ready") {
                 state.generation = (state.generation || 0) + 1;
@@ -1823,11 +1966,55 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         const outputPlaylist = buffered.playlist || hls.playlist;
         const rewritten = rewriteHLSPlaylistThroughKronos(outputPlaylist, hls.baseUrl, host, configKey);
 
+        // Make sure the real playlist's #EXT-X-MEDIA-SEQUENCE never goes below
+        // anything we already served (including placeholders). HLS players require
+        // a monotonically increasing media-sequence — a backwards jump leaves the
+        // player stuck in eternal "loading" (this is exactly the bug the placeholder
+        // transition was producing before).
+        const state = memoryCache.streamStates[cacheKey];
+        const upstreamFirstSeq = buffered.segments?.[0]?.sequence ?? 0;
+        const upstreamSegCount = buffered.segments?.length || 0;
+
+        let mediaSeqOffset = 0;
+        let discontinuitySeq = 0;
+
+        if (state) {
+            const minRequiredFirst = (state.maxServedSeq || 0) + 1;
+            const transitioning = state.placeholderActive === true;
+            const currentOffset = state.realOffset || 0;
+            const wouldRegress = (upstreamFirstSeq + currentOffset) < minRequiredFirst;
+
+            if (transitioning || wouldRegress || !state.realOffset) {
+                state.realOffset = Math.max(0, minRequiredFirst - upstreamFirstSeq);
+                if (transitioning) {
+                    state.discontinuitySeq = (state.discontinuitySeq || 0) + 1;
+                    console.log(
+                        `[HLS TRANSITION] channel="${c.name}"` +
+                        ` lastPlaceholderSeq=${state.maxServedSeq}` +
+                        ` upstreamFirstSeq=${upstreamFirstSeq}` +
+                        ` offset=${state.realOffset}` +
+                        ` discontinuitySeq=${state.discontinuitySeq}`
+                    );
+                }
+                state.placeholderActive = false;
+            }
+
+            mediaSeqOffset = state.realOffset || 0;
+            discontinuitySeq = state.discontinuitySeq || 0;
+
+            const adjustedLastSeq = upstreamFirstSeq + Math.max(0, upstreamSegCount - 1) + mediaSeqOffset;
+            state.maxServedSeq = Math.max(state.maxServedSeq || 0, adjustedLastSeq);
+        }
+
+        const adjustedPlaylist = applyPlaylistSequenceAdjustments(rewritten, mediaSeqOffset, discontinuitySeq);
+
         console.log(
             `[HLS ROUTE] channel="${c.name}" cache=${hls.cacheStatus}` +
             `${typeof hls.age === "number" ? ` age=${hls.age}ms` : ""}` +
             ` segs=${buffered.info?.segmentCount ?? hls.info?.segmentCount ?? 0}` +
-            `${buffered.cachedSeconds !== undefined ? ` cached≈${Math.round(buffered.cachedSeconds)}s` : ""}`
+            `${buffered.cachedSeconds !== undefined ? ` cached≈${Math.round(buffered.cachedSeconds)}s` : ""}` +
+            `${mediaSeqOffset ? ` seqOffset=${mediaSeqOffset}` : ""}` +
+            `${discontinuitySeq ? ` discSeq=${discontinuitySeq}` : ""}`
         );
 
         if (buffered.cachedSeconds !== undefined && buffered.cachedSeconds < STREAM_PREBUFFER_SECONDS) {
@@ -1842,7 +2029,7 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
         res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
         res.setHeader("Pragma", "no-cache");
-        res.send(rewritten);
+        res.send(adjustedPlaylist);
     } catch (err) {
         if (err.code === "KRONOS_SESSION_CANCELLED") {
             console.log(`[HLS ROUTE CANCELLED] ${err.message}`);
