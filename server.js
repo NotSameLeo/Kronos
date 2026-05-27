@@ -40,7 +40,7 @@ const CACHE_TTL = 30 * 60 * 1000;
     - Al primo avvio fa più tentativi prima di fallire.
 */
 const HLS_REFRESH_TTL = 25 * 1000;
-const HLS_STALE_TTL = 20 * 60 * 1000;
+const HLS_STALE_TTL = 60 * 1000;
 const HLS_REQUEST_TIMEOUT = 20000;
 const HLS_RETRY_COUNT = 4;
 const HLS_RETRY_BASE_DELAY = 500;
