@@ -1586,23 +1586,46 @@ app.post("/api/analyze-lists", async (req, res) => {
 });
 
 async function catalogResponse(req, res) {
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+
     try {
         const configKey = req.params.base64Config;
         const config = decodeConfig(configKey);
-        const channels = await getChannelsFromCache(configKey, config);
-        const extraParams = getExtraParams(req.params.extra);
+
+        // Read extra params from both the path segment and query string (Stremio uses path,
+        // but being defensive here handles edge cases).
+        const extraParams = {
+            ...getExtraParams(req.params.extra),
+            ...Object.fromEntries(
+                Object.entries(req.query || {}).map(([k, v]) => [k, Array.isArray(v) ? v[0] : v])
+            )
+        };
         const targetGroup = extraParams.genre || null;
         const targetSource = getCatalogSourceName(req.params.id);
         const searchQuery = extraParams.search ? String(extraParams.search).trim() : null;
         const host = getPublicHost(req);
-        
+
+        // If this is a search request and channels aren't cached yet, kick off loading
+        // in the background and return empty immediately. Stremio will retry on the next
+        // keystroke by which time the cache will be warm.
+        if (searchQuery && !memoryCache.channelItems[configKey]) {
+            console.log(`[CATALOG SEARCH MISS] search="${searchQuery}" triggering background load`);
+            getChannelsFromCache(configKey, config).catch(err => {
+                console.error("[CATALOG BACKGROUND LOAD ERROR]", err.message);
+            });
+            return res.json({ metas: [] });
+        }
+
+        const channels = await getChannelsFromCache(configKey, config);
+
         const filteredChannels = sortChannelsByName(channels.filter(channel => {
             const matchesSource = targetSource ? channel.sourceName === targetSource : true;
             const matchesGroup = targetGroup ? normalizeGroupName(channel.group) === normalizeGroupName(targetGroup) : true;
             const matchesSearch = matchesChannelSearch(channel, searchQuery);
             return matchesSource && matchesGroup && matchesSearch;
         }));
-        
+
         console.log(
             `[CATALOG ROUTE] id=${req.params.id}` +
             `${targetGroup ? ` genre="${targetGroup}"` : ""}` +
@@ -1620,6 +1643,7 @@ async function catalogResponse(req, res) {
 
 app.get("/:base64Config/catalog/:type/:id.json", catalogResponse);
 app.get("/:base64Config/catalog/:type/:id/:extra.json", catalogResponse);
+app.get("/:base64Config/catalog/:type/:id/:extra", catalogResponse);
 
 app.get("/:base64Config/meta/:type/:id.json", async (req, res) => {
     const configKey = req.params.base64Config;
@@ -1736,7 +1760,18 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
 
         const host = getPublicHost(req);
         const session = activatePlaybackSession(req, c);
+
+        let startupDone = false;
+        req.on("close", () => {
+            if (!startupDone && memoryCache.activeSessions[session.key]?.id === session.id) {
+                delete memoryCache.activeSessions[session.key];
+                cancelSessionWork(session, "player-closed");
+                console.log(`[SESSION CLOSED] channel="${c.name}" reason=player-disconnected`);
+            }
+        });
+
         await ensureStreamReady(c.url, c.name, { session, label: c.name });
+        startupDone = true;
 
         const hls = await getCachedHLSRaw(c.url);
         assertSessionActive(session, c.name);
