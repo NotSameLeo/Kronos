@@ -1192,7 +1192,7 @@ function parseM3UChannels(data, source = {}) {
             const group = (line.match(/group-title="([^"]+)"/) || [, "Altri Canali"])[1].trim();
             const logoMatch = line.match(/tvg-logo="([^"]+)"/);
             const tvgId = (line.match(/tvg-id="([^"]+)"/) || [, null])[1];
-            const logo = logoMatch ? logoMatch[1] : "";
+            const logo = logoMatch ? logoMatch[1] : `https://placehold.co/512x512/111827/ffffff?text=${encodeURIComponent(name.substring(0, 5))}`;
 
             currentChannel = {
                 name,
@@ -1366,7 +1366,7 @@ function buildStream(channel, host, configKey, config) {
 
 function toMeta(channel, host, configKey = "", config = {}) {
     const fallbackLogo = `${host}/logo.svg`;
-    const poster = configKey ? `${host}/${configKey}/poster/${channel.id}.svg?v=${encodeURIComponent(RELEASE_VERSION)}` : (channel.logo || fallbackLogo);
+    const poster = configKey ? `${host}/${configKey}/poster/${channel.id}.svg` : (channel.logo || fallbackLogo);
     const logo = channel.logo || fallbackLogo;
     const stream = configKey ? buildStream(channel, host, configKey, config) : null;
 
@@ -1652,7 +1652,7 @@ app.get("/:base64Config/poster/:id.svg", async (req, res) => {
         const config = decodeConfig(configKey);
         const c = await getChannelById(configKey, config, req.params.id);
         const host = getPublicHost(req);
-        const logoUrl = c?.logo || "";
+        const logoUrl = c?.logo || `${host}/logo.svg`;
         const logoDataUri = await getLogoDataUri(logoUrl);
         const name = stripInitialCountryPrefix(c?.name || "Kronos");
         const initials = name
@@ -1668,7 +1668,7 @@ app.get("/:base64Config/poster/:id.svg", async (req, res) => {
             : `<text x="256" y="274" text-anchor="middle" fill="#111827" font-family="Arial, sans-serif" font-size="86" font-weight="800">${escapeXml(initials)}</text>`;
 
         res.setHeader("Content-Type", "image/svg+xml");
-        res.setHeader("Cache-Control", "public, max-age=3600");
+        res.setHeader("Cache-Control", "public, max-age=604800");
         res.send(`
             <svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
                 <defs>
@@ -1984,12 +1984,6 @@ app.get("/:base64Config/debug", async (req, res) => {
                 segmentCacheBytes: memoryCache.segmentCacheBytes,
                 segmentPrefetchActive: memoryCache.segmentPrefetchActive,
                 segmentPrefetchQueue: memoryCache.segmentPrefetchQueue.length,
-                activeSessions: Object.values(memoryCache.activeSessions).map(session => ({
-                    channelName: session.channelName,
-                    channelId: session.channelId,
-                    startedAt: session.startedAt,
-                    lastSeenAt: session.lastSeenAt
-                })),
                 playbackStates: Object.entries(memoryCache.playbackStates).map(([key, state]) => ({
                     key,
                     ok: state.ok,
