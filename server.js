@@ -65,8 +65,10 @@ const SEGMENT_PREFETCH_AHEAD = Number(process.env.SEGMENT_PREFETCH_AHEAD || 14);
 const SEGMENT_WAIT_FOR_PREFETCH_MS = Number(process.env.SEGMENT_WAIT_FOR_PREFETCH_MS || 3000);
 const PLAYER_SEGMENT_SLOW_MS = Number(process.env.PLAYER_SEGMENT_SLOW_MS || 2500);
 const PLAYER_SEGMENT_GAP_WARN_MS = Number(process.env.PLAYER_SEGMENT_GAP_WARN_MS || 30000);
+const WAIT_SEGMENT_DURATION = Number(process.env.WAIT_SEGMENT_DURATION || 2);
+const WAIT_PLAYLIST_SEGMENTS = Number(process.env.WAIT_PLAYLIST_SEGMENTS || 4);
 const ADDON_TYPE = "kronos";
-const RELEASE_VERSION = "1.6.3";
+const RELEASE_VERSION = "1.7.0";
 
 function decodeConfig(configKey) {
     try {
@@ -280,6 +282,39 @@ function formatBytes(bytes) {
 
 function formatSeconds(value) {
     return `${Math.round(Number(value || 0))}s`;
+}
+
+function buildWaitingPlaylist(host, configKey, channelId, sequenceSeed = Date.now()) {
+    const sequence = Math.floor(Number(sequenceSeed || Date.now()) / (WAIT_SEGMENT_DURATION * 1000));
+    const segmentUrl = `${host}/${configKey}/wait/${encodeURIComponent(channelId)}/black.ts`;
+    const lines = [
+        "#EXTM3U",
+        "#EXT-X-VERSION:3",
+        `#EXT-X-TARGETDURATION:${Math.ceil(WAIT_SEGMENT_DURATION)}`,
+        `#EXT-X-MEDIA-SEQUENCE:${sequence}`,
+        "#EXT-X-DISCONTINUITY"
+    ];
+
+    for (let i = 0; i < WAIT_PLAYLIST_SEGMENTS; i++) {
+        lines.push(`#EXTINF:${WAIT_SEGMENT_DURATION.toFixed(3)},`);
+        lines.push(`${segmentUrl}?seq=${sequence + i}`);
+    }
+
+    return lines.join("\n") + "\n";
+}
+
+function insertDiscontinuityBeforeFirstMediaSegment(playlist) {
+    const lines = String(playlist || "").split(/\r?\n/);
+    const firstSegmentIndex = lines.findIndex(line => {
+        const trimmed = String(line || "").trim();
+        return trimmed && !trimmed.startsWith("#");
+    });
+
+    if (firstSegmentIndex <= 0) return playlist;
+    if (String(lines[firstSegmentIndex - 1] || "").trim() === "#EXT-X-DISCONTINUITY") return playlist;
+
+    lines.splice(firstSegmentIndex, 0, "#EXT-X-DISCONTINUITY");
+    return lines.join("\n");
 }
 
 function getBufferStatus(cachedSeconds) {
@@ -1097,7 +1132,7 @@ async function ensureStreamReady(sourceUrl, label = "stream", context = {}) {
     let state = memoryCache.streamStates[cacheKey];
 
     if (!state) {
-        state = { status: "idle", promise: null, readyAt: 0, lastError: null };
+        state = { status: "idle", promise: null, acquirePromise: null, readyAt: 0, lastError: null };
         memoryCache.streamStates[cacheKey] = state;
     }
 
@@ -1150,6 +1185,110 @@ async function ensureStreamReady(sourceUrl, label = "stream", context = {}) {
     })();
 
     return state.promise;
+}
+
+async function ensureStreamAcquiredOrReady(sourceUrl, label = "stream", context = {}) {
+    const cacheKey = getHLSCacheKey(sourceUrl);
+    let state = memoryCache.streamStates[cacheKey];
+
+    if (!state) {
+        state = { status: "idle", promise: null, acquirePromise: null, readyAt: 0, lastError: null };
+        memoryCache.streamStates[cacheKey] = state;
+    }
+
+    const buffer = getLiveBuffer(sourceUrl);
+    const cachedSeconds = getCachedDurationForSegments(buffer?.segments || []);
+    if (state.status === "ready" && cachedSeconds >= STREAM_PREBUFFER_SECONDS) {
+        assertSessionActive(context.session, label);
+        queueDynamicPrefetchForBuffer(buffer, context);
+        console.log(`[STARTUP REUSE] channel="${label}" ready-cache cached=${formatSeconds(cachedSeconds)}`);
+        return { status: "ready", cachedSeconds, reused: true };
+    }
+
+    if (state.status === "failed" && state.failedPhase === "prebuffer") {
+        throw new Error(state.lastError || `Prebuffer failed: less than ${STREAM_PREBUFFER_SECONDS}s`);
+    }
+
+    if (state.status === "prebuffering") {
+        if (Date.now() - (state.prebufferStartedAt || Date.now()) >= STREAM_PREBUFFER_TIMEOUT) {
+            state.status = "failed";
+            state.failedPhase = "prebuffer";
+            state.lastError = `Prebuffer failed: less than ${STREAM_PREBUFFER_SECONDS}s after ${STREAM_PREBUFFER_TIMEOUT}ms`;
+            throw new Error(state.lastError);
+        }
+        return { status: "prebuffering", cachedSeconds };
+    }
+
+    if (state.acquirePromise) {
+        console.log(`[STARTUP WAIT] channel="${label}" existingPhase=${state.status}`);
+        await state.acquirePromise;
+        return {
+            status: state.status === "ready" ? "ready" : "prebuffering",
+            cachedSeconds: getCachedDurationForSegments(getLiveBuffer(sourceUrl)?.segments || [])
+        };
+    }
+
+    state.status = "acquiring";
+    state.acquirePromise = (async () => {
+        try {
+            const initial = await acquireInitialHLS(sourceUrl, label, context);
+            assertSessionActive(context.session, label);
+
+            if (initial.info?.isMaster) {
+                state.status = "ready";
+                state.readyAt = Date.now();
+                state.lastError = null;
+                console.log(`[STARTUP COMPLETE] channel="${label}" master-playlist-ready`);
+                return { status: "ready", master: true };
+            }
+
+            state.status = "prebuffering";
+            state.prebufferStartedAt = Date.now();
+            console.log(`[WAIT STREAM START] channel="${label}" acquired=true serving=black-screen untilPrebuffer=${formatSeconds(STREAM_PREBUFFER_SECONDS)}`);
+
+            state.promise = prebufferInitialStream(sourceUrl, label, context)
+                .then(ready => {
+                    assertSessionActive(context.session, label);
+                    state.status = "ready";
+                    state.readyAt = Date.now();
+                    state.lastError = null;
+                    console.log(`[WAIT STREAM END] channel="${label}" switching-to-real-stream cached=${formatSeconds(ready.cachedSeconds)}`);
+                    return ready;
+                })
+                .catch(err => {
+                    if (err.code === "KRONOS_SESSION_CANCELLED") {
+                        state.status = "cancelled";
+                        state.failedPhase = "cancelled";
+                    } else {
+                        state.status = "failed";
+                        state.failedPhase = "prebuffer";
+                    }
+                    state.lastError = err.message;
+                    return { status: state.status, error: err.message };
+                })
+                .finally(() => {
+                    state.promise = null;
+                });
+
+            return { status: "prebuffering" };
+        } catch (err) {
+            if (err.code === "KRONOS_SESSION_CANCELLED") {
+                state.status = "cancelled";
+            } else {
+                state.status = "failed";
+            }
+            state.lastError = err.message;
+            throw err;
+        } finally {
+            state.acquirePromise = null;
+        }
+    })();
+
+    await state.acquirePromise;
+    return {
+        status: state.status === "ready" ? "ready" : "prebuffering",
+        cachedSeconds: getCachedDurationForSegments(getLiveBuffer(sourceUrl)?.segments || [])
+    };
 }
 
 function parseM3UChannels(data, source = {}) {
@@ -1716,12 +1855,29 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
 
         const host = getPublicHost(req);
         const session = activatePlaybackSession(req, c);
-        await ensureStreamReady(c.url, c.name, { session, label: c.name });
+        const readiness = await ensureStreamAcquiredOrReady(c.url, c.name, { session, label: c.name });
+
+        if (readiness.status === "prebuffering") {
+            session.servedWaitingStream = true;
+            console.log(
+                `[WAIT STREAM] channel="${c.name}" serving=black-screen` +
+                ` cached=${formatSeconds(readiness.cachedSeconds || 0)}/${formatSeconds(STREAM_PREBUFFER_SECONDS)}`
+            );
+            res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+            res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+            res.setHeader("Pragma", "no-cache");
+            return res.send(buildWaitingPlaylist(host, configKey, c.id));
+        }
 
         const hls = await getCachedHLSRaw(c.url);
         assertSessionActive(session, c.name);
         const buffered = updateLiveBufferFromPlaylist(c.url, hls.playlist, hls.baseUrl, { session, label: c.name });
-        const outputPlaylist = buffered.playlist || hls.playlist;
+        let outputPlaylist = buffered.playlist || hls.playlist;
+        if (session.servedWaitingStream && !session.realStreamStarted) {
+            outputPlaylist = insertDiscontinuityBeforeFirstMediaSegment(outputPlaylist);
+            session.realStreamStarted = true;
+            console.log(`[WAIT STREAM SWITCH] channel="${c.name}" first-real-playlist discontinuity=true`);
+        }
         const rewritten = rewriteHLSPlaylistThroughKronos(outputPlaylist, hls.baseUrl, host, configKey);
 
         console.log(
@@ -1752,6 +1908,15 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         console.error("[ERROR HLS ROUTE]", err.message);
         res.status(502).send("#EXTM3U\n#EXT-X-ENDLIST\n");
     }
+});
+
+app.get("/:base64Config/wait/:id/black.ts", (req, res) => {
+    const blackSegmentPath = path.join(__dirname, "public", "kronos-black.ts");
+    res.setHeader("Content-Type", "video/mp2t");
+    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    res.sendFile(blackSegmentPath, err => {
+        if (err && !res.headersSent) res.status(404).end();
+    });
 });
 
 app.get("/:base64Config/proxy/pl", async (req, res) => {
