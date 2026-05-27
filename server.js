@@ -1121,14 +1121,19 @@ async function ensureStreamReady(sourceUrl, label = "stream", context = {}) {
     }
 
     const buffer = getLiveBuffer(sourceUrl);
-    if (state.status === "ready" && getCachedDurationForSegments(buffer?.segments || []) >= STREAM_PREBUFFER_SECONDS) {
+    const cachedSeconds = getCachedDurationForSegments(buffer?.segments || []);
+
+    // Fast path: once the playlist is acquired we serve immediately. Both "playable"
+    // (Phase 1 done, Phase 2 still running in background) and "ready" (Phase 2 done)
+    // qualify — the player starts on real content either way.
+    if (state.status === "playable" || state.status === "ready") {
         assertSessionActive(context.session, label);
-        queueDynamicPrefetchForBuffer(buffer, context);
+        if (buffer) queueDynamicPrefetchForBuffer(buffer, context);
         console.log(
-            `[STARTUP REUSE] channel="${label}" ready-cache` +
-            ` cached=${formatSeconds(getCachedDurationForSegments(buffer?.segments || []))}`
+            `[STARTUP REUSE] channel="${label}" status=${state.status}` +
+            ` cached=${formatSeconds(cachedSeconds)}`
         );
-        return { status: "ready", reused: true };
+        return { status: state.status, reused: true };
     }
 
     if (state.promise && state.status !== "cancelled" && state.status !== "failed") {
@@ -1150,33 +1155,44 @@ async function ensureStreamReady(sourceUrl, label = "stream", context = {}) {
                 console.log(`[STARTUP COMPLETE] channel="${label}" master-playlist-ready`);
                 return { status: "ready", master: true };
             }
-            state.status = "prebuffering";
-            const ready = await prebufferInitialStream(sourceUrl, label, context);
-            assertSessionActive(context.session, label);
-            state.status = "ready";
+
+            // Phase 1 done — seed the segment prefetch queue right away so the very
+            // first segments the player asks for are either cached or already in flight.
+            try {
+                const hls = await getCachedHLSRaw(sourceUrl);
+                const buffered = updateLiveBufferFromPlaylist(sourceUrl, hls.playlist, hls.baseUrl, context);
+                const candidates = (buffered.segments || []).slice(-SEGMENT_PREFETCH_AHEAD);
+                candidates.forEach(segment => queueSegmentPrefetch(segment.sourceUrl || segment.url, context));
+            } catch (err) {
+                if (err.code === "KRONOS_SESSION_CANCELLED") throw err;
+                // Non-fatal here — the background prebuffer below will keep retrying.
+            }
+
+            state.status = "playable";
             state.readyAt = Date.now();
             state.lastError = null;
+            console.log(
+                `[STARTUP PLAYABLE] channel="${label}" playlist-ready` +
+                ` (continuing prebuffer to ${formatSeconds(STREAM_PREBUFFER_SECONDS)} in background)`
+            );
 
-            // After startup, immediately do a background refresh cycle so the cache
-            // is in the optimal state for the player's first actual playlist poll.
-            // This mimics what happens on a "second entry" (exit + re-enter),
-            // which is always instant because the cache is already warm.
-            setImmediate(async () => {
-                try {
-                    await sleep(400);
-                    const hls = await getCachedHLSRaw(sourceUrl);
-                    const buffer = getLiveBuffer(sourceUrl);
-                    if (buffer) {
-                        updateLiveBufferFromPlaylist(sourceUrl, hls.playlist, hls.baseUrl);
-                        queueDynamicPrefetchForBuffer(buffer, { label });
-                    }
-                    console.log(`[STARTUP POST-WARM] channel="${label}" cache refreshed after startup`);
-                } catch (err) {
-                    // non-critical background task
-                }
+            // Continue prebuffer in background — enriches the cache so later segments
+            // are already warm when the player gets to them, without blocking startup.
+            setImmediate(() => {
+                prebufferInitialStream(sourceUrl, label, context)
+                    .then(() => {
+                        if (state.generation === myGen) {
+                            state.status = "ready";
+                            console.log(`[STARTUP BACKGROUND PREBUFFER DONE] channel="${label}"`);
+                        }
+                    })
+                    .catch(err => {
+                        if (err.code === "KRONOS_SESSION_CANCELLED") return;
+                        console.warn(`[STARTUP BACKGROUND PREBUFFER WARN] channel="${label}" ${err.message}`);
+                    });
             });
 
-            return ready;
+            return { status: "playable", early: true };
         } catch (err) {
             // Only update state if no newer generation has superseded us. Otherwise
             // we'd corrupt the state of a fresh startup that took over after a
