@@ -37,7 +37,7 @@ const CACHE_TTL = 30 * 60 * 1000;
     - Kronos serve subito l’ultima manifest valida.
     - Se la manifest è vecchia, viene aggiornata in background.
     - Se MediaFlowProxy/EasyProxy restituisce una risposta non valida, Kronos non la salva.
-    - Al primo avvio fa più tentativi prima di fallire.
+    - Anche status 200 con body non-HLS viene ritentato.
 */
 const HLS_REFRESH_TTL = 25 * 1000;
 const HLS_STALE_TTL = 60 * 1000;
@@ -102,15 +102,17 @@ function isValidHLSManifest(data) {
 }
 
 function getErrorStatus(err) {
-    return err?.response?.status || null;
+    return err?.response?.status || err?.status || null;
 }
 
 function shouldRetryHLS(err) {
+    if (err?.retryable) return true;
+
     const status = getErrorStatus(err);
 
     if (!status) return true;
 
-    return [408, 425, 429, 500, 502, 503, 504].includes(status);
+    return [200, 408, 425, 429, 500, 502, 503, 504].includes(status);
 }
 
 async function fetchHLSManifestWithRetry(fetchUrl) {
@@ -137,6 +139,8 @@ async function fetchHLSManifestWithRetry(fetchUrl) {
             if (!isValidHLSManifest(response.data)) {
                 const invalidErr = new Error("Invalid HLS manifest returned by proxy/upstream");
                 invalidErr.response = response;
+                invalidErr.status = response.status;
+                invalidErr.retryable = true;
                 throw invalidErr;
             }
 
@@ -518,11 +522,18 @@ async function refreshHLSInBackground(cacheKey, sourceUrl, config = {}) {
 
         console.log("[HLS BACKGROUND REFRESH] Updated manifest:", sanitizeUrlForLog(fetchUrl));
     } catch (err) {
-        console.error("[HLS BACKGROUND REFRESH ERROR]", err.message);
+        const status = getErrorStatus(err);
+
+        console.error(
+            "[HLS BACKGROUND REFRESH ERROR]",
+            status ? `status=${status}` : "",
+            err.message
+        );
 
         if (memoryCache.hlsData[cacheKey]) {
             memoryCache.hlsData[cacheKey].refreshing = false;
             memoryCache.hlsData[cacheKey].lastError = err.message;
+            memoryCache.hlsData[cacheKey].lastErrorAt = Date.now();
         }
     }
 }
