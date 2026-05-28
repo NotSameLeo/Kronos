@@ -37,6 +37,7 @@ const memoryCache = {
     segmentCacheBytes: 0,
     playbackStates: {},
     activeSessions: {},
+    sessionCloseTimers: {},
     logoData: {},
     lastUpdate: {},
     isUpdating: {}
@@ -69,8 +70,9 @@ const SEGMENT_WAIT_FOR_PREFETCH_MS = Number(process.env.SEGMENT_WAIT_FOR_PREFETC
 const PLAYER_SEGMENT_SLOW_MS = Number(process.env.PLAYER_SEGMENT_SLOW_MS || 2500);
 const PLAYER_SEGMENT_GAP_WARN_MS = Number(process.env.PLAYER_SEGMENT_GAP_WARN_MS || 30000);
 const PLAYER_SESSION_IDLE_RESET_MS = Number(process.env.PLAYER_SESSION_IDLE_RESET_MS || 60000);
+const PLAYER_SESSION_CLOSE_IDLE_MS = Number(process.env.PLAYER_SESSION_CLOSE_IDLE_MS || 45000);
 const ADDON_TYPE = "tv";
-const RELEASE_VERSION = "1.6.7";
+const RELEASE_VERSION = "1.6.8";
 
 function decodeConfig(configKey) {
     try {
@@ -346,10 +348,35 @@ function notePlayerSegment(req, sourceUrl, event = {}) {
     return { gapMs, state };
 }
 
-function createCancelledError(message) {
+function createCancelledError(message, reason = "inactive-session") {
     const err = new Error(message || "Cancelled because another channel became active");
     err.code = "KRONOS_SESSION_CANCELLED";
+    err.cancelReason = reason;
     return err;
+}
+
+function formatCancelReason(reason) {
+    return String(reason || "inactive-session").split(":")[0];
+}
+
+function clearSessionCloseTimer(session) {
+    const id = session?.id || session;
+    if (!id || !memoryCache.sessionCloseTimers[id]) return;
+    clearTimeout(memoryCache.sessionCloseTimers[id]);
+    delete memoryCache.sessionCloseTimers[id];
+}
+
+function markSessionInactive(session, reason = "inactive-session") {
+    if (!session) return;
+    session.cancelReason = reason;
+    clearSessionCloseTimer(session);
+}
+
+function getSessionInactiveReason(session) {
+    if (session?.cancelReason) return session.cancelReason;
+    const current = session?.key ? memoryCache.activeSessions[session.key] : null;
+    if (current && current.id !== session?.id) return `channel-switch:${current.channelName || "stream"}`;
+    return "player-disconnected";
 }
 
 function activatePlaybackSession(req, channel) {
@@ -366,6 +393,7 @@ function activatePlaybackSession(req, channel) {
             return previous;
         }
 
+        markSessionInactive(previous, `session-idle-reset:${idleMs}ms`);
         cancelSessionWork(previous, `session-idle-reset:${idleMs}ms`);
         console.log(`[CHANNEL SESSION RESET] channel="${channelName}" reason=idle idle=${idleMs}ms`);
     }
@@ -385,6 +413,7 @@ function activatePlaybackSession(req, channel) {
     delete memoryCache.playbackStates[key];
 
     if (previous && previous.channelId !== channelId) {
+        markSessionInactive(previous, `channel-switch:${channelName}`);
         cancelSessionWork(previous, `channel-switch:${channelName}`);
         console.log(`[CHANNEL SWITCH] from="${previous.channelName}" to="${channelName}"`);
     } else if (!previous) {
@@ -401,8 +430,9 @@ function isSessionActive(session) {
 
 function assertSessionActive(session, label = "stream") {
     if (isSessionActive(session)) return;
-    console.log(`[STARTUP CANCELLED] channel="${label}" reason=channel-switch`);
-    throw createCancelledError(`Cancelled ${label}: another channel became active`);
+    const reason = getSessionInactiveReason(session);
+    console.log(`[STARTUP CANCELLED] channel="${label}" reason=${formatCancelReason(reason)}`);
+    throw createCancelledError(`Cancelled ${label}: ${formatCancelReason(reason)}`, reason);
 }
 
 function cancelSessionWork(session, reason = "inactive-session") {
@@ -417,6 +447,49 @@ function cancelSessionWork(session, reason = "inactive-session") {
     if (removed > 0) {
         console.log(`[PREFETCH CANCELLED] channel="${session.channelName}" reason=${reason} removed=${removed}`);
     }
+}
+
+function touchPlaybackSession(session) {
+    if (!session || !isSessionActive(session)) return;
+    session.lastSeenAt = Date.now();
+    clearSessionCloseTimer(session);
+}
+
+function closePlaybackSession(session, reason = "player-disconnected") {
+    if (!session?.key || !session?.id) return false;
+    if (memoryCache.activeSessions[session.key]?.id !== session.id) return false;
+
+    markSessionInactive(session, reason);
+    delete memoryCache.activeSessions[session.key];
+    cancelSessionWork(session, reason);
+    console.log(
+        `[SESSION CLOSED] channel="${session.channelName}" reason=${formatCancelReason(reason)}` +
+        `${session.lastSeenAt ? ` idle=${Date.now() - session.lastSeenAt}ms` : ""}`
+    );
+    return true;
+}
+
+function schedulePlaybackIdleClose(session) {
+    if (!session || !isSessionActive(session) || PLAYER_SESSION_CLOSE_IDLE_MS <= 0) return;
+    clearSessionCloseTimer(session);
+
+    const timer = setTimeout(() => {
+        if (!isSessionActive(session)) {
+            clearSessionCloseTimer(session);
+            return;
+        }
+
+        const idleMs = Date.now() - (session.lastSeenAt || session.startedAt || Date.now());
+        if (idleMs >= PLAYER_SESSION_CLOSE_IDLE_MS) {
+            closePlaybackSession(session, `player-idle:${idleMs}ms`);
+            return;
+        }
+
+        schedulePlaybackIdleClose(session);
+    }, PLAYER_SESSION_CLOSE_IDLE_MS);
+
+    if (typeof timer.unref === "function") timer.unref();
+    memoryCache.sessionCloseTimers[session.id] = timer;
 }
 
 function deleteSegmentCacheEntryByUrl(sourceUrl) {
@@ -1155,6 +1228,7 @@ async function acquireInitialHLS(sourceUrl, label = "stream", context = {}) {
 
             lastErr = new Error("Playlist valid but without playable segments");
         } catch (err) {
+            if (err.code === "KRONOS_SESSION_CANCELLED") throw err;
             lastErr = err;
             const elapsed = Date.now() - started;
             console.error(
@@ -1921,9 +1995,6 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
             if (startupDone) return;
             if (memoryCache.activeSessions[session.key]?.id !== session.id) return;
 
-            delete memoryCache.activeSessions[session.key];
-            cancelSessionWork(session, "player-closed");
-
             // Force-reset the stream state so a subsequent re-open of the same channel
             // starts a fresh startup instead of attaching to the about-to-fail promise.
             // Bumping the generation also prevents the old promise from corrupting any
@@ -1937,11 +2008,12 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
                 state.lastError = "player-closed-during-startup";
             }
 
-            console.log(`[SESSION CLOSED] channel="${c.name}" reason=player-disconnected`);
+            closePlaybackSession(session, "player-disconnected");
         });
 
         await ensureStreamReady(c.url, c.name, { session, label: c.name });
         startupDone = true;
+        touchPlaybackSession(session);
 
         const hls = await getCachedHLSRaw(c.url);
         assertSessionActive(session, c.name);
@@ -1963,10 +2035,14 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
         res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate, no-transform");
         res.setHeader("Pragma", "no-cache");
+        res.on("finish", () => {
+            touchPlaybackSession(session);
+            schedulePlaybackIdleClose(session);
+        });
         res.send(rewritten);
     } catch (err) {
         if (err.code === "KRONOS_SESSION_CANCELLED") {
-            console.log("[HLS ROUTE CANCELLED]", err.message);
+            console.log(`[HLS ROUTE CANCELLED] reason=${formatCancelReason(err.cancelReason)} ${err.message}`);
             return res.status(499).send("#EXTM3U\n#EXT-X-ENDLIST\n");
         }
 
@@ -2235,7 +2311,8 @@ app.get("/:base64Config/debug", async (req, res) => {
                 SEGMENT_PREFETCH_CONCURRENCY,
                 SEGMENT_PREFETCH_AHEAD,
                 SEGMENT_PREFETCH_FAILURE_COOLDOWN_MS,
-                PLAYER_SESSION_IDLE_RESET_MS
+                PLAYER_SESSION_IDLE_RESET_MS,
+                PLAYER_SESSION_CLOSE_IDLE_MS
             }
         };
         
