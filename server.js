@@ -31,6 +31,7 @@ const memoryCache = {
     liveBuffers: {},
     segmentData: {},
     segmentInflight: {},
+    segmentPrefetchFailures: {},
     segmentPrefetchQueue: [],
     segmentPrefetchActive: 0,
     segmentCacheBytes: 0,
@@ -63,11 +64,13 @@ const SEGMENT_CACHE_MAX_SEGMENTS = Number(process.env.SEGMENT_CACHE_MAX_SEGMENTS
 const SEGMENT_CACHE_MAX_ITEM_BYTES = Number(process.env.SEGMENT_CACHE_MAX_ITEM_BYTES || 24 * 1024 * 1024);
 const SEGMENT_PREFETCH_CONCURRENCY = Number(process.env.SEGMENT_PREFETCH_CONCURRENCY || 4);
 const SEGMENT_PREFETCH_AHEAD = Number(process.env.SEGMENT_PREFETCH_AHEAD || 14);
+const SEGMENT_PREFETCH_FAILURE_COOLDOWN_MS = Number(process.env.SEGMENT_PREFETCH_FAILURE_COOLDOWN_MS || 60000);
 const SEGMENT_WAIT_FOR_PREFETCH_MS = Number(process.env.SEGMENT_WAIT_FOR_PREFETCH_MS || 3000);
 const PLAYER_SEGMENT_SLOW_MS = Number(process.env.PLAYER_SEGMENT_SLOW_MS || 2500);
 const PLAYER_SEGMENT_GAP_WARN_MS = Number(process.env.PLAYER_SEGMENT_GAP_WARN_MS || 30000);
+const PLAYER_SESSION_IDLE_RESET_MS = Number(process.env.PLAYER_SESSION_IDLE_RESET_MS || 60000);
 const ADDON_TYPE = "tv";
-const RELEASE_VERSION = "1.6.5";
+const RELEASE_VERSION = "1.6.6";
 
 function decodeConfig(configKey) {
     try {
@@ -354,29 +357,37 @@ function activatePlaybackSession(req, channel) {
     const previous = memoryCache.activeSessions[key];
     const channelId = channel?.id || hashKey(channel?.url || "unknown");
     const channelName = channel?.name || "stream";
+    const now = Date.now();
 
     if (previous?.channelId === channelId) {
-        previous.lastSeenAt = Date.now();
-        return previous;
+        const idleMs = now - (previous.lastSeenAt || previous.startedAt || 0);
+        if (idleMs <= PLAYER_SESSION_IDLE_RESET_MS) {
+            previous.lastSeenAt = now;
+            return previous;
+        }
+
+        cancelSessionWork(previous, `session-idle-reset:${idleMs}ms`);
+        console.log(`[CHANNEL SESSION RESET] channel="${channelName}" reason=idle idle=${idleMs}ms`);
     }
 
     const session = {
         key,
-        id: `${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
+        id: `${now}:${Math.random().toString(36).slice(2, 8)}`,
         channelId,
         channelName,
         sourceUrl: channel?.url || "",
-        startedAt: Date.now(),
-        lastSeenAt: Date.now()
+        startedAt: now,
+        lastSeenAt: now
     };
 
+    resetStreamRuntimeForSource(session.sourceUrl, channelName, "new-session");
     memoryCache.activeSessions[key] = session;
     delete memoryCache.playbackStates[key];
 
-    if (previous) {
+    if (previous && previous.channelId !== channelId) {
         cancelSessionWork(previous, `channel-switch:${channelName}`);
         console.log(`[CHANNEL SWITCH] from="${previous.channelName}" to="${channelName}"`);
-    } else {
+    } else if (!previous) {
         console.log(`[CHANNEL SESSION] channel="${channelName}" active`);
     }
 
@@ -405,6 +416,58 @@ function cancelSessionWork(session, reason = "inactive-session") {
     const removed = before - memoryCache.segmentPrefetchQueue.length;
     if (removed > 0) {
         console.log(`[PREFETCH CANCELLED] channel="${session.channelName}" reason=${reason} removed=${removed}`);
+    }
+}
+
+function deleteSegmentCacheEntryByUrl(sourceUrl) {
+    const key = getSegmentCacheKey(sourceUrl);
+    const cached = memoryCache.segmentData[key];
+    if (!cached) return false;
+
+    memoryCache.segmentCacheBytes = Math.max(0, memoryCache.segmentCacheBytes - cached.size);
+    delete memoryCache.segmentData[key];
+    return true;
+}
+
+function resetStreamRuntimeForSource(sourceUrl, label = "stream", reason = "reset") {
+    if (!sourceUrl) return;
+
+    const cacheKey = getHLSCacheKey(sourceUrl);
+    const oldBuffer = memoryCache.liveBuffers[cacheKey];
+    let removedSegments = 0;
+
+    if (oldBuffer?.segments?.length) {
+        const urls = new Set();
+        oldBuffer.segments.forEach(segment => {
+            [segment?.cacheUrl, segment?.url, segment?.sourceUrl, ...(Array.isArray(segment?.altUrls) ? segment.altUrls : [])]
+                .filter(Boolean)
+                .forEach(url => urls.add(url));
+        });
+        urls.forEach(url => {
+            if (deleteSegmentCacheEntryByUrl(url)) removedSegments += 1;
+            delete memoryCache.segmentPrefetchFailures[getSegmentCacheKey(url)];
+        });
+    }
+
+    delete memoryCache.liveBuffers[cacheKey];
+    delete memoryCache.hlsData[cacheKey];
+    delete memoryCache.hlsInflight[cacheKey];
+    delete memoryCache.streamStates[cacheKey];
+
+    const queuedBefore = memoryCache.segmentPrefetchQueue.length;
+    memoryCache.segmentPrefetchQueue = memoryCache.segmentPrefetchQueue.filter(item => {
+        const itemLabel = typeof item === "string" ? "" : item.label;
+        return itemLabel !== label;
+    });
+    const removedQueued = queuedBefore - memoryCache.segmentPrefetchQueue.length;
+
+    if (oldBuffer || removedQueued > 0) {
+        console.log(
+            `[STREAM RESET] channel="${label}" reason=${reason}` +
+            ` removedBufferSegs=${oldBuffer?.segments?.length || 0}` +
+            ` removedCachedSegs=${removedSegments}` +
+            ` removedQueued=${removedQueued}`
+        );
     }
 }
 
@@ -731,6 +794,29 @@ function storeSegmentInCache(sourceUrl, buffer, responseHeaders = {}, status = 2
     return true;
 }
 
+function getSegmentPrefetchCooldownMs(sourceUrl) {
+    const key = getSegmentCacheKey(sourceUrl);
+    const failure = memoryCache.segmentPrefetchFailures[key];
+    if (!failure) return 0;
+
+    const remaining = failure.until - Date.now();
+    if (remaining <= 0) {
+        delete memoryCache.segmentPrefetchFailures[key];
+        return 0;
+    }
+    return remaining;
+}
+
+function noteSegmentPrefetchFailure(sourceUrl, err) {
+    const key = getSegmentCacheKey(sourceUrl);
+    memoryCache.segmentPrefetchFailures[key] = {
+        until: Date.now() + SEGMENT_PREFETCH_FAILURE_COOLDOWN_MS,
+        status: err?.response?.status || null,
+        message: err?.message || "prefetch failed"
+    };
+    return SEGMENT_PREFETCH_FAILURE_COOLDOWN_MS;
+}
+
 async function fetchSegmentToCache(sourceUrl) {
     const cached = getSegmentFromCache(sourceUrl);
     if (cached) return cached;
@@ -758,6 +844,7 @@ async function fetchSegmentToCache(sourceUrl) {
 
         const buffer = Buffer.from(response.data);
         storeSegmentInCache(sourceUrl, buffer, response.headers, response.status);
+        delete memoryCache.segmentPrefetchFailures[key];
         console.log(`[SEG PREFETCH OK] bytes=${formatBytes(buffer.length)} time=${Date.now() - started}ms`);
         return getSegmentFromCache(sourceUrl);
     })();
@@ -771,15 +858,16 @@ async function fetchSegmentToCache(sourceUrl) {
 }
 
 function queueSegmentPrefetch(sourceUrl, context = {}) {
-    if (!isHttpUrl(sourceUrl)) return;
+    if (!isHttpUrl(sourceUrl)) return false;
     if (context.session && !isSessionActive(context.session)) {
         console.log(`[PREFETCH SKIP] channel="${context.label || context.session.channelName || "stream"}" reason=inactive-session`);
-        return;
+        return false;
     }
 
     const key = getSegmentCacheKey(sourceUrl);
-    if (getSegmentFromCache(sourceUrl) || memoryCache.segmentInflight[key]) return;
-    if (memoryCache.segmentPrefetchQueue.some(item => (typeof item === "string" ? item : item.sourceUrl) === sourceUrl)) return;
+    if (getSegmentPrefetchCooldownMs(sourceUrl) > 0) return false;
+    if (getSegmentFromCache(sourceUrl) || memoryCache.segmentInflight[key]) return false;
+    if (memoryCache.segmentPrefetchQueue.some(item => (typeof item === "string" ? item : item.sourceUrl) === sourceUrl)) return false;
 
     memoryCache.segmentPrefetchQueue.push({
         sourceUrl,
@@ -788,6 +876,7 @@ function queueSegmentPrefetch(sourceUrl, context = {}) {
         label: context.label || context.session?.channelName || "stream"
     });
     processSegmentPrefetchQueue();
+    return true;
 }
 
 function processSegmentPrefetchQueue() {
@@ -807,11 +896,20 @@ function processSegmentPrefetchQueue() {
 
         const key = getSegmentCacheKey(sourceUrl);
 
+        if (getSegmentPrefetchCooldownMs(sourceUrl) > 0) continue;
         if (getSegmentFromCache(sourceUrl) || memoryCache.segmentInflight[key]) continue;
 
         memoryCache.segmentPrefetchActive += 1;
         fetchSegmentToCache(sourceUrl)
-            .catch(err => console.error("[SEG PREFETCH ERROR]", err.message))
+            .catch(err => {
+                const cooldownMs = noteSegmentPrefetchFailure(sourceUrl, err);
+                console.error(
+                    `[SEG PREFETCH ERROR] channel="${label}" segment=${getSegmentLabel(sourceUrl)}` +
+                    `${err.response?.status ? ` status=${err.response.status}` : ""}` +
+                    ` cooldown=${formatSeconds(cooldownMs / 1000)}` +
+                    ` err=${err.message}`
+                );
+            })
             .finally(() => {
                 memoryCache.segmentPrefetchActive = Math.max(0, memoryCache.segmentPrefetchActive - 1);
                 processSegmentPrefetchQueue();
@@ -988,15 +1086,18 @@ function queueDynamicPrefetchForBuffer(buffer, context = {}) {
         .filter(segment => !getCachedSegmentForLogicalSegment(segment))
         .slice(-SEGMENT_PREFETCH_AHEAD);
 
-    candidates.forEach(segment => queueSegmentPrefetch(segment.sourceUrl || segment.url, context));
+    const queued = candidates.reduce((count, segment) => {
+        return count + (queueSegmentPrefetch(segment.sourceUrl || segment.url, context) ? 1 : 0);
+    }, 0);
 
-    if (candidates.length > 0) {
+    if (queued > 0) {
         console.log(
             `[DYNAMIC BUFFER] status=${getBufferStatus(cachedSeconds)}` +
             ` cached=${formatSeconds(cachedSeconds)}` +
             ` target=${formatSeconds(DYNAMIC_BUFFER_TARGET_SECONDS)}` +
             ` max=${formatSeconds(DYNAMIC_BUFFER_MAX_SECONDS)}` +
-            ` queued=${candidates.length}` +
+            ` queued=${queued}` +
+            ` candidates=${candidates.length}` +
             ` active=${memoryCache.segmentPrefetchActive}` +
             ` queue=${memoryCache.segmentPrefetchQueue.length}`
         );
@@ -1076,8 +1177,6 @@ async function prebufferInitialStream(sourceUrl, label = "stream", context = {})
             assertSessionActive(context.session, label);
             const buffered = updateLiveBufferFromPlaylist(sourceUrl, hls.playlist, hls.baseUrl, context);
             const candidates = (buffered.segments || []).slice(-SEGMENT_PREFETCH_AHEAD);
-
-            candidates.forEach(segment => queueSegmentPrefetch(segment.sourceUrl || segment.url, context));
 
             const cachedSeconds = getCachedDurationForSegments(candidates);
             console.log(
@@ -2050,6 +2149,7 @@ app.get("/:base64Config/stats", (req, res) => {
             segmentCacheBytes: memoryCache.segmentCacheBytes,
             segmentCacheBytesHuman: formatBytes(memoryCache.segmentCacheBytes),
             liveBuffers: liveBuffers.length,
+            prefetchFailures: Object.keys(memoryCache.segmentPrefetchFailures).length,
             prefetchActive: memoryCache.segmentPrefetchActive,
             prefetchQueue: memoryCache.segmentPrefetchQueue.length
         },
@@ -2116,7 +2216,9 @@ app.get("/:base64Config/debug", async (req, res) => {
                 SEG_REQUEST_TIMEOUT,
                 SEGMENT_CACHE_MAX_SEGMENTS,
                 SEGMENT_PREFETCH_CONCURRENCY,
-                SEGMENT_PREFETCH_AHEAD
+                SEGMENT_PREFETCH_AHEAD,
+                SEGMENT_PREFETCH_FAILURE_COOLDOWN_MS,
+                PLAYER_SESSION_IDLE_RESET_MS
             }
         };
         
