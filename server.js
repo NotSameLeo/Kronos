@@ -72,7 +72,7 @@ const PLAYER_SEGMENT_GAP_WARN_MS = Number(process.env.PLAYER_SEGMENT_GAP_WARN_MS
 const PLAYER_SESSION_IDLE_RESET_MS = Number(process.env.PLAYER_SESSION_IDLE_RESET_MS || 60000);
 const PLAYER_SESSION_CLOSE_IDLE_MS = Number(process.env.PLAYER_SESSION_CLOSE_IDLE_MS || 45000);
 const ADDON_TYPE = "tv";
-const RELEASE_VERSION = "1.6.8";
+const RELEASE_VERSION = "1.6.9";
 
 function decodeConfig(configKey) {
     try {
@@ -390,6 +390,7 @@ function activatePlaybackSession(req, channel) {
         const idleMs = now - (previous.lastSeenAt || previous.startedAt || 0);
         if (idleMs <= PLAYER_SESSION_IDLE_RESET_MS) {
             previous.lastSeenAt = now;
+            clearSessionCloseTimer(previous);
             return previous;
         }
 
@@ -435,6 +436,13 @@ function assertSessionActive(session, label = "stream") {
     throw createCancelledError(`Cancelled ${label}: ${formatCancelReason(reason)}`, reason);
 }
 
+function assertStartupContextActive(context = {}, label = "stream") {
+    if (context.isClientGone?.() && context.session && isSessionActive(context.session)) {
+        closePlaybackSession(context.session, "player-disconnected");
+    }
+    assertSessionActive(context.session, label);
+}
+
 function cancelSessionWork(session, reason = "inactive-session") {
     if (!session) return;
 
@@ -462,9 +470,13 @@ function closePlaybackSession(session, reason = "player-disconnected") {
     markSessionInactive(session, reason);
     delete memoryCache.activeSessions[session.key];
     cancelSessionWork(session, reason);
+    const reasonLabel = formatCancelReason(reason);
+    const now = Date.now();
+    const idleMs = now - (session.lastSeenAt || session.startedAt || now);
+    const elapsedMs = now - (session.startedAt || now);
     console.log(
-        `[SESSION CLOSED] channel="${session.channelName}" reason=${formatCancelReason(reason)}` +
-        `${session.lastSeenAt ? ` idle=${Date.now() - session.lastSeenAt}ms` : ""}`
+        `[SESSION CLOSED] channel="${session.channelName}" reason=${reasonLabel}` +
+        `${reasonLabel === "player-idle" ? ` idle=${idleMs}ms` : ` elapsed=${elapsedMs}ms`}`
     );
     return true;
 }
@@ -1206,12 +1218,12 @@ async function acquireInitialHLS(sourceUrl, label = "stream", context = {}) {
     );
 
     while (Date.now() - started < STREAM_ACQUIRE_TIMEOUT) {
-        assertSessionActive(context.session, label);
+        assertStartupContextActive(context, label);
         fetches += 1;
 
         try {
             const hls = await fetchAndStoreHLSRaw(getHLSCacheKey(sourceUrl), sourceUrl, "acquire");
-            assertSessionActive(context.session, label);
+            assertStartupContextActive(context, label);
             const info = hls.info || analyzeHLSPlaylist(hls.playlist);
 
             if (info.isMaster || info.segmentCount > 0) {
@@ -1229,6 +1241,7 @@ async function acquireInitialHLS(sourceUrl, label = "stream", context = {}) {
             lastErr = new Error("Playlist valid but without playable segments");
         } catch (err) {
             if (err.code === "KRONOS_SESSION_CANCELLED") throw err;
+            assertStartupContextActive(context, label);
             lastErr = err;
             const elapsed = Date.now() - started;
             console.error(
@@ -1239,7 +1252,7 @@ async function acquireInitialHLS(sourceUrl, label = "stream", context = {}) {
         }
 
         await sleep(Math.min(STREAM_ACQUIRE_POLL_MS, Math.max(0, STREAM_ACQUIRE_TIMEOUT - (Date.now() - started))));
-        assertSessionActive(context.session, label);
+        assertStartupContextActive(context, label);
     }
 
     throw new Error(lastErr ? `Acquire failed: ${lastErr.message}` : "Acquire failed: timeout");
@@ -1260,12 +1273,12 @@ async function prebufferInitialStream(sourceUrl, label = "stream", context = {})
     let attempt = 0;
 
     while (Date.now() - started < STREAM_PREBUFFER_TIMEOUT) {
-        assertSessionActive(context.session, label);
+        assertStartupContextActive(context, label);
         attempt += 1;
 
         try {
             const hls = await getCachedHLSRaw(sourceUrl);
-            assertSessionActive(context.session, label);
+            assertStartupContextActive(context, label);
             const buffered = updateLiveBufferFromPlaylist(sourceUrl, hls.playlist, hls.baseUrl, context);
             const candidates = (buffered.segments || []).slice(-SEGMENT_PREFETCH_AHEAD);
 
@@ -1294,6 +1307,7 @@ async function prebufferInitialStream(sourceUrl, label = "stream", context = {})
             lastErr = null;
         } catch (err) {
             if (err.code === "KRONOS_SESSION_CANCELLED") throw err;
+            assertStartupContextActive(context, label);
             lastErr = err;
             console.warn(
                 `[STARTUP PHASE 2 RETRY] channel="${label}" attempt=${attempt}` +
@@ -1302,7 +1316,7 @@ async function prebufferInitialStream(sourceUrl, label = "stream", context = {})
         }
 
         await sleep(STREAM_PREBUFFER_POLL_MS);
-        assertSessionActive(context.session, label);
+        assertStartupContextActive(context, label);
     }
 
     throw new Error(
@@ -1981,6 +1995,12 @@ function sendCachedSegment(req, res, cached, source = "cache", started = Date.no
 }
 
 app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
+    let startupDone = false;
+    let startupResponseFinished = false;
+    res.on("finish", () => {
+        startupResponseFinished = true;
+    });
+
     try {
         const configKey = req.params.base64Config;
         const config = decodeConfig(configKey);
@@ -1990,15 +2010,16 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         const host = getPublicHost(req);
         const session = activatePlaybackSession(req, c);
 
-        let startupDone = false;
-        req.on("close", () => {
-            if (startupDone) return;
+        let startupCloseHandled = false;
+        const handleStartupClientClose = () => {
+            if (startupDone || startupResponseFinished || startupCloseHandled) return;
             if (memoryCache.activeSessions[session.key]?.id !== session.id) return;
 
             // Force-reset the stream state so a subsequent re-open of the same channel
             // starts a fresh startup instead of attaching to the about-to-fail promise.
             // Bumping the generation also prevents the old promise from corrupting any
             // newer state when it finally throws.
+            startupCloseHandled = true;
             const cacheKey = getHLSCacheKey(c.url);
             const state = memoryCache.streamStates[cacheKey];
             if (state && state.status !== "ready") {
@@ -2009,9 +2030,20 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
             }
 
             closePlaybackSession(session, "player-disconnected");
-        });
+        };
 
-        await ensureStreamReady(c.url, c.name, { session, label: c.name });
+        req.on("aborted", handleStartupClientClose);
+        req.on("close", handleStartupClientClose);
+        res.on("close", handleStartupClientClose);
+
+        await ensureStreamReady(c.url, c.name, {
+            session,
+            label: c.name,
+            isClientGone: () => (
+                startupCloseHandled ||
+                (!startupDone && !startupResponseFinished && (Boolean(req.aborted) || Boolean(res.destroyed)))
+            )
+        });
         startupDone = true;
         touchPlaybackSession(session);
 
@@ -2041,12 +2073,15 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         });
         res.send(rewritten);
     } catch (err) {
+        startupDone = true;
         if (err.code === "KRONOS_SESSION_CANCELLED") {
             console.log(`[HLS ROUTE CANCELLED] reason=${formatCancelReason(err.cancelReason)} ${err.message}`);
+            if (res.headersSent || res.destroyed) return;
             return res.status(499).send("#EXTM3U\n#EXT-X-ENDLIST\n");
         }
 
         console.error("[ERROR HLS ROUTE]", err.message);
+        if (res.headersSent || res.destroyed) return;
         res.status(502).send("#EXTM3U\n#EXT-X-ENDLIST\n");
     }
 });
