@@ -71,9 +71,9 @@ const SEGMENT_WAIT_FOR_PREFETCH_MS = Number(process.env.SEGMENT_WAIT_FOR_PREFETC
 const PLAYER_SEGMENT_SLOW_MS = Number(process.env.PLAYER_SEGMENT_SLOW_MS || 2500);
 const PLAYER_SEGMENT_GAP_WARN_MS = Number(process.env.PLAYER_SEGMENT_GAP_WARN_MS || 30000);
 const PLAYER_SESSION_IDLE_RESET_MS = Number(process.env.PLAYER_SESSION_IDLE_RESET_MS || 60000);
-const PLAYER_SESSION_CLOSE_IDLE_MS = Number(process.env.PLAYER_SESSION_CLOSE_IDLE_MS || 45000);
+const PLAYER_SESSION_CLOSE_IDLE_MS = Number(process.env.PLAYER_SESSION_CLOSE_IDLE_MS || 25000);
 const ADDON_TYPE = "tv";
-const RELEASE_VERSION = "1.7.0";
+const RELEASE_VERSION = "1.7.1";
 
 function decodeConfig(configKey) {
     try {
@@ -475,6 +475,21 @@ function touchPlaybackSession(session) {
     clearSessionCloseTimer(session);
 }
 
+function markPlaybackActivity(session) {
+    if (!session || !isSessionActive(session)) return;
+    touchPlaybackSession(session);
+    schedulePlaybackIdleClose(session);
+}
+
+function findPlaybackSessionById(sessionId) {
+    if (!sessionId) return null;
+    return Object.values(memoryCache.activeSessions).find(session => session.id === sessionId) || null;
+}
+
+function getRequestPlaybackSession(req) {
+    return findPlaybackSessionById(String(req.query.sid || ""));
+}
+
 function closePlaybackSession(session, reason = "player-disconnected") {
     if (!session?.key || !session?.id) return false;
     if (memoryCache.activeSessions[session.key]?.id !== session.id) return false;
@@ -696,9 +711,10 @@ function parseHLSMediaPlaylist(playlist, baseUrl) {
     return { info, headerLines, segments };
 }
 
-function rewriteHLSPlaylistThroughKronos(playlist, baseUrl, hostBase, configKey) {
-    const proxiedSegment = absUrl => `${hostBase}/${configKey}/proxy/seg?u=${encodeProxyUrl(absUrl)}`;
-    const proxiedPlaylist = absUrl => `${hostBase}/${configKey}/proxy/pl?u=${encodeProxyUrl(absUrl)}`;
+function rewriteHLSPlaylistThroughKronos(playlist, baseUrl, hostBase, configKey, options = {}) {
+    const sidParam = options.session?.id ? `&sid=${encodeURIComponent(options.session.id)}` : "";
+    const proxiedSegment = absUrl => `${hostBase}/${configKey}/proxy/seg?u=${encodeProxyUrl(absUrl)}${sidParam}`;
+    const proxiedPlaylist = absUrl => `${hostBase}/${configKey}/proxy/pl?u=${encodeProxyUrl(absUrl)}${sidParam}`;
     const proxyForUrl = absUrl => isHlsUrl(absUrl) ? proxiedPlaylist(absUrl) : proxiedSegment(absUrl);
 
     return String(playlist || "").split(/\r?\n/).map(line => {
@@ -1967,7 +1983,7 @@ app.get("/:base64Config/poster/:id.svg", async (req, res) => {
     }
 });
 
-function sendCachedSegment(req, res, cached, source = "cache", started = Date.now()) {
+function sendCachedSegment(req, res, cached, source = "cache", started = Date.now(), session = null) {
     const buffer = cached.buffer;
     const total = buffer.length;
     const rangeHeader = req.headers.range;
@@ -2007,16 +2023,27 @@ function sendCachedSegment(req, res, cached, source = "cache", started = Date.no
         res.setHeader("Content-Type", cached.headers?.["content-type"] || "video/mp2t");
     }
 
-    const durationMs = Date.now() - started;
-    notePlayerSegment(req, cached.url, { ok: true, source, status, durationMs, bytes: chunk.length });
-    console.log(
-        `[PLAYER SEGMENT] segment=${getSegmentLabel(cached.url)}` +
-        ` source=${source}` +
-        ` status=${status}` +
-        ` bytes=${formatBytes(chunk.length)}` +
-        ` time=${durationMs}ms` +
-        `${req.headers.range ? ` range=${req.headers.range}` : ""}`
-    );
+    let finished = false;
+    res.on("finish", () => {
+        finished = true;
+        markPlaybackActivity(session);
+        const durationMs = Date.now() - started;
+        notePlayerSegment(req, cached.url, { ok: true, source, status, durationMs, bytes: chunk.length });
+        console.log(
+            `[PLAYER SEGMENT] segment=${getSegmentLabel(cached.url)}` +
+            ` source=${source}` +
+            ` status=${status}` +
+            ` bytes=${formatBytes(chunk.length)}` +
+            ` time=${durationMs}ms` +
+            `${req.headers.range ? ` range=${req.headers.range}` : ""}`
+        );
+    });
+    res.on("close", () => {
+        if (!finished && session && isSessionActive(session)) {
+            console.log(`[PLAYER SEGMENT ABORT] segment=${getSegmentLabel(cached.url)} source=${source} reason=client-closed`);
+            closePlaybackSession(session, "player-disconnected");
+        }
+    });
 
     return res.end(chunk);
 }
@@ -2077,7 +2104,7 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         const hls = await getCachedHLSRaw(c.url, { session, label: c.name });
         assertSessionActive(session, c.name);
         const buffered = updateLiveBufferFromPlaylist(c.url, hls.playlist, hls.baseUrl, { session, label: c.name });
-        const rewritten = rewriteHLSPlaylistThroughKronos(buffered.playlist, hls.baseUrl, host, configKey);
+        const rewritten = rewriteHLSPlaylistThroughKronos(buffered.playlist, hls.baseUrl, host, configKey, { session });
         const info = buffered.info || analyzeHLSPlaylist(buffered.playlist);
 
         console.log(
@@ -2095,8 +2122,7 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate, no-transform");
         res.setHeader("Pragma", "no-cache");
         res.on("finish", () => {
-            touchPlaybackSession(session);
-            schedulePlaybackIdleClose(session);
+            markPlaybackActivity(session);
         });
         res.send(rewritten);
     } catch (err) {
@@ -2121,12 +2147,15 @@ app.get("/:base64Config/proxy/pl", async (req, res) => {
 
         const sourceUrl = decodeProxyUrl(req.query.u);
         const host = getPublicHost(req);
+        const session = getRequestPlaybackSession(req);
+        const label = session?.channelName || "nested-playlist";
 
-        await ensureStreamReady(sourceUrl, "nested-playlist", { label: "nested-playlist" });
+        markPlaybackActivity(session);
+        await ensureStreamReady(sourceUrl, label, { session, label });
 
-        const hls = await getCachedHLSRaw(sourceUrl);
-        const buffered = updateLiveBufferFromPlaylist(sourceUrl, hls.playlist, hls.baseUrl, { label: "nested-playlist" });
-        const rewritten = rewriteHLSPlaylistThroughKronos(buffered.playlist, hls.baseUrl, host, configKey);
+        const hls = await getCachedHLSRaw(sourceUrl, { session, label });
+        const buffered = updateLiveBufferFromPlaylist(sourceUrl, hls.playlist, hls.baseUrl, { session, label });
+        const rewritten = rewriteHLSPlaylistThroughKronos(buffered.playlist, hls.baseUrl, host, configKey, { session });
         const info = buffered.info || analyzeHLSPlaylist(buffered.playlist);
 
         console.log(
@@ -2141,6 +2170,7 @@ app.get("/:base64Config/proxy/pl", async (req, res) => {
 
         res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
         res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, no-transform");
+        res.on("finish", () => markPlaybackActivity(session));
         res.send(rewritten);
     } catch (err) {
         console.error("[ERROR PL ROUTE]", err.message);
@@ -2160,15 +2190,17 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
         if (!req.query.u) return res.status(400).end();
 
         sourceUrl = decodeProxyUrl(req.query.u);
+        const session = getRequestPlaybackSession(req);
+        markPlaybackActivity(session);
 
         const cached = getSegmentFromCache(sourceUrl);
         if (cached) {
-            return sendCachedSegment(req, res, cached, "cache", started);
+            return sendCachedSegment(req, res, cached, "cache", started, session);
         }
 
         const waited = await waitForSegmentPrefetch(sourceUrl);
         if (waited) {
-            return sendCachedSegment(req, res, waited, "prefetch-wait", started);
+            return sendCachedSegment(req, res, waited, "prefetch-wait", started, session);
         }
 
         const headers = {
@@ -2217,6 +2249,7 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
             if (storeable && cacheChunks.length > 0 && (response.status === 200 || response.status === 206)) {
                 storeSegmentInCache(sourceUrl, Buffer.concat(cacheChunks), response.headers, response.status);
             }
+            markPlaybackActivity(session);
             notePlayerSegment(req, sourceUrl, { ok: true, source: "upstream", status: response.status, durationMs, bytes });
             console.log(
                 `[PLAYER SEGMENT] segment=${getSegmentLabel(sourceUrl)}` +
@@ -2237,6 +2270,9 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
                     ` bytes=${formatBytes(bytes)}` +
                     ` time=${durationMs}ms`
                 );
+                if (session && isSessionActive(session)) {
+                    closePlaybackSession(session, "player-disconnected");
+                }
             }
         });
 
