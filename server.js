@@ -27,6 +27,7 @@ const memoryCache = {
     epgData: {},
     hlsData: {},
     hlsInflight: {},
+    hlsGenerations: {},
     streamStates: {},
     liveBuffers: {},
     segmentData: {},
@@ -72,7 +73,7 @@ const PLAYER_SEGMENT_GAP_WARN_MS = Number(process.env.PLAYER_SEGMENT_GAP_WARN_MS
 const PLAYER_SESSION_IDLE_RESET_MS = Number(process.env.PLAYER_SESSION_IDLE_RESET_MS || 60000);
 const PLAYER_SESSION_CLOSE_IDLE_MS = Number(process.env.PLAYER_SESSION_CLOSE_IDLE_MS || 45000);
 const ADDON_TYPE = "tv";
-const RELEASE_VERSION = "1.6.9";
+const RELEASE_VERSION = "1.7.0";
 
 function decodeConfig(configKey) {
     try {
@@ -432,8 +433,19 @@ function isSessionActive(session) {
 function assertSessionActive(session, label = "stream") {
     if (isSessionActive(session)) return;
     const reason = getSessionInactiveReason(session);
-    console.log(`[STARTUP CANCELLED] channel="${label}" reason=${formatCancelReason(reason)}`);
+    const sinceCloseMs = session?.closedAt ? Date.now() - session.closedAt : null;
+    console.log(
+        `[STARTUP CANCELLED] channel="${label}" reason=${formatCancelReason(reason)}` +
+        `${sinceCloseMs !== null ? ` sinceClose=${sinceCloseMs}ms` : ""}`
+    );
     throw createCancelledError(`Cancelled ${label}: ${formatCancelReason(reason)}`, reason);
+}
+
+function isStartupContextInactive(context = {}) {
+    return Boolean(
+        (context.session && !isSessionActive(context.session)) ||
+        context.isClientGone?.()
+    );
 }
 
 function assertStartupContextActive(context = {}, label = "stream") {
@@ -472,6 +484,7 @@ function closePlaybackSession(session, reason = "player-disconnected") {
     cancelSessionWork(session, reason);
     const reasonLabel = formatCancelReason(reason);
     const now = Date.now();
+    session.closedAt = now;
     const idleMs = now - (session.lastSeenAt || session.startedAt || now);
     const elapsedMs = now - (session.startedAt || now);
     console.log(
@@ -537,6 +550,7 @@ function resetStreamRuntimeForSource(sourceUrl, label = "stream", reason = "rese
     delete memoryCache.liveBuffers[cacheKey];
     delete memoryCache.hlsData[cacheKey];
     delete memoryCache.hlsInflight[cacheKey];
+    memoryCache.hlsGenerations[cacheKey] = (memoryCache.hlsGenerations[cacheKey] || 0) + 1;
     delete memoryCache.streamStates[cacheKey];
 
     const queuedBefore = memoryCache.segmentPrefetchQueue.length;
@@ -739,7 +753,7 @@ async function getLogoDataUri(logoUrl) {
     }
 }
 
-async function fetchHLSManifest(sourceUrl) {
+async function fetchHLSManifest(sourceUrl, context = {}) {
     const response = await axios.get(sourceUrl, {
         timeout: HLS_REQUEST_TIMEOUT,
         maxRedirects: 5,
@@ -757,23 +771,26 @@ async function fetchHLSManifest(sourceUrl) {
     }
 
     const info = analyzeHLSPlaylist(response.data);
-    console.log(
-        `[HLS OK] ${info.isMaster ? "master" : "media"} live=${info.isLive}` +
-        ` segs=${info.segmentCount}` +
-        `${info.mediaSequence !== null ? ` seq=${info.mediaSequence}` : ""}` +
-        `${info.targetDuration !== null ? ` target=${info.targetDuration}s` : ""}`
-    );
+    if (!isStartupContextInactive(context)) {
+        console.log(
+            `[HLS OK] ${info.isMaster ? "master" : "media"} live=${info.isLive}` +
+            ` segs=${info.segmentCount}` +
+            `${info.mediaSequence !== null ? ` seq=${info.mediaSequence}` : ""}` +
+            `${info.targetDuration !== null ? ` target=${info.targetDuration}s` : ""}`
+        );
+    }
 
     return response;
 }
 
-async function fetchAndStoreHLSRaw(cacheKey, sourceUrl, reason = "request") {
+async function fetchAndStoreHLSRaw(cacheKey, sourceUrl, reason = "request", context = {}) {
     if (memoryCache.hlsInflight[cacheKey]) {
         return memoryCache.hlsInflight[cacheKey];
     }
 
+    const generation = memoryCache.hlsGenerations[cacheKey] || 0;
     const promise = (async () => {
-        const response = await fetchHLSManifest(sourceUrl);
+        const response = await fetchHLSManifest(sourceUrl, context);
         const finalUrl = response.request?.res?.responseUrl || sourceUrl;
         const result = {
             playlist: response.data,
@@ -782,7 +799,11 @@ async function fetchAndStoreHLSRaw(cacheKey, sourceUrl, reason = "request") {
             updatedAt: Date.now(),
             reason
         };
-        memoryCache.hlsData[cacheKey] = result;
+
+        if ((memoryCache.hlsGenerations[cacheKey] || 0) === generation && !isStartupContextInactive(context)) {
+            memoryCache.hlsData[cacheKey] = result;
+        }
+
         return result;
     })();
 
@@ -790,11 +811,13 @@ async function fetchAndStoreHLSRaw(cacheKey, sourceUrl, reason = "request") {
     try {
         return await promise;
     } finally {
-        delete memoryCache.hlsInflight[cacheKey];
+        if (memoryCache.hlsInflight[cacheKey] === promise) {
+            delete memoryCache.hlsInflight[cacheKey];
+        }
     }
 }
 
-async function getCachedHLSRaw(sourceUrl) {
+async function getCachedHLSRaw(sourceUrl, context = {}) {
     const cacheKey = getHLSCacheKey(sourceUrl);
     const cached = memoryCache.hlsData[cacheKey];
     const now = Date.now();
@@ -808,7 +831,7 @@ async function getCachedHLSRaw(sourceUrl) {
     }
 
     try {
-        const fresh = await fetchAndStoreHLSRaw(cacheKey, sourceUrl, cached ? "refresh" : "miss");
+        const fresh = await fetchAndStoreHLSRaw(cacheKey, sourceUrl, cached ? "refresh" : "miss", context);
         return { ...fresh, cacheStatus: cached ? "refresh" : "miss", age: 0 };
     } catch (err) {
         if (cached?.playlist && now - cached.updatedAt <= HLS_STALE_TTL) {
@@ -902,7 +925,7 @@ function noteSegmentPrefetchFailure(sourceUrl, err) {
     return SEGMENT_PREFETCH_FAILURE_COOLDOWN_MS;
 }
 
-async function fetchSegmentToCache(sourceUrl) {
+async function fetchSegmentToCache(sourceUrl, context = {}) {
     const cached = getSegmentFromCache(sourceUrl);
     if (cached) return cached;
 
@@ -928,6 +951,10 @@ async function fetchSegmentToCache(sourceUrl) {
         });
 
         const buffer = Buffer.from(response.data);
+        if (isStartupContextInactive(context)) {
+            return null;
+        }
+
         storeSegmentInCache(sourceUrl, buffer, response.headers, response.status);
         delete memoryCache.segmentPrefetchFailures[key];
         console.log(`[SEG PREFETCH OK] bytes=${formatBytes(buffer.length)} time=${Date.now() - started}ms`);
@@ -985,7 +1012,7 @@ function processSegmentPrefetchQueue() {
         if (getSegmentFromCache(sourceUrl) || memoryCache.segmentInflight[key]) continue;
 
         memoryCache.segmentPrefetchActive += 1;
-        fetchSegmentToCache(sourceUrl)
+        fetchSegmentToCache(sourceUrl, session ? { session, label } : { label })
             .catch(err => {
                 const cooldownMs = noteSegmentPrefetchFailure(sourceUrl, err);
                 console.error(
@@ -1222,7 +1249,7 @@ async function acquireInitialHLS(sourceUrl, label = "stream", context = {}) {
         fetches += 1;
 
         try {
-            const hls = await fetchAndStoreHLSRaw(getHLSCacheKey(sourceUrl), sourceUrl, "acquire");
+            const hls = await fetchAndStoreHLSRaw(getHLSCacheKey(sourceUrl), sourceUrl, "acquire", context);
             assertStartupContextActive(context, label);
             const info = hls.info || analyzeHLSPlaylist(hls.playlist);
 
@@ -1277,7 +1304,7 @@ async function prebufferInitialStream(sourceUrl, label = "stream", context = {})
         attempt += 1;
 
         try {
-            const hls = await getCachedHLSRaw(sourceUrl);
+            const hls = await getCachedHLSRaw(sourceUrl, context);
             assertStartupContextActive(context, label);
             const buffered = updateLiveBufferFromPlaylist(sourceUrl, hls.playlist, hls.baseUrl, context);
             const candidates = (buffered.segments || []).slice(-SEGMENT_PREFETCH_AHEAD);
@@ -2047,7 +2074,7 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         startupDone = true;
         touchPlaybackSession(session);
 
-        const hls = await getCachedHLSRaw(c.url);
+        const hls = await getCachedHLSRaw(c.url, { session, label: c.name });
         assertSessionActive(session, c.name);
         const buffered = updateLiveBufferFromPlaylist(c.url, hls.playlist, hls.baseUrl, { session, label: c.name });
         const rewritten = rewriteHLSPlaylistThroughKronos(buffered.playlist, hls.baseUrl, host, configKey);
