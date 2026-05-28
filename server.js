@@ -70,7 +70,7 @@ const PLAYER_SEGMENT_SLOW_MS = Number(process.env.PLAYER_SEGMENT_SLOW_MS || 2500
 const PLAYER_SEGMENT_GAP_WARN_MS = Number(process.env.PLAYER_SEGMENT_GAP_WARN_MS || 30000);
 const PLAYER_SESSION_IDLE_RESET_MS = Number(process.env.PLAYER_SESSION_IDLE_RESET_MS || 60000);
 const ADDON_TYPE = "tv";
-const RELEASE_VERSION = "1.6.6";
+const RELEASE_VERSION = "1.6.7";
 
 function decodeConfig(configKey) {
     try {
@@ -946,18 +946,35 @@ function getCachedSegmentForLogicalSegment(segment) {
     return null;
 }
 
+function uniqueSegmentUrls(...groups) {
+    const urls = [];
+    groups.flat().filter(Boolean).forEach(url => {
+        if (!urls.includes(url)) urls.push(url);
+    });
+    return urls;
+}
+
 function mergeLiveSegment(existing, incoming) {
+    const altUrls = uniqueSegmentUrls(
+        incoming.url,
+        existing?.cacheUrl,
+        existing?.url,
+        existing?.sourceUrl,
+        Array.isArray(existing?.altUrls) ? existing.altUrls : []
+    );
+    const cached = getCachedSegmentForLogicalSegment({ ...existing, altUrls });
+
     return {
         ...(existing || {}),
         ...incoming,
         url: incoming.url || existing?.url,
         sourceUrl: incoming.url,
-        cacheUrl: incoming.url || existing?.cacheUrl,
+        cacheUrl: cached?.url || incoming.url || existing?.cacheUrl,
         lines: incoming.lines,
         duration: incoming.duration || existing?.duration || 0,
         firstSeenAt: existing?.firstSeenAt || incoming.firstSeenAt || Date.now(),
         lastSeenAt: Date.now(),
-        altUrls: [incoming.url].filter(Boolean),
+        altUrls,
         logicalKey: incoming.logicalKey || existing?.logicalKey || getSegmentLogicalKey(incoming)
     };
 }
