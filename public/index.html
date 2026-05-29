@@ -373,107 +373,6 @@
             color: #5f687b;
         }
 
-        .proxy-box {
-            border: 1px solid var(--line);
-            border-radius: 18px;
-            background: linear-gradient(135deg, rgba(255, 255, 255, 0.065), rgba(255, 255, 255, 0.026));
-            overflow: hidden;
-        }
-
-        .proxy-toggle {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            min-height: 64px;
-            padding: 14px 15px;
-            cursor: pointer;
-            user-select: none;
-        }
-
-        .proxy-toggle input {
-            position: absolute;
-            opacity: 0;
-            pointer-events: none;
-        }
-
-        .switch {
-            position: relative;
-            width: 48px;
-            height: 28px;
-            flex: 0 0 auto;
-            border-radius: 999px;
-            background: rgba(255, 255, 255, 0.12);
-            border: 1px solid rgba(255, 255, 255, 0.14);
-            transition: background 180ms ease;
-        }
-
-        .switch::after {
-            content: "";
-            position: absolute;
-            top: 4px;
-            left: 4px;
-            width: 18px;
-            height: 18px;
-            border-radius: 50%;
-            background: #ffffff;
-            transition: transform 180ms ease;
-        }
-
-        #useProxy:checked + .switch {
-            background: linear-gradient(90deg, var(--orange), var(--pink));
-        }
-
-        #useProxy:checked + .switch::after {
-            transform: translateX(20px);
-        }
-
-        .proxy-title {
-            display: block;
-            font-weight: 850;
-        }
-
-        .proxy-copy {
-            display: block;
-            margin-top: 4px;
-            color: var(--muted);
-            font-size: 0.83rem;
-        }
-
-        .proxy-section {
-            display: grid;
-            grid-template-rows: 0fr;
-            transition: grid-template-rows 220ms ease;
-        }
-
-        .proxy-section.is-open {
-            grid-template-rows: 1fr;
-        }
-
-        .proxy-inner {
-            overflow: hidden;
-        }
-
-        .proxy-inner .field {
-            margin: 0 14px 14px;
-            background: rgba(7, 8, 13, 0.68);
-        }
-
-        .proxy-inner .field:focus-within {
-            border-color: rgba(56, 223, 244, 0.34);
-            background: rgba(7, 8, 13, 0.58);
-            transform: none;
-            box-shadow: inset 0 0 0 1px rgba(56, 223, 244, 0.08);
-        }
-
-        .proxy-inner input:-webkit-autofill,
-        .proxy-inner input:-webkit-autofill:hover,
-        .proxy-inner input:-webkit-autofill:focus {
-            -webkit-text-fill-color: var(--text);
-            caret-color: var(--text);
-            box-shadow: 0 0 0 1000px rgba(7, 8, 13, 0.92) inset;
-            transition: background-color 9999s ease-out;
-        }
-
         .actions {
             display: grid;
             grid-template-columns: 1fr auto;
@@ -750,7 +649,7 @@
 
         .preview-body {
             display: grid;
-            grid-template-columns: repeat(3, 1fr);
+            grid-template-columns: repeat(2, minmax(0, 1fr));
             gap: 10px;
             padding: 15px;
         }
@@ -1112,8 +1011,8 @@
                     <span>Programmi in onda nelle schede canale.</span>
                 </div>
                 <div class="metric">
-                    <strong>Proxy</strong>
-                    <span>Resolver usato su liste e stream.</span>
+                    <strong>HLS</strong>
+                    <span>Proxy interno per stream live e segmenti .ts.</span>
                 </div>
             </div>
         </section>
@@ -1149,7 +1048,7 @@
             <div class="panel-head">
                 <div>
                     <h2>Configura il tuo addon</h2>
-                    <p>Il link contiene tutte le impostazioni: liste, gruppi, EPG e resolver.</p>
+                    <p>Il link contiene tutte le impostazioni: liste, gruppi e guida TV.</p>
                 </div>
                 <div class="step-badge">01</div>
             </div>
@@ -1193,29 +1092,6 @@
                     </div>
                 </div>
 
-                <div class="proxy-box">
-                    <label class="proxy-toggle" for="useProxy">
-                        <input type="checkbox" id="useProxy">
-                        <span class="switch" aria-hidden="true"></span>
-                        <span>
-                            <span class="proxy-title">Resolver proxy</span>
-                            <span class="proxy-copy">Usa il resolver per leggere playlist e avviare gli stream.</span>
-                        </span>
-                    </label>
-                    <div id="proxySection" class="proxy-section">
-                        <div class="proxy-inner">
-                            <div class="field">
-                                <label for="proxyUrl">URL proxy resolver <small>richiesto se attivo</small></label>
-                                <input type="url" id="proxyUrl" placeholder="http://192.168.1.108:7860" autocomplete="url">
-                            </div>
-                            <div class="field">
-                                <label for="proxyPassword">Password proxy <small>opzionale, se l'URL contiene utente</small></label>
-                                <input type="password" id="proxyPassword" placeholder="Password proxy" autocomplete="current-password">
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
                 <div class="actions">
                     <button type="submit" class="generate-button">Genera setup K.R.O.N.O.S.</button>
                     <button type="button" id="resetButton" class="ghost-button" title="Pulisci campi" aria-label="Pulisci campi">Reset</button>
@@ -1238,10 +1114,6 @@
                     <div class="preview-item">
                         <b id="epgState">No</b>
                         <span>Guida TV collegata</span>
-                    </div>
-                    <div class="preview-item">
-                        <b id="proxyState">Off</b>
-                        <span>Proxy configurato</span>
                     </div>
                 </div>
                 <div id="chips" class="chips">
@@ -1310,10 +1182,6 @@
         const groupOptions = document.getElementById('groupOptions');
         const insertGroupsButton = document.getElementById('insertGroupsButton');
         const selectAllGroupsButton = document.getElementById('selectAllGroupsButton');
-        const useProxy = document.getElementById('useProxy');
-        const proxyUrl = document.getElementById('proxyUrl');
-        const proxyPassword = document.getElementById('proxyPassword');
-        const proxySection = document.getElementById('proxySection');
         const resultSection = document.getElementById('resultSection');
         const stremioLink = document.getElementById('stremioLink');
         const manifestText = document.getElementById('manifestText');
@@ -1325,7 +1193,6 @@
         const previewHint = document.getElementById('previewHint');
         const playlistState = document.getElementById('playlistState');
         const epgState = document.getElementById('epgState');
-        const proxyState = document.getElementById('proxyState');
         const chips = document.getElementById('chips');
 
         let currentManifestUrl = '';
@@ -1420,11 +1287,7 @@
                 const response = await fetch('/api/analyze-lists', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        lists,
-                        proxyUrl: useProxy.checked ? proxyUrl.value.trim() : null,
-                        proxyPassword: useProxy.checked ? proxyPassword.value.trim() : null
-                    })
+                    body: JSON.stringify({ lists })
                 });
 
                 if (!response.ok) throw new Error('analysis_failed');
@@ -1494,23 +1357,17 @@
                 u: lists[0]?.u || '',
                 e: epgUrl.value.trim() || null,
                 g: parseGroups(),
-                gm: groupsInsertedFromAnalysis ? 'filter' : 'list',
-                p: useProxy.checked ? proxyUrl.value.trim() || null : null,
-                pp: useProxy.checked ? proxyPassword.value.trim() || null : null
+                gm: groupsInsertedFromAnalysis ? 'filter' : 'list'
             };
         }
 
         function updatePreview() {
             const config = getConfig();
             const ready = Boolean(config.l.length);
-            const hasProxy = Boolean(config.p);
             const groupList = config.g.length ? config.g : config.l.map(list => list.n);
 
-            proxySection.classList.toggle('is-open', useProxy.checked);
-            proxyUrl.required = useProxy.checked;
             playlistState.textContent = String(config.l.length);
             epgState.textContent = config.e ? 'Si' : 'No';
-            proxyState.textContent = hasProxy ? 'On' : 'Off';
             health.textContent = ready ? 'Pronto' : 'In attesa';
             health.classList.toggle('ready', ready);
             previewHint.textContent = ready
@@ -1592,9 +1449,6 @@
 
             epgUrl.value = config.e || '';
             groups.value = Array.isArray(config.g) ? config.g.join(', ') : '';
-            useProxy.checked = Boolean(config.p);
-            proxyUrl.value = config.p || '';
-            proxyPassword.value = config.pp || '';
             groupsInsertedFromAnalysis = config.gm === 'filter';
             analysisSignature = groupsInsertedFromAnalysis ? getListSignature(lists) : '';
             groupAssistant.classList.remove('is-visible');
@@ -1723,7 +1577,7 @@
             groupsInsertedFromAnalysis = false;
         });
 
-        [epgUrl, groups, proxyUrl, proxyPassword, useProxy].forEach(element => {
+        [epgUrl, groups].forEach(element => {
             element.addEventListener('input', updatePreview);
             element.addEventListener('change', updatePreview);
         });
