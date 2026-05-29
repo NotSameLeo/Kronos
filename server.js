@@ -119,6 +119,14 @@ app.get("/health", (req, res) => {
     });
 });
 
+app.get("/configure", (req, res) => {
+    res.sendFile(path.join(__dirname, "public", "index.html"));
+});
+
+app.get("/:base64Config/configure", (req, res) => {
+    res.redirect(`/?config=${encodeURIComponent(req.params.base64Config)}`);
+});
+
 async function updateEPGCache(epgUrl) {
     if (!epgUrl) return {};
     try {
