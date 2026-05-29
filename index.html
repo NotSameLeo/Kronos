@@ -1,0 +1,1591 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>K.R.O.N.O.S. Channel Configurator</title>
+    <style>
+        :root {
+            color-scheme: dark;
+            --bg: #07080d;
+            --panel: rgba(16, 20, 31, 0.78);
+            --panel-strong: rgba(22, 27, 41, 0.94);
+            --line: rgba(255, 255, 255, 0.12);
+            --muted: #8e98ad;
+            --text: #f5f7fb;
+            --orange: #ff7a1a;
+            --pink: #ff3f89;
+            --cyan: #38dff4;
+            --green: #4ade80;
+            --red: #fb7185;
+            --shadow: 0 24px 80px rgba(0, 0, 0, 0.52);
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            min-height: 100vh;
+            margin: 0;
+            font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background:
+                radial-gradient(circle at 20% 10%, rgba(56, 223, 244, 0.16), transparent 26rem),
+                radial-gradient(circle at 82% 18%, rgba(255, 63, 137, 0.18), transparent 28rem),
+                linear-gradient(135deg, #07080d 0%, #11131e 48%, #090a12 100%);
+            color: var(--text);
+            overflow-x: hidden;
+        }
+
+        body::before {
+            content: "";
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            background-image:
+                linear-gradient(rgba(255, 255, 255, 0.045) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(255, 255, 255, 0.045) 1px, transparent 1px);
+            background-size: 44px 44px;
+            mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.9), transparent 78%);
+        }
+
+        .shell {
+            position: relative;
+            width: min(1160px, calc(100% - 32px));
+            min-height: 100vh;
+            margin: 0 auto;
+            padding: 28px 0;
+            display: grid;
+            grid-template-columns: 1fr;
+            align-items: start;
+            gap: 18px;
+        }
+
+        .brand-panel,
+        .config-panel {
+            border: 1px solid var(--line);
+            background: var(--panel);
+            box-shadow: var(--shadow);
+            backdrop-filter: blur(22px);
+        }
+
+        .brand-panel {
+            position: relative;
+            min-height: auto;
+            padding: 24px;
+            border-radius: 24px;
+            display: grid;
+            grid-template-columns: minmax(0, 1.4fr) minmax(250px, 0.8fr);
+            align-items: center;
+            gap: 22px;
+            overflow: hidden;
+        }
+
+        .brand-panel::after {
+            content: "";
+            position: absolute;
+            inset: auto -20% -32% 12%;
+            height: 44%;
+            background: conic-gradient(from 180deg, rgba(255, 122, 26, 0.9), rgba(255, 63, 137, 0.85), rgba(56, 223, 244, 0.75), rgba(255, 122, 26, 0.9));
+            filter: blur(54px);
+            opacity: 0.28;
+            animation: drift 9s ease-in-out infinite alternate;
+        }
+
+        .topbar {
+            position: relative;
+            z-index: 1;
+            display: flex;
+            align-items: center;
+            justify-content: flex-start;
+            gap: 16px;
+            grid-column: 1 / -1;
+        }
+
+        .identity {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+
+        .logo {
+            width: 58px;
+            height: 58px;
+            border-radius: 18px;
+            box-shadow: 0 16px 34px rgba(255, 93, 30, 0.18), inset 0 0 0 1px rgba(255, 255, 255, 0.18);
+        }
+
+        .brand-name {
+            margin: 0;
+            font-size: 1.15rem;
+            letter-spacing: 0;
+            line-height: 1;
+        }
+
+        .brand-subtitle {
+            margin: 6px 0 0;
+            color: var(--cyan);
+            font-family: "SFMono-Regular", Consolas, monospace;
+            font-size: 0.72rem;
+        }
+
+        .brand-release {
+            margin: 6px 0 0;
+            color: #f9d7bd;
+            font-size: 0.72rem;
+            font-weight: 850;
+        }
+
+        .status-pill {
+            margin-left: auto;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            min-height: 34px;
+            padding: 0 12px;
+            border: 1px solid rgba(74, 222, 128, 0.28);
+            border-radius: 999px;
+            background: rgba(74, 222, 128, 0.1);
+            color: #bbf7d0;
+            font-size: 0.78rem;
+            font-weight: 700;
+            white-space: nowrap;
+        }
+
+        .status-pill::before {
+            content: "";
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--green);
+            box-shadow: 0 0 18px var(--green);
+        }
+
+        .hero-copy {
+            position: relative;
+            z-index: 1;
+            max-width: 48rem;
+            padding: 4px 0 4px;
+        }
+
+        .eyebrow {
+            display: inline-flex;
+            margin: 0 0 16px;
+            padding: 7px 11px;
+            border: 1px solid rgba(56, 223, 244, 0.26);
+            border-radius: 999px;
+            background: rgba(56, 223, 244, 0.08);
+            color: #b7f6ff;
+            font-size: 0.74rem;
+            font-weight: 800;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+
+        h1 {
+            margin: 0;
+            font-size: clamp(2.2rem, 4.4vw, 4.1rem);
+            line-height: 0.98;
+            letter-spacing: 0;
+        }
+
+        .gradient-text {
+            display: inline-block;
+            background: linear-gradient(100deg, #fff 0%, #ffd8bb 28%, var(--orange) 52%, var(--pink) 76%, var(--cyan) 100%);
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+        }
+
+        .lead {
+            max-width: 68ch;
+            margin: 16px 0 0;
+            color: #c5cad8;
+            font-size: 0.98rem;
+            line-height: 1.6;
+        }
+
+        .signal-card {
+            position: relative;
+            z-index: 1;
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 12px;
+            grid-column: 1 / -1;
+        }
+
+        .metric {
+            min-height: 94px;
+            padding: 14px;
+            border: 1px solid var(--line);
+            border-radius: 14px;
+            background: rgba(255, 255, 255, 0.055);
+        }
+
+        .metric strong {
+            display: block;
+            font-size: 1.26rem;
+            line-height: 1.1;
+        }
+
+        .metric span {
+            display: block;
+            margin-top: 8px;
+            color: var(--muted);
+            font-size: 0.78rem;
+            line-height: 1.35;
+        }
+
+        .orbit {
+            position: relative;
+            z-index: 1;
+            height: 176px;
+            margin: 0;
+            display: grid;
+            place-items: center;
+        }
+
+        .orbit-ring {
+            position: absolute;
+            border-radius: 50%;
+            border: 1px solid rgba(255, 255, 255, 0.14);
+            animation: spin 18s linear infinite;
+        }
+
+        .orbit-ring:nth-child(1) {
+            width: 154px;
+            height: 154px;
+            border-top-color: var(--orange);
+        }
+
+        .orbit-ring:nth-child(2) {
+            width: 112px;
+            height: 112px;
+            border-right-color: var(--pink);
+            animation-duration: 13s;
+            animation-direction: reverse;
+        }
+
+        .orbit-core {
+            width: 84px;
+            height: 84px;
+            border-radius: 50%;
+            display: grid;
+            place-items: center;
+            background: linear-gradient(135deg, rgba(255, 122, 26, 0.25), rgba(56, 223, 244, 0.15));
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            box-shadow: inset 0 0 28px rgba(56, 223, 244, 0.16), 0 0 42px rgba(255, 63, 137, 0.22);
+            font-weight: 900;
+            letter-spacing: 0;
+        }
+
+        .config-panel {
+            border-radius: 28px;
+            padding: 24px;
+        }
+
+        .panel-head {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 18px;
+            margin-bottom: 22px;
+        }
+
+        .panel-head h2 {
+            margin: 0;
+            font-size: 1.55rem;
+            letter-spacing: 0;
+        }
+
+        .panel-head p {
+            margin: 8px 0 0;
+            color: var(--muted);
+            line-height: 1.55;
+            font-size: 0.92rem;
+        }
+
+        .step-badge {
+            flex: 0 0 auto;
+            display: grid;
+            place-items: center;
+            width: 46px;
+            height: 46px;
+            border-radius: 16px;
+            background: linear-gradient(135deg, rgba(255, 122, 26, 0.24), rgba(255, 63, 137, 0.16));
+            border: 1px solid rgba(255, 255, 255, 0.14);
+            color: #ffd6bd;
+            font-weight: 900;
+        }
+
+        .form-grid {
+            display: grid;
+            gap: 16px;
+        }
+
+        .field {
+            position: relative;
+            border: 1px solid var(--line);
+            border-radius: 18px;
+            background: rgba(7, 8, 13, 0.52);
+            transition: border-color 180ms ease, transform 180ms ease, background 180ms ease;
+        }
+
+        .field:focus-within {
+            border-color: rgba(255, 122, 26, 0.75);
+            background: rgba(7, 8, 13, 0.72);
+            transform: translateY(-1px);
+        }
+
+        .field label {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            padding: 14px 15px 0;
+            color: #d7dbea;
+            font-size: 0.76rem;
+            font-weight: 850;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+
+        .field small {
+            color: var(--muted);
+            font-weight: 700;
+            letter-spacing: 0;
+            text-transform: none;
+            white-space: nowrap;
+        }
+
+        input {
+            width: 100%;
+            border: 0;
+            outline: 0;
+            background: transparent;
+            color: var(--text);
+            padding: 11px 15px 15px;
+            font: inherit;
+            font-size: 0.96rem;
+        }
+
+        input::placeholder {
+            color: #5f687b;
+        }
+
+        .actions {
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: 12px;
+            align-items: center;
+        }
+
+        button,
+        .stremio-button {
+            min-height: 54px;
+            border: 0;
+            border-radius: 16px;
+            font: inherit;
+            font-weight: 900;
+            cursor: pointer;
+            line-height: 1.2;
+            transition: transform 180ms ease, filter 180ms ease, border-color 180ms ease, background 180ms ease;
+        }
+
+        .generate-button {
+            color: #170a04;
+            background: linear-gradient(100deg, #ffd2aa 0%, var(--orange) 34%, var(--pink) 100%);
+            box-shadow: 0 18px 38px rgba(255, 88, 61, 0.24);
+            padding: 0 22px;
+        }
+
+        .generate-button:hover,
+        .stremio-button:hover {
+            transform: translateY(-2px);
+            filter: brightness(1.06);
+        }
+
+        .ghost-button {
+            width: 54px;
+            display: grid;
+            place-items: center;
+            color: #dbeafe;
+            background: rgba(255, 255, 255, 0.06);
+            border: 1px solid var(--line);
+        }
+
+        .ghost-button:hover {
+            border-color: rgba(56, 223, 244, 0.45);
+            color: #b7f6ff;
+        }
+
+        .link-tools {
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: 12px;
+            align-items: stretch;
+        }
+
+        .link-tools .field {
+            min-width: 0;
+        }
+
+        .analyze-button,
+        .insert-groups-button {
+            color: #d9fbff;
+            background: rgba(56, 223, 244, 0.1);
+            border: 1px solid rgba(56, 223, 244, 0.28);
+            padding: 0 18px;
+        }
+
+        .analyze-button:hover,
+        .insert-groups-button:hover {
+            transform: translateY(-2px);
+            border-color: rgba(56, 223, 244, 0.55);
+            background: rgba(56, 223, 244, 0.16);
+        }
+
+        .analyze-button:disabled,
+        .insert-groups-button:disabled {
+            cursor: wait;
+            opacity: 0.62;
+            transform: none;
+        }
+
+        .group-assistant {
+            display: none;
+            border: 1px solid rgba(56, 223, 244, 0.2);
+            border-radius: 18px;
+            background: rgba(56, 223, 244, 0.06);
+            overflow: hidden;
+        }
+
+        .group-assistant.is-visible {
+            display: block;
+            animation: reveal 220ms ease both;
+        }
+
+        .assistant-head {
+            display: flex;
+            justify-content: space-between;
+            gap: 14px;
+            padding: 14px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.09);
+        }
+
+        .assistant-head strong {
+            display: block;
+            font-size: 0.9rem;
+        }
+
+        .assistant-head span {
+            display: block;
+            margin-top: 4px;
+            color: var(--muted);
+            font-size: 0.8rem;
+            line-height: 1.4;
+        }
+
+        .group-options {
+            max-height: 190px;
+            overflow: auto;
+            padding: 10px;
+            display: grid;
+            gap: 8px;
+        }
+
+        .group-option {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px;
+            border-radius: 12px;
+            background: rgba(255, 255, 255, 0.055);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            cursor: pointer;
+        }
+
+        .group-option input {
+            width: 16px;
+            flex: 0 0 auto;
+            padding: 0;
+        }
+
+        .group-option span {
+            min-width: 0;
+            flex: 1;
+            overflow-wrap: anywhere;
+            font-weight: 800;
+        }
+
+        .group-option small {
+            color: var(--muted);
+            white-space: nowrap;
+        }
+
+        .assistant-actions {
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: 10px;
+            padding: 0 14px 14px;
+        }
+
+        .playlist-manager {
+            display: grid;
+            gap: 12px;
+        }
+
+        .playlist-head {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 14px;
+        }
+
+        .playlist-head strong {
+            display: block;
+            font-size: 0.9rem;
+        }
+
+        .playlist-head span {
+            display: block;
+            margin-top: 4px;
+            color: var(--muted);
+            font-size: 0.8rem;
+            line-height: 1.4;
+        }
+
+        .playlist-list {
+            display: grid;
+            gap: 12px;
+        }
+
+        .playlist-row {
+            display: grid;
+            grid-template-columns: minmax(160px, 0.28fr) minmax(360px, 1fr) auto;
+            gap: 10px;
+            align-items: stretch;
+            padding: 10px;
+            border: 1px solid var(--line);
+            border-radius: 18px;
+            background: rgba(255, 255, 255, 0.045);
+        }
+
+        .playlist-remove {
+            width: 48px;
+            min-height: 54px;
+            color: #fecdd3;
+            background: rgba(251, 113, 133, 0.08);
+            border: 1px solid rgba(251, 113, 133, 0.22);
+        }
+
+        .playlist-actions {
+            display: grid;
+            grid-template-columns: auto 1fr;
+            gap: 10px;
+        }
+
+        .add-list-button {
+            color: #dbeafe;
+            background: rgba(255, 255, 255, 0.06);
+            border: 1px solid var(--line);
+            padding: 0 18px;
+        }
+
+        .preview {
+            margin-top: 18px;
+            border: 1px solid var(--line);
+            border-radius: 20px;
+            background: var(--panel-strong);
+            overflow: hidden;
+        }
+
+        .preview-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 14px;
+            padding: 15px;
+            border-bottom: 1px solid var(--line);
+        }
+
+        .preview-head strong {
+            display: block;
+            font-size: 0.9rem;
+        }
+
+        .preview-head span {
+            color: var(--muted);
+            font-size: 0.8rem;
+        }
+
+        .health {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            color: #fca5a5;
+            font-size: 0.8rem;
+            font-weight: 850;
+            white-space: nowrap;
+        }
+
+        .health.ready {
+            color: #bbf7d0;
+        }
+
+        .health::before {
+            content: "";
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--red);
+            box-shadow: 0 0 14px rgba(251, 113, 133, 0.8);
+        }
+
+        .health.ready::before {
+            background: var(--green);
+            box-shadow: 0 0 14px rgba(74, 222, 128, 0.8);
+        }
+
+        .preview-body {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 10px;
+            padding: 15px;
+        }
+
+        .preview-item {
+            min-height: 86px;
+            padding: 13px;
+            border-radius: 14px;
+            background: rgba(255, 255, 255, 0.055);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+        }
+
+        .preview-item b {
+            display: block;
+            font-size: 1.25rem;
+        }
+
+        .preview-item span {
+            display: block;
+            margin-top: 8px;
+            color: var(--muted);
+            font-size: 0.78rem;
+            line-height: 1.35;
+        }
+
+        .chips {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            padding: 0 15px 15px;
+        }
+
+        .chip {
+            max-width: 100%;
+            padding: 7px 10px;
+            border-radius: 999px;
+            color: #d9fbff;
+            background: rgba(56, 223, 244, 0.1);
+            border: 1px solid rgba(56, 223, 244, 0.18);
+            font-size: 0.78rem;
+            font-weight: 800;
+            overflow-wrap: anywhere;
+        }
+
+        .result {
+            display: none;
+            margin-top: 18px;
+            border: 1px solid rgba(74, 222, 128, 0.26);
+            border-radius: 20px;
+            background: linear-gradient(135deg, rgba(74, 222, 128, 0.12), rgba(56, 223, 244, 0.07));
+            overflow: hidden;
+        }
+
+        .result.is-visible {
+            display: block;
+            animation: reveal 260ms ease both;
+        }
+
+        .result-copy {
+            padding: 16px 16px 0;
+        }
+
+        .result-copy strong {
+            display: block;
+            color: #bbf7d0;
+        }
+
+        .result-copy span {
+            display: block;
+            margin-top: 6px;
+            color: #c6d1df;
+            font-size: 0.86rem;
+            line-height: 1.45;
+            overflow-wrap: anywhere;
+        }
+
+        .local-warning {
+            display: none;
+            margin: 12px 16px 0;
+            padding: 11px 12px;
+            border-radius: 14px;
+            border: 1px solid rgba(255, 190, 92, 0.3);
+            background: rgba(255, 190, 92, 0.1);
+            color: #fde7bd;
+            font-size: 0.82rem;
+            line-height: 1.45;
+        }
+
+        .local-warning.is-visible {
+            display: block;
+        }
+
+        .result-actions {
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: 10px;
+            padding: 16px;
+        }
+
+        .stremio-button {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            color: #ffffff;
+            text-decoration: none;
+            background: linear-gradient(100deg, #6d5dfc, #ff3f89);
+            padding: 0 18px;
+        }
+
+        .copy-button {
+            width: 54px;
+            color: #dbeafe;
+            background: rgba(255, 255, 255, 0.08);
+            border: 1px solid var(--line);
+        }
+
+        .toast {
+            position: fixed;
+            left: 50%;
+            bottom: 24px;
+            z-index: 10;
+            transform: translate(-50%, 16px);
+            opacity: 0;
+            pointer-events: none;
+            padding: 12px 14px;
+            border: 1px solid rgba(74, 222, 128, 0.28);
+            border-radius: 14px;
+            background: rgba(13, 18, 28, 0.92);
+            color: #bbf7d0;
+            box-shadow: var(--shadow);
+            transition: opacity 180ms ease, transform 180ms ease;
+        }
+
+        .toast.is-visible {
+            opacity: 1;
+            transform: translate(-50%, 0);
+        }
+
+        /* Disclaimer Collapsabile */
+        .disclaimer-collapsible {
+            border: 1px solid rgba(255, 190, 92, 0.25);
+            border-radius: 20px;
+            background: rgba(255, 190, 92, 0.05);
+            overflow: hidden;
+            backdrop-filter: blur(22px);
+            box-shadow: var(--shadow);
+        }
+        
+        .disclaimer-toggle {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 16px 20px;
+            cursor: pointer;
+            user-select: none;
+            background: rgba(255, 190, 92, 0.08);
+            border-bottom: 1px solid rgba(255, 190, 92, 0.15);
+            transition: background 180ms ease;
+        }
+        
+        .disclaimer-toggle:hover {
+            background: rgba(255, 190, 92, 0.12);
+        }
+        
+        .disclaimer-toggle-left {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        
+        .disclaimer-toggle-icon {
+            font-size: 20px;
+        }
+        
+        .disclaimer-toggle-title {
+            font-weight: 800;
+            font-size: 0.9rem;
+            color: #ffd89b;
+            letter-spacing: 0.03em;
+        }
+        
+        .disclaimer-toggle-arrow {
+            font-size: 18px;
+            color: #ffd89b;
+            transition: transform 280ms ease;
+        }
+        
+        .disclaimer-collapsible.is-open .disclaimer-toggle-arrow {
+            transform: rotate(180deg);
+        }
+        
+        .disclaimer-content {
+            display: grid;
+            grid-template-rows: 0fr;
+            transition: grid-template-rows 280ms ease;
+        }
+        
+        .disclaimer-collapsible.is-open .disclaimer-content {
+            grid-template-rows: 1fr;
+        }
+        
+        .disclaimer-content-inner {
+            overflow: hidden;
+        }
+        
+        .disclaimer-collapsible.is-open .disclaimer-content-inner {
+            padding: 18px 20px 20px;
+        }
+        
+        .disclaimer-content p {
+            margin: 0 0 12px 0;
+            font-size: 0.82rem;
+            line-height: 1.55;
+            color: #e8d4b8;
+        }
+        
+        .disclaimer-content p:last-child {
+            margin-bottom: 0;
+        }
+        
+        .disclaimer-content strong {
+            display: block;
+            color: #ffd89b;
+            font-weight: 800;
+            margin-top: 14px;
+            margin-bottom: 6px;
+            font-size: 0.88rem;
+            letter-spacing: 0.03em;
+        }
+        
+        .disclaimer-content strong:first-child {
+            margin-top: 0;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        @keyframes drift {
+            to { transform: translate3d(4%, -7%, 0) rotate(8deg); }
+        }
+
+        @keyframes reveal {
+            from { opacity: 0; transform: translateY(8px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        @media (max-width: 980px) {
+            .brand-panel {
+                grid-template-columns: 1fr;
+            }
+
+            .hero-copy {
+                padding: 8px 0;
+            }
+        }
+
+        @media (max-width: 620px) {
+            .shell {
+                width: min(100% - 20px, 1180px);
+            }
+
+            .brand-panel,
+            .config-panel {
+                border-radius: 20px;
+                padding: 18px;
+            }
+
+            .topbar,
+            .panel-head {
+                align-items: flex-start;
+                flex-direction: column;
+            }
+
+            .status-pill {
+                white-space: normal;
+            }
+
+            .signal-card,
+            .preview-body,
+            .brand-panel {
+                grid-template-columns: 1fr;
+            }
+
+            .disclaimer-toggle {
+                padding: 14px 16px;
+            }
+
+            .disclaimer-toggle-title {
+                font-size: 0.82rem;
+            }
+
+            .disclaimer-content p {
+                font-size: 0.78rem;
+            }
+
+            .actions,
+            .result-actions,
+            .link-tools,
+            .assistant-actions,
+            .playlist-actions,
+            .playlist-row {
+                grid-template-columns: 1fr;
+            }
+
+            .ghost-button,
+            .copy-button {
+                width: 100%;
+            }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            *,
+            *::before,
+            *::after {
+                animation-duration: 0.01ms !important;
+                animation-iteration-count: 1 !important;
+                scroll-behavior: auto !important;
+                transition-duration: 0.01ms !important;
+            }
+        }
+    </style>
+</head>
+<body>
+    <main class="shell">
+        <section class="brand-panel" aria-label="Presentazione K.R.O.N.O.S.">
+            <div class="topbar">
+                <div class="identity">
+                    <img src="/logo.svg" alt="K.R.O.N.O.S. Logo" class="logo">
+                    <div>
+                        <p class="brand-name">K.R.O.N.O.S.</p>
+                        <p class="brand-subtitle">Kanal Routing Optimized Network On Stremio</p>
+                        <p class="brand-release">Release 1.5.7</p>
+                    </div>
+                </div>
+                <div class="status-pill">Addon builder online</div>
+            </div>
+
+            <div class="hero-copy">
+                <p class="eyebrow">Channel Configurator</p>
+                <h1><span class="gradient-text">Editor canali per generare liste per Stremio.</span></h1>
+                <p class="lead">Unisci una o piu liste M3U, scegli i gruppi da mostrare e genera un catalogo live TV pronto per Stremio.</p>
+            </div>
+
+            <div class="orbit" aria-hidden="true">
+                <div class="orbit-ring"></div>
+                <div class="orbit-ring"></div>
+                <div class="orbit-core">TV</div>
+            </div>
+
+            <div class="signal-card" aria-label="Funzionalita principali">
+                <div class="metric">
+                    <strong>M3U</strong>
+                    <span>Liste multiple ordinate in cataloghi separati.</span>
+                </div>
+                <div class="metric">
+                    <strong>EPG</strong>
+                    <span>Programmi in onda nelle schede canale.</span>
+                </div>
+                <div class="metric">
+                    <strong>HLS</strong>
+                    <span>Proxy interno per stream live e segmenti .ts.</span>
+                </div>
+            </div>
+        </section>
+
+        <section class="disclaimer-collapsible is-open" id="disclaimerPanel" aria-label="Avviso legale">
+            <div class="disclaimer-toggle" role="button" tabindex="0" aria-expanded="true" aria-controls="disclaimerContent">
+                <div class="disclaimer-toggle-left">
+                    <span class="disclaimer-toggle-icon" aria-hidden="true">⚠️</span>
+                    <span class="disclaimer-toggle-title">AVVISO LEGALE E DISCLAIMER</span>
+                </div>
+                <span class="disclaimer-toggle-arrow" aria-hidden="true">▼</span>
+            </div>
+            <div class="disclaimer-content" id="disclaimerContent">
+                <div class="disclaimer-content-inner">
+                    <p>Questo addon è uno strumento di configurazione tecnica che permette di organizzare e visualizzare contenuti da sorgenti esterne fornite dall'utente.</p>
+                    
+                    <strong>IMPORTANTE:</strong>
+                    <p>• Questo software NON fornisce, ospita o distribuisce alcun contenuto multimediale<br>
+                    • Questo software NON include liste M3U, stream o canali preconfigurati<br>
+                    • L'utente è l'unico responsabile delle sorgenti (liste M3U/URL) che sceglie di utilizzare<br>
+                    • L'utente deve assicurarsi di avere i diritti legali per accedere ai contenuti configurati<br>
+                    • L'utilizzo di questo addon per accedere a contenuti protetti da copyright senza autorizzazione è illegale e vietato</p>
+                    
+                    <strong>RESPONSABILITÀ:</strong>
+                    <p>Il creatore e i contributori di questo progetto non sono responsabili dell'uso improprio del software, dei contenuti accessibili tramite liste fornite dall'utente, non forniscono supporto per attività illegali o violazioni del copyright e declinano ogni responsabilità per danni diretti, indiretti o conseguenti.</p>
+                    
+                    <p>Utilizzando questo software, l'utente accetta integralmente questi termini e si assume la piena responsabilità legale del proprio utilizzo.</p>
+                </div>
+            </div>
+        </section>
+
+        <section class="config-panel" aria-label="Configurazione addon">
+            <div class="panel-head">
+                <div>
+                    <h2>Configura il tuo addon</h2>
+                    <p>Il link contiene tutte le impostazioni: liste, gruppi e guida TV.</p>
+                </div>
+                <div class="step-badge">01</div>
+            </div>
+
+            <form id="configForm" class="form-grid">
+                <div class="playlist-manager">
+                    <div class="playlist-head">
+                        <div>
+                            <strong>Liste canali</strong>
+                            <span>Aggiungi una o piu playlist. Ogni nome lista puo diventare una sezione del catalogo.</span>
+                        </div>
+                    </div>
+                    <div id="playlistList" class="playlist-list"></div>
+                    <div class="playlist-actions">
+                        <button type="button" id="addListButton" class="add-list-button">Aggiungi lista</button>
+                        <button type="button" id="analyzeButton" class="analyze-button">Analizza gruppi da tutte le liste</button>
+                    </div>
+                </div>
+
+                <div class="field">
+                    <label for="epgUrl">URL guida TV <small>opzionale</small></label>
+                    <input type="url" id="epgUrl" placeholder="https://example.com/epg.xml" autocomplete="url">
+                </div>
+
+                <div class="field">
+                    <label for="groups">Gruppi canali <small>separati da virgola</small></label>
+                    <input type="text" id="groups" placeholder="Cinema, Sport, Documentari" autocomplete="off">
+                </div>
+
+                <div id="groupAssistant" class="group-assistant" aria-live="polite">
+                    <div class="assistant-head">
+                        <div>
+                            <strong id="analysisTitle">Gruppi individuati</strong>
+                            <span id="analysisSummary">Seleziona i gruppi da pubblicare nel catalogo Stremio.</span>
+                        </div>
+                    </div>
+                    <div id="groupOptions" class="group-options"></div>
+                    <div class="assistant-actions">
+                        <button type="button" id="insertGroupsButton" class="insert-groups-button">Inserisci gruppi selezionati</button>
+                        <button type="button" id="selectAllGroupsButton" class="ghost-button" title="Seleziona tutti" aria-label="Seleziona tutti">Tutti</button>
+                    </div>
+                </div>
+
+                <div class="actions">
+                    <button type="submit" class="generate-button">Genera setup K.R.O.N.O.S.</button>
+                    <button type="button" id="resetButton" class="ghost-button" title="Pulisci campi" aria-label="Pulisci campi">Reset</button>
+                </div>
+            </form>
+
+            <div class="preview" aria-live="polite">
+                <div class="preview-head">
+                    <div>
+                        <strong>Anteprima configurazione</strong>
+                        <span id="previewHint">Inserisci una lista M3U per abilitare il setup.</span>
+                    </div>
+                    <div id="health" class="health">In attesa</div>
+                </div>
+                <div class="preview-body">
+                    <div class="preview-item">
+                        <b id="playlistState">0</b>
+                        <span>Sorgenti playlist pronte</span>
+                    </div>
+                    <div class="preview-item">
+                        <b id="epgState">No</b>
+                        <span>Guida TV collegata</span>
+                    </div>
+                </div>
+                <div id="chips" class="chips">
+                    <span class="chip">Tutti i gruppi</span>
+                </div>
+            </div>
+
+            <div id="resultSection" class="result" aria-live="polite">
+                <div class="result-copy">
+                    <strong>Setup generato con successo.</strong>
+                    <span id="manifestText">Il link di installazione apparira qui.</span>
+                </div>
+                <div id="localWarning" class="local-warning">
+                    Stai usando localhost: funziona solo se Stremio gira sullo stesso PC. Da Stremio Web, Android TV o un altro dispositivo serve un URL raggiungibile in rete.
+                </div>
+                <div class="result-actions">
+                    <a id="stremioLink" href="#" class="stremio-button">Installa in Stremio</a>
+                    <button type="button" id="copyButton" class="copy-button" title="Copia link manifest" aria-label="Copia link manifest">Copia</button>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <div id="toast" class="toast" role="status" aria-live="polite">Link copiato negli appunti</div>
+
+    <script>
+        // Gestione Disclaimer
+        const disclaimerPanel = document.getElementById('disclaimerPanel');
+        const disclaimerToggle = disclaimerPanel.querySelector('.disclaimer-toggle');
+        
+        // Carica stato disclaimer da localStorage
+        const disclaimerState = localStorage.getItem('kronos_disclaimer_open');
+        if (disclaimerState === 'false') {
+            disclaimerPanel.classList.remove('is-open');
+            disclaimerToggle.setAttribute('aria-expanded', 'false');
+        }
+        
+        // Funzione per toggle del disclaimer
+        function toggleDisclaimer() {
+            const isOpen = disclaimerPanel.classList.toggle('is-open');
+            disclaimerToggle.setAttribute('aria-expanded', isOpen);
+            localStorage.setItem('kronos_disclaimer_open', isOpen);
+        }
+        
+        // Toggle disclaimer con click (su tutto il toggle)
+        disclaimerToggle.addEventListener('click', toggleDisclaimer);
+        
+        // Toggle disclaimer con tastiera (Enter o Space)
+        disclaimerToggle.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                toggleDisclaimer();
+            }
+        });
+        
+        // Form e configurazione
+        const form = document.getElementById('configForm');
+        const playlistList = document.getElementById('playlistList');
+        const addListButton = document.getElementById('addListButton');
+        const analyzeButton = document.getElementById('analyzeButton');
+        const epgUrl = document.getElementById('epgUrl');
+        const groups = document.getElementById('groups');
+        const groupAssistant = document.getElementById('groupAssistant');
+        const analysisTitle = document.getElementById('analysisTitle');
+        const analysisSummary = document.getElementById('analysisSummary');
+        const groupOptions = document.getElementById('groupOptions');
+        const insertGroupsButton = document.getElementById('insertGroupsButton');
+        const selectAllGroupsButton = document.getElementById('selectAllGroupsButton');
+        const resultSection = document.getElementById('resultSection');
+        const stremioLink = document.getElementById('stremioLink');
+        const manifestText = document.getElementById('manifestText');
+        const localWarning = document.getElementById('localWarning');
+        const copyButton = document.getElementById('copyButton');
+        const resetButton = document.getElementById('resetButton');
+        const toast = document.getElementById('toast');
+        const health = document.getElementById('health');
+        const previewHint = document.getElementById('previewHint');
+        const playlistState = document.getElementById('playlistState');
+        const epgState = document.getElementById('epgState');
+        const chips = document.getElementById('chips');
+
+        let currentManifestUrl = '';
+        let analysisData = null;
+        let analysisSignature = '';
+        let groupsInsertedFromAnalysis = false;
+
+        function parseGroups() {
+            return groups.value.split(',').map(item => item.trim()).filter(Boolean);
+        }
+
+        function normalizeGroupName(group) {
+            return String(group || '').trim().toLowerCase();
+        }
+
+        function getPlaylistRows() {
+            return [...playlistList.querySelectorAll('.playlist-row')];
+        }
+
+        function getLists() {
+            return getPlaylistRows().map((row, index) => {
+                const name = row.querySelector('[data-list-name]').value.trim() || `Lista ${index + 1}`;
+                const url = row.querySelector('[data-list-url]').value.trim();
+                return { n: name, u: url };
+            }).filter(list => list.u);
+        }
+
+        function getListSignature(lists = getLists()) {
+            return JSON.stringify(lists.map(list => ({ n: list.n, u: list.u })));
+        }
+
+        function createPlaylistRow(data = {}) {
+            const row = document.createElement('div');
+            row.className = 'playlist-row';
+            row.innerHTML = `
+                <div class="field">
+                    <label>Nome lista <small>nome catalogo</small></label>
+                    <input type="text" data-list-name placeholder="Lista 1" autocomplete="off">
+                </div>
+                <div class="field">
+                    <label>URL lista M3U <small>obbligatorio</small></label>
+                    <input type="url" data-list-url required placeholder="https://example.com/lista.m3u" autocomplete="url">
+                </div>
+                <button type="button" class="playlist-remove" title="Rimuovi lista" aria-label="Rimuovi lista">X</button>
+            `;
+
+            row.querySelector('[data-list-name]').value = data.n || `Lista ${getPlaylistRows().length + 1}`;
+            row.querySelector('[data-list-url]').value = data.u || '';
+            row.querySelector('.playlist-remove').addEventListener('click', function() {
+                if (getPlaylistRows().length === 1) {
+                    row.querySelector('[data-list-url]').value = '';
+                    row.querySelector('[data-list-name]').value = 'Lista 1';
+                } else {
+                    row.remove();
+                }
+                resetAnalysisState();
+                updatePreview();
+            });
+
+            row.querySelectorAll('input').forEach(input => {
+                input.addEventListener('input', function() {
+                    resetAnalysisState();
+                    updatePreview();
+                });
+                input.addEventListener('change', updatePreview);
+            });
+
+            playlistList.appendChild(row);
+            return row;
+        }
+
+        function resetAnalysisState() {
+            analysisData = null;
+            analysisSignature = '';
+            groupsInsertedFromAnalysis = false;
+            groupAssistant.classList.remove('is-visible');
+            groupOptions.innerHTML = '';
+        }
+
+        async function fetchAnalysis() {
+            const lists = getLists();
+            const firstEmptyUrl = getPlaylistRows().find(row => !row.querySelector('[data-list-url]').value.trim());
+            if (!lists.length || firstEmptyUrl) {
+                firstEmptyUrl?.querySelector('[data-list-url]').reportValidity();
+                return null;
+            }
+
+            analyzeButton.disabled = true;
+            analyzeButton.textContent = 'Analisi...';
+
+            try {
+                const response = await fetch('/api/analyze-lists', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ lists })
+                });
+
+                if (!response.ok) throw new Error('analysis_failed');
+
+                analysisData = await response.json();
+                analysisSignature = getListSignature(lists);
+                renderAnalysis();
+                return analysisData;
+            } catch (err) {
+                showToast('Non ho potuto analizzare queste liste');
+                return null;
+            } finally {
+                analyzeButton.disabled = false;
+                analyzeButton.textContent = 'Analizza gruppi da tutte le liste';
+            }
+        }
+
+        function renderAnalysis() {
+            const totalGroups = analysisData.groups.length;
+            analysisTitle.textContent = `${totalGroups} gruppi individuati`;
+            analysisSummary.textContent = `${analysisData.totalChannels} canali letti da ${analysisData.totalLists} liste. I canali aggregati includeranno il nome lista tra parentesi.`;
+            groupOptions.innerHTML = '';
+
+            analysisData.groups.forEach((group, index) => {
+                const label = document.createElement('label');
+                label.className = 'group-option';
+
+                const input = document.createElement('input');
+                input.type = 'checkbox';
+                input.value = group.name;
+                input.checked = index < 8;
+
+                const name = document.createElement('span');
+                name.textContent = group.name;
+
+                const count = document.createElement('small');
+                count.textContent = `${group.count} canali`;
+
+                label.append(input, name, count);
+                groupOptions.appendChild(label);
+            });
+
+            groupAssistant.classList.add('is-visible');
+        }
+
+        function getSelectedAnalyzedGroups() {
+            return [...groupOptions.querySelectorAll('input:checked')].map(input => input.value);
+        }
+
+        function setGroupsFromAnalysis() {
+            const selectedGroups = getSelectedAnalyzedGroups();
+            if (!selectedGroups.length) {
+                showToast('Seleziona almeno un gruppo individuato');
+                return;
+            }
+
+            groups.value = selectedGroups.join(', ');
+            groupsInsertedFromAnalysis = true;
+            updatePreview();
+            showToast('Gruppi inseriti');
+        }
+
+        function getConfig() {
+            const lists = getLists();
+            return {
+                l: lists,
+                u: lists[0]?.u || '',
+                e: epgUrl.value.trim() || null,
+                g: parseGroups(),
+                gm: groupsInsertedFromAnalysis ? 'filter' : 'list'
+            };
+        }
+
+        function updatePreview() {
+            const config = getConfig();
+            const ready = Boolean(config.l.length);
+            const groupList = config.g.length ? config.g : config.l.map(list => list.n);
+
+            playlistState.textContent = String(config.l.length);
+            epgState.textContent = config.e ? 'Si' : 'No';
+            health.textContent = ready ? 'Pronto' : 'In attesa';
+            health.classList.toggle('ready', ready);
+            previewHint.textContent = ready
+                ? 'Il manifest includera liste, filtri e opzioni selezionate.'
+                : 'Inserisci almeno una lista M3U per abilitare il setup.';
+
+            chips.innerHTML = '';
+            const visibleGroups = groupList.length ? groupList : ['Tutti i gruppi'];
+            visibleGroups.slice(0, 7).forEach(group => {
+                const chip = document.createElement('span');
+                chip.className = 'chip';
+                chip.textContent = group;
+                chips.appendChild(chip);
+            });
+            if (visibleGroups.length > 7) {
+                const chip = document.createElement('span');
+                chip.className = 'chip';
+                chip.textContent = `+${visibleGroups.length - 7} altri`;
+                chips.appendChild(chip);
+            }
+        }
+
+        function showToast(message) {
+            toast.textContent = message;
+            toast.classList.add('is-visible');
+            window.clearTimeout(showToast.timer);
+            showToast.timer = window.setTimeout(() => toast.classList.remove('is-visible'), 1800);
+        }
+
+        function getStremioInstallUrl(url) {
+            const parsed = new URL(url);
+            if (parsed.protocol === 'http:' && parsed.hostname === 'localhost') {
+                parsed.hostname = '127.0.0.1';
+            }
+            return `stremio://${parsed.host}${parsed.pathname}${parsed.search}`;
+        }
+
+        function toBase64Url(value) {
+            return btoa(unescape(encodeURIComponent(value)))
+                .replace(/\+/g, '-')
+                .replace(/\//g, '_')
+                .replace(/=+$/g, '');
+        }
+
+        function fromBase64Url(value) {
+            const normalized = String(value || '')
+                .replace(/-/g, '+')
+                .replace(/_/g, '/');
+            const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '=');
+            return decodeURIComponent(escape(atob(padded)));
+        }
+
+        function getListsFromConfig(config) {
+            if (Array.isArray(config.l) && config.l.length) {
+                return config.l
+                    .map((list, index) => ({
+                        n: list.n || `Lista ${index + 1}`,
+                        u: list.u || ''
+                    }))
+                    .filter(list => list.u);
+            }
+
+            return config.u ? [{ n: config.ln || 'Lista 1', u: config.u }] : [];
+        }
+
+        function setCurrentManifestFromToken(token) {
+            currentManifestUrl = `${window.location.origin}/${token}/manifest.json`;
+            stremioLink.href = getStremioInstallUrl(currentManifestUrl);
+            stremioLink.textContent = 'Installa in Stremio';
+            manifestText.textContent = currentManifestUrl;
+            localWarning.classList.toggle('is-visible', ['localhost', '127.0.0.1'].includes(window.location.hostname));
+            resultSection.classList.add('is-visible');
+        }
+
+        function applyConfig(config, token = '') {
+            const lists = getListsFromConfig(config);
+            playlistList.innerHTML = '';
+            (lists.length ? lists : [{ n: 'Lista 1', u: '' }]).forEach(createPlaylistRow);
+
+            epgUrl.value = config.e || '';
+            groups.value = Array.isArray(config.g) ? config.g.join(', ') : '';
+            groupsInsertedFromAnalysis = config.gm === 'filter';
+            analysisSignature = groupsInsertedFromAnalysis ? getListSignature(lists) : '';
+            groupAssistant.classList.remove('is-visible');
+            groupOptions.innerHTML = '';
+
+            if (token) {
+                setCurrentManifestFromToken(token);
+            }
+
+            updatePreview();
+        }
+
+        function loadConfigFromUrl() {
+            const token = new URLSearchParams(window.location.search).get('config');
+            if (!token) return false;
+
+            try {
+                applyConfig(JSON.parse(fromBase64Url(token)), token);
+                showToast('Settaggi caricati');
+                return true;
+            } catch (err) {
+                showToast('Non ho potuto caricare i settaggi');
+                return false;
+            }
+        }
+
+        async function prepareConfigForSubmit() {
+            const config = getConfig();
+
+            if (!config.l.length) {
+                const firstUrl = getPlaylistRows()[0]?.querySelector('[data-list-url]');
+                firstUrl?.reportValidity();
+                return null;
+            }
+
+            if (!config.g.length) {
+                config.gm = 'list';
+                config.g = config.l.map(list => list.n);
+                return config;
+            }
+
+            if (groupsInsertedFromAnalysis && analysisSignature === getListSignature(config.l)) {
+                config.gm = 'filter';
+                return config;
+            }
+
+            if (config.g.length === 1) {
+                config.gm = 'bucket';
+                return config;
+            }
+
+            const analyzed = analysisSignature === getListSignature(config.l) && analysisData ? analysisData : await fetchAnalysis();
+            if (!analyzed) {
+                config.gm = 'bucket';
+                config.g = [config.g[0]];
+                showToast('Filtro non verificato: includo tutto nel primo gruppo');
+                return config;
+            }
+
+            const realGroups = new Map(analyzed.groups.map(group => [normalizeGroupName(group.name), group.name]));
+            const matchedGroups = config.g.map(group => realGroups.get(normalizeGroupName(group))).filter(Boolean);
+
+            if (matchedGroups.length === config.g.length) {
+                config.g = matchedGroups;
+                config.gm = 'filter';
+                return config;
+            }
+
+            config.gm = 'bucket';
+            config.g = [config.g[0]];
+            showToast('Non ho potuto filtrare: includo tutto nel primo gruppo');
+            return config;
+        }
+
+        form.addEventListener('submit', async function(e) {
+            e.preventDefault();
+
+            const config = await prepareConfigForSubmit();
+            if (!config) return;
+
+            const base64Config = toBase64Url(JSON.stringify(config));
+            currentManifestUrl = `${window.location.origin}/${base64Config}/manifest.json`;
+
+            stremioLink.href = getStremioInstallUrl(currentManifestUrl);
+            stremioLink.textContent = 'Installa in Stremio';
+            manifestText.textContent = currentManifestUrl;
+            localWarning.classList.toggle('is-visible', ['localhost', '127.0.0.1'].includes(window.location.hostname));
+            resultSection.classList.add('is-visible');
+            resultSection.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        });
+
+        copyButton.addEventListener('click', async function() {
+            if (!currentManifestUrl) return;
+
+            try {
+                await navigator.clipboard.writeText(currentManifestUrl);
+                showToast('Link manifest copiato');
+            } catch (err) {
+                showToast('Copia non disponibile in questo browser');
+            }
+        });
+
+        resetButton.addEventListener('click', function() {
+            form.reset();
+            currentManifestUrl = '';
+            playlistList.innerHTML = '';
+            createPlaylistRow({ n: 'Lista 1', u: '' });
+            resetAnalysisState();
+            resultSection.classList.remove('is-visible');
+            updatePreview();
+            playlistList.querySelector('[data-list-url]').focus();
+        });
+
+        addListButton.addEventListener('click', function() {
+            createPlaylistRow();
+            updatePreview();
+            playlistList.lastElementChild.querySelector('[data-list-name]').focus();
+        });
+        analyzeButton.addEventListener('click', fetchAnalysis);
+        insertGroupsButton.addEventListener('click', setGroupsFromAnalysis);
+        selectAllGroupsButton.addEventListener('click', function() {
+            groupOptions.querySelectorAll('input').forEach(input => input.checked = true);
+        });
+
+        groups.addEventListener('input', function() {
+            groupsInsertedFromAnalysis = false;
+        });
+
+        [epgUrl, groups].forEach(element => {
+            element.addEventListener('input', updatePreview);
+            element.addEventListener('change', updatePreview);
+        });
+
+        if (!loadConfigFromUrl()) {
+            createPlaylistRow({ n: 'Lista 1', u: '' });
+            updatePreview();
+        }
+    </script>
+</body>
+</html>
