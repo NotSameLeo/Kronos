@@ -36,6 +36,7 @@ const memoryCache = {
     segmentPrefetchQueue: [],
     segmentPrefetchActive: 0,
     segmentCacheBytes: 0,
+    startupSourceRefresh: {},
     playbackStates: {},
     activeSessions: {},
     sessionCloseTimers: {},
@@ -54,6 +55,7 @@ const STREAM_ACQUIRE_POLL_MS = Number(process.env.STREAM_ACQUIRE_POLL_MS || 1000
 const STREAM_PREBUFFER_SECONDS = Number(process.env.STREAM_PREBUFFER_SECONDS || 30);
 const STREAM_PREBUFFER_TIMEOUT = Number(process.env.STREAM_PREBUFFER_TIMEOUT || 70000);
 const STREAM_PREBUFFER_POLL_MS = Number(process.env.STREAM_PREBUFFER_POLL_MS || 1200);
+const STREAM_WARM_REUSE_TTL_MS = Number(process.env.STREAM_WARM_REUSE_TTL_MS || 120000);
 const DYNAMIC_BUFFER_TARGET_SECONDS = Number(process.env.DYNAMIC_BUFFER_TARGET_SECONDS || 70);
 const DYNAMIC_BUFFER_MAX_SECONDS = Number(process.env.DYNAMIC_BUFFER_MAX_SECONDS || 90);
 const LIVE_BUFFER_SEGMENTS = Number(process.env.LIVE_BUFFER_SEGMENTS || 36);
@@ -68,6 +70,8 @@ const SEGMENT_PREFETCH_CONCURRENCY = Number(process.env.SEGMENT_PREFETCH_CONCURR
 const SEGMENT_PREFETCH_AHEAD = Number(process.env.SEGMENT_PREFETCH_AHEAD || 14);
 const SEGMENT_PREFETCH_FAILURE_COOLDOWN_MS = Number(process.env.SEGMENT_PREFETCH_FAILURE_COOLDOWN_MS || 60000);
 const SEGMENT_WAIT_FOR_PREFETCH_MS = Number(process.env.SEGMENT_WAIT_FOR_PREFETCH_MS || 3000);
+const STARTUP_SOURCE_REFRESH_ERRORS = Number(process.env.STARTUP_SOURCE_REFRESH_ERRORS || 4);
+const STARTUP_SOURCE_REFRESH_COOLDOWN_MS = Number(process.env.STARTUP_SOURCE_REFRESH_COOLDOWN_MS || 30000);
 const PLAYER_SEGMENT_SLOW_MS = Number(process.env.PLAYER_SEGMENT_SLOW_MS || 2500);
 const PLAYER_SEGMENT_GAP_WARN_MS = Number(process.env.PLAYER_SEGMENT_GAP_WARN_MS || 30000);
 const PLAYER_SESSION_IDLE_RESET_MS = Number(process.env.PLAYER_SESSION_IDLE_RESET_MS || 60000);
@@ -232,12 +236,12 @@ function getConfiguredLists(config) {
     }].filter(list => list.url);
 }
 
-async function fetchPlaylist(sourceUrl) {
+async function fetchPlaylist(sourceUrl, options = {}) {
     console.log('[FETCH PLAYLIST] Attempting to fetch:', sourceUrl);
     
     try {
         const response = await axios.get(sourceUrl, {
-            timeout: 60000,
+            timeout: options.timeout || 60000,
             maxRedirects: 5,
             headers: {
                 "User-Agent": UPSTREAM_UA,
@@ -418,7 +422,7 @@ function activatePlaybackSession(req, channel) {
         lastSeenAt: now
     };
 
-    resetStreamRuntimeForSource(session.sourceUrl, channelName, "new-session");
+    prepareStreamRuntimeForNewSession(session.sourceUrl, channelName);
     memoryCache.activeSessions[key] = session;
     delete memoryCache.playbackStates[key];
 
@@ -593,6 +597,41 @@ function resetStreamRuntimeForSource(sourceUrl, label = "stream", reason = "rese
     }
 }
 
+function getWarmStreamRuntimeInfo(sourceUrl) {
+    const buffer = getLiveBuffer(sourceUrl);
+    if (!buffer?.segments?.length || !buffer.lastUpdated) {
+        return { reusable: false, ageMs: Infinity, cachedSeconds: 0, segmentCount: 0 };
+    }
+
+    const ageMs = Date.now() - buffer.lastUpdated;
+    const cachedSeconds = getCachedDurationForSegments(buffer.segments);
+    return {
+        reusable: ageMs <= STREAM_WARM_REUSE_TTL_MS && cachedSeconds > 0,
+        ageMs,
+        cachedSeconds,
+        segmentCount: buffer.segments.length
+    };
+}
+
+function prepareStreamRuntimeForNewSession(sourceUrl, label = "stream") {
+    const warm = getWarmStreamRuntimeInfo(sourceUrl);
+    if (warm.reusable) {
+        console.log(
+            `[STREAM WARM REUSE] channel="${label}"` +
+            ` age=${warm.ageMs}ms` +
+            ` cached=${formatSeconds(warm.cachedSeconds)}` +
+            ` segs=${warm.segmentCount}`
+        );
+        return;
+    }
+
+    resetStreamRuntimeForSource(
+        sourceUrl,
+        label,
+        Number.isFinite(warm.ageMs) ? `new-session-stale:${warm.ageMs}ms` : "new-session"
+    );
+}
+
 function getHLSCacheKey(sourceUrl) {
     return `hls:${hashKey(sourceUrl)}`;
 }
@@ -634,6 +673,11 @@ function getHLSRefreshTTL(info) {
         return Math.max(1000, Math.min(HLS_REFRESH_TTL, Math.floor(info.targetDuration * 500)));
     }
     return HLS_REFRESH_TTL;
+}
+
+function isAcceptableStartupHLS(info) {
+    if (info?.isMaster) return true;
+    return Boolean(info?.isLive && info.segmentCount > 0);
 }
 
 function extractSegmentIdentityFromUrl(value) {
@@ -860,7 +904,13 @@ async function getCachedHLSRaw(sourceUrl, context = {}) {
     } catch (err) {
         if (cached?.playlist && now - cached.updatedAt <= HLS_STALE_TTL) {
             console.error("[HLS STALE FALLBACK]", err.message);
-            return { ...cached, cacheStatus: "stale-fallback", age: now - cached.updatedAt };
+            return {
+                ...cached,
+                cacheStatus: "stale-fallback",
+                age: now - cached.updatedAt,
+                staleError: err.message,
+                staleStatus: err.response?.status || null
+            };
         }
         throw err;
     }
@@ -1261,6 +1311,8 @@ async function acquireInitialHLS(sourceUrl, label = "stream", context = {}) {
     const started = Date.now();
     let lastErr = null;
     let fetches = 0;
+    let refreshableErrors = 0;
+    let currentSourceUrl = getStartupSourceUrl(sourceUrl, context);
 
     console.log(
         `[STARTUP PHASE 1] channel="${label}" acquiring-stream` +
@@ -1273,11 +1325,13 @@ async function acquireInitialHLS(sourceUrl, label = "stream", context = {}) {
         fetches += 1;
 
         try {
-            const hls = await fetchAndStoreHLSRaw(getHLSCacheKey(sourceUrl), sourceUrl, "acquire", context);
+            currentSourceUrl = getStartupSourceUrl(currentSourceUrl, context);
+            const hls = await fetchAndStoreHLSRaw(getHLSCacheKey(currentSourceUrl), currentSourceUrl, "acquire", context);
             assertStartupContextActive(context, label);
             const info = hls.info || analyzeHLSPlaylist(hls.playlist);
 
-            if (info.isMaster || info.segmentCount > 0) {
+            if (isAcceptableStartupHLS(info)) {
+                refreshableErrors = 0;
                 console.log(
                     `[STARTUP PHASE 1 OK] channel="${label}" acquired` +
                     ` fetches=${fetches}` +
@@ -1289,17 +1343,36 @@ async function acquireInitialHLS(sourceUrl, label = "stream", context = {}) {
                 return hls;
             }
 
-            lastErr = new Error("Playlist valid but without playable segments");
+            refreshableErrors = 0;
+            lastErr = new Error(
+                info.segmentCount > 0
+                    ? "Playlist has segments but is not a live startup manifest"
+                    : "Playlist valid but without playable segments"
+            );
         } catch (err) {
             if (err.code === "KRONOS_SESSION_CANCELLED") throw err;
             assertStartupContextActive(context, label);
             lastErr = err;
+            refreshableErrors = isStartupSourceRefreshableError(err) ? refreshableErrors + 1 : 0;
             const elapsed = Date.now() - started;
             console.error(
                 `[STARTUP PHASE 1 RETRY] channel="${label}" fetch=${fetches}` +
                 ` elapsed=${elapsed}ms remaining=${Math.max(0, STREAM_ACQUIRE_TIMEOUT - elapsed)}ms` +
                 ` err=${err.message}`
             );
+
+            if (refreshableErrors >= STARTUP_SOURCE_REFRESH_ERRORS) {
+                const refreshedUrl = await refreshStartupChannelSource(
+                    context,
+                    currentSourceUrl,
+                    label,
+                    err.response?.status ? `status-${err.response.status}` : err.message
+                );
+                if (refreshedUrl !== currentSourceUrl) {
+                    currentSourceUrl = refreshedUrl;
+                    refreshableErrors = 0;
+                }
+            }
         }
 
         await sleep(Math.min(STREAM_ACQUIRE_POLL_MS, Math.max(0, STREAM_ACQUIRE_TIMEOUT - (Date.now() - started))));
@@ -1311,6 +1384,7 @@ async function acquireInitialHLS(sourceUrl, label = "stream", context = {}) {
 
 async function prebufferInitialStream(sourceUrl, label = "stream", context = {}) {
     const started = Date.now();
+    let currentSourceUrl = getStartupSourceUrl(sourceUrl, context);
 
     console.log(
         `[STARTUP PHASE 2] channel="${label}" prebuffering` +
@@ -1322,18 +1396,23 @@ async function prebufferInitialStream(sourceUrl, label = "stream", context = {})
 
     let lastErr = null;
     let attempt = 0;
+    let refreshableErrors = 0;
 
     while (Date.now() - started < STREAM_PREBUFFER_TIMEOUT) {
         assertStartupContextActive(context, label);
         attempt += 1;
 
         try {
-            const hls = await getCachedHLSRaw(sourceUrl, context);
+            currentSourceUrl = getStartupSourceUrl(currentSourceUrl, context);
+            const hls = await getCachedHLSRaw(currentSourceUrl, context);
             assertStartupContextActive(context, label);
-            const buffered = updateLiveBufferFromPlaylist(sourceUrl, hls.playlist, hls.baseUrl, context);
+            const buffered = updateLiveBufferFromPlaylist(currentSourceUrl, hls.playlist, hls.baseUrl, context);
             const candidates = (buffered.segments || []).slice(-SEGMENT_PREFETCH_AHEAD);
 
             const cachedSeconds = getCachedDurationForSegments(candidates);
+            refreshableErrors = hls.cacheStatus === "stale-fallback" && isStartupSourceRefreshableError(hls)
+                ? refreshableErrors + 1
+                : 0;
             console.log(
                 `[STARTUP PHASE 2 PROGRESS] channel="${label}"` +
                 ` cache=${hls.cacheStatus || "refresh"}` +
@@ -1355,15 +1434,42 @@ async function prebufferInitialStream(sourceUrl, label = "stream", context = {})
                 return { status: "ready", cachedSeconds };
             }
 
+            if (refreshableErrors >= STARTUP_SOURCE_REFRESH_ERRORS) {
+                const refreshedUrl = await refreshStartupChannelSource(
+                    context,
+                    currentSourceUrl,
+                    label,
+                    hls.staleStatus ? `status-${hls.staleStatus}` : hls.staleError || "stale-fallback"
+                );
+                if (refreshedUrl !== currentSourceUrl) {
+                    currentSourceUrl = refreshedUrl;
+                    refreshableErrors = 0;
+                }
+            }
+
             lastErr = null;
         } catch (err) {
             if (err.code === "KRONOS_SESSION_CANCELLED") throw err;
             assertStartupContextActive(context, label);
             lastErr = err;
+            refreshableErrors = isStartupSourceRefreshableError(err) ? refreshableErrors + 1 : 0;
             console.warn(
                 `[STARTUP PHASE 2 RETRY] channel="${label}" attempt=${attempt}` +
                 ` err=${err.message} elapsed=${Date.now() - started}ms - continuing until timeout`
             );
+
+            if (refreshableErrors >= STARTUP_SOURCE_REFRESH_ERRORS) {
+                const refreshedUrl = await refreshStartupChannelSource(
+                    context,
+                    currentSourceUrl,
+                    label,
+                    err.response?.status ? `status-${err.response.status}` : err.message
+                );
+                if (refreshedUrl !== currentSourceUrl) {
+                    currentSourceUrl = refreshedUrl;
+                    refreshableErrors = 0;
+                }
+            }
         }
 
         await sleep(STREAM_PREBUFFER_POLL_MS);
@@ -1377,7 +1483,8 @@ async function prebufferInitialStream(sourceUrl, label = "stream", context = {})
 }
 
 async function ensureStreamReady(sourceUrl, label = "stream", context = {}) {
-    const cacheKey = getHLSCacheKey(sourceUrl);
+    const startupSourceUrl = getStartupSourceUrl(sourceUrl, context);
+    const cacheKey = getHLSCacheKey(startupSourceUrl);
     let state = memoryCache.streamStates[cacheKey];
 
     if (!state) {
@@ -1385,13 +1492,20 @@ async function ensureStreamReady(sourceUrl, label = "stream", context = {}) {
         memoryCache.streamStates[cacheKey] = state;
     }
 
-    const buffer = getLiveBuffer(sourceUrl);
-    if (state.status === "ready" && getCachedDurationForSegments(buffer?.segments || []) >= STREAM_PREBUFFER_SECONDS) {
+    const buffer = getLiveBuffer(startupSourceUrl);
+    const cachedBufferSeconds = getCachedDurationForSegments(buffer?.segments || []);
+    if (!state.promise && cachedBufferSeconds >= STREAM_PREBUFFER_SECONDS) {
+        state.status = "ready";
+        state.readyAt = Date.now();
+        state.lastError = null;
+    }
+
+    if (state.status === "ready" && cachedBufferSeconds >= STREAM_PREBUFFER_SECONDS) {
         assertSessionActive(context.session, label);
         queueDynamicPrefetchForBuffer(buffer, context);
         console.log(
             `[STARTUP REUSE] channel="${label}" ready-cache` +
-            ` cached=${formatSeconds(getCachedDurationForSegments(buffer?.segments || []))}`
+            ` cached=${formatSeconds(cachedBufferSeconds)}`
         );
         return { status: "ready", reused: true };
     }
@@ -1407,7 +1521,7 @@ async function ensureStreamReady(sourceUrl, label = "stream", context = {}) {
     state.lastError = null;
     state.promise = (async () => {
         try {
-            const initial = await acquireInitialHLS(sourceUrl, label, context);
+            const initial = await acquireInitialHLS(startupSourceUrl, label, context);
             assertSessionActive(context.session, label);
             if (initial.info?.isMaster) {
                 state.status = "ready";
@@ -1416,7 +1530,7 @@ async function ensureStreamReady(sourceUrl, label = "stream", context = {}) {
                 return { status: "ready", master: true };
             }
             state.status = "prebuffering";
-            const ready = await prebufferInitialStream(sourceUrl, label, context);
+            const ready = await prebufferInitialStream(getStartupSourceUrl(startupSourceUrl, context), label, context);
             assertSessionActive(context.session, label);
             state.status = "ready";
             state.readyAt = Date.now();
@@ -1429,10 +1543,11 @@ async function ensureStreamReady(sourceUrl, label = "stream", context = {}) {
             setImmediate(async () => {
                 try {
                     await sleep(400);
-                    const hls = await getCachedHLSRaw(sourceUrl);
-                    const buffer = getLiveBuffer(sourceUrl);
+                    const postWarmSourceUrl = getStartupSourceUrl(startupSourceUrl, context);
+                    const hls = await getCachedHLSRaw(postWarmSourceUrl);
+                    const buffer = getLiveBuffer(postWarmSourceUrl);
                     if (buffer) {
-                        updateLiveBufferFromPlaylist(sourceUrl, hls.playlist, hls.baseUrl);
+                        updateLiveBufferFromPlaylist(postWarmSourceUrl, hls.playlist, hls.baseUrl);
                         queueDynamicPrefetchForBuffer(buffer, { label });
                     }
                     console.log(`[STARTUP POST-WARM] channel="${label}" cache refreshed after startup`);
@@ -1765,6 +1880,128 @@ async function getChannelsFromCache(configKey, config) {
     return cachedData;
 }
 
+function getStartupSourceUrl(defaultSourceUrl, context = {}) {
+    return context.sourceRef?.value || context.channel?.url || defaultSourceUrl;
+}
+
+function setStartupSourceUrl(context = {}, nextUrl) {
+    if (!nextUrl) return;
+    if (context.sourceRef) context.sourceRef.value = nextUrl;
+    if (context.channel) context.channel.url = nextUrl;
+    if (context.session) context.session.sourceUrl = nextUrl;
+}
+
+function getRefreshChannelName(value) {
+    return normalizeSearchText(
+        stripInitialCountryPrefix(value)
+            .replace(/\s*\([a-z0-9]{1,5}\)\s*$/gi, "")
+            .trim()
+    );
+}
+
+function matchesRefreshChannel(candidate, channel) {
+    if (!candidate || !channel) return false;
+    if (candidate.sourceName !== channel.sourceName) return false;
+
+    const candidateTvg = normalizeSearchText(candidate.tvgId);
+    const channelTvg = normalizeSearchText(channel.tvgId);
+    if (candidateTvg && channelTvg && candidateTvg === channelTvg) return true;
+
+    const candidateName = getRefreshChannelName(candidate.name);
+    const channelName = getRefreshChannelName(channel.name);
+    if (!candidateName || candidateName !== channelName) return false;
+
+    const candidateGroup = normalizeGroupName(candidate.group);
+    const channelGroup = normalizeGroupName(channel.group);
+    return !candidateGroup || !channelGroup || candidateGroup === channelGroup;
+}
+
+function isStartupSourceRefreshableError(err = {}) {
+    const status = err.response?.status || err.status || err.staleStatus || null;
+    const message = String(err.message || err.staleError || "");
+    return (
+        status === 401 ||
+        status === 403 ||
+        status === 404 ||
+        status === 410 ||
+        /Invalid HLS manifest/i.test(message)
+    );
+}
+
+async function refreshStartupChannelSource(context = {}, currentSourceUrl, label = "stream", reason = "startup-error") {
+    const { configKey, config, channel } = context;
+    if (!configKey || !config || !channel) return currentSourceUrl;
+
+    const key = `${configKey}:${channel.id || hashKey(channel.name || label)}`;
+    const now = Date.now();
+    const refreshState = memoryCache.startupSourceRefresh[key];
+    if (refreshState?.until && refreshState.until > now) {
+        console.log(
+            `[STARTUP SOURCE REFRESH SKIP] channel="${label}"` +
+            ` reason=cooldown remaining=${refreshState.until - now}ms`
+        );
+        return currentSourceUrl;
+    }
+
+    memoryCache.startupSourceRefresh[key] = {
+        until: now + STARTUP_SOURCE_REFRESH_COOLDOWN_MS,
+        lastReason: reason,
+        lastAttemptAt: now
+    };
+
+    try {
+        const lists = getConfiguredLists(config);
+        const selectedLists = lists.filter(list => list.name === channel.sourceName);
+        const listsToScan = selectedLists.length ? selectedLists : lists;
+        const bucketGroup = Array.isArray(config.g) && config.g.length ? config.g[0] : "Kronos";
+
+        for (const list of listsToScan) {
+            const playlistData = await fetchPlaylist(list.url, { timeout: Math.min(15000, HLS_REQUEST_TIMEOUT + 3000) });
+            const parsed = parseM3UChannels(playlistData, list).map(candidate => ({
+                ...candidate,
+                name: decorateChannelName(candidate, lists.length, config.gm),
+                group: config.gm === "bucket" ? bucketGroup : candidate.group
+            }));
+
+            const refreshed = parsed.find(candidate => matchesRefreshChannel(candidate, channel));
+            if (!refreshed?.url) continue;
+
+            if (refreshed.url !== currentSourceUrl) {
+                setStartupSourceUrl(context, refreshed.url);
+                console.log(
+                    `[STARTUP SOURCE REFRESH] channel="${label}"` +
+                    ` reason=${reason}` +
+                    ` result=url-updated` +
+                    ` old=${hashKey(currentSourceUrl)}` +
+                    ` new=${hashKey(refreshed.url)}`
+                );
+                return refreshed.url;
+            }
+
+            console.log(
+                `[STARTUP SOURCE REFRESH] channel="${label}"` +
+                ` reason=${reason}` +
+                ` result=url-unchanged`
+            );
+            return currentSourceUrl;
+        }
+
+        console.log(
+            `[STARTUP SOURCE REFRESH] channel="${label}"` +
+            ` reason=${reason}` +
+            ` result=channel-not-found`
+        );
+    } catch (err) {
+        console.warn(
+            `[STARTUP SOURCE REFRESH ERROR] channel="${label}"` +
+            ` reason=${reason}` +
+            ` err=${err.message}`
+        );
+    }
+
+    return currentSourceUrl;
+}
+
 function getPublicHost(req) {
     const forwardedProto = req.get('x-forwarded-proto') || req.protocol;
     const forwardedHost = req.get('x-forwarded-host') || req.get('host');
@@ -2071,6 +2308,7 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
 
         const host = getPublicHost(req);
         const session = activatePlaybackSession(req, c);
+        const sourceRef = { value: c.url };
 
         let startupCloseHandled = false;
         const handleStartupClientClose = () => {
@@ -2101,6 +2339,10 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         await ensureStreamReady(c.url, c.name, {
             session,
             label: c.name,
+            configKey,
+            config,
+            channel: c,
+            sourceRef,
             isClientGone: () => (
                 startupCloseHandled ||
                 (!startupDone && !startupResponseFinished && (Boolean(req.aborted) || Boolean(res.destroyed)))
@@ -2109,9 +2351,11 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         startupDone = true;
         touchPlaybackSession(session);
 
-        const hls = await getCachedHLSRaw(c.url, { session, label: c.name });
+        const playbackSourceUrl = getStartupSourceUrl(c.url, { channel: c, sourceRef, session });
+        session.sourceUrl = playbackSourceUrl;
+        const hls = await getCachedHLSRaw(playbackSourceUrl, { session, label: c.name });
         assertSessionActive(session, c.name);
-        const buffered = updateLiveBufferFromPlaylist(c.url, hls.playlist, hls.baseUrl, { session, label: c.name });
+        const buffered = updateLiveBufferFromPlaylist(playbackSourceUrl, hls.playlist, hls.baseUrl, { session, label: c.name });
         const rewritten = rewriteHLSPlaylistThroughKronos(buffered.playlist, hls.baseUrl, host, configKey, { session });
         const info = buffered.info || analyzeHLSPlaylist(buffered.playlist);
 
@@ -2407,6 +2651,7 @@ app.get("/:base64Config/debug", async (req, res) => {
                 STREAM_ACQUIRE_TIMEOUT,
                 STREAM_PREBUFFER_POLL_MS,
                 STREAM_PREBUFFER_SECONDS,
+                STREAM_WARM_REUSE_TTL_MS,
                 DYNAMIC_BUFFER_TARGET_SECONDS,
                 DYNAMIC_BUFFER_MAX_SECONDS,
                 LIVE_BUFFER_SEGMENTS,
@@ -2417,6 +2662,8 @@ app.get("/:base64Config/debug", async (req, res) => {
                 SEGMENT_PREFETCH_CONCURRENCY,
                 SEGMENT_PREFETCH_AHEAD,
                 SEGMENT_PREFETCH_FAILURE_COOLDOWN_MS,
+                STARTUP_SOURCE_REFRESH_ERRORS,
+                STARTUP_SOURCE_REFRESH_COOLDOWN_MS,
                 PLAYER_SESSION_IDLE_RESET_MS,
                 PLAYER_SESSION_CLOSE_IDLE_MS
             }
