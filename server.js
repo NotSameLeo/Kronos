@@ -1656,13 +1656,7 @@ function matchesChannelSearch(channel, rawQuery) {
     const query = normalizeSearchText(rawQuery);
     if (!query) return true;
 
-    const haystack = normalizeSearchText([
-        channel.name,
-        channel.group,
-        channel.sourceName,
-        channel.tvgId,
-        channel.description
-    ].filter(Boolean).join(" "));
+    const haystack = normalizeSearchText(channel.name);
 
     const compactHaystack = haystack.replace(/\s+/g, "");
     const compactQuery = query.replace(/\s+/g, "");
@@ -1829,9 +1823,7 @@ async function fetchAndProcessChannels(configKey, config, options = {}) {
                 ...channel,
                 name: decorateChannelName(channel, configuredLists.length, config.gm),
                 group: config.gm === "bucket" ? bucketGroup : channel.group,
-                description: channel.tvgId && epgMap[normalizeEpgId(channel.tvgId)]
-                    ? epgMap[normalizeEpgId(channel.tvgId)]
-                    : "K.R.O.N.O.S. - Nessun dato guida oraria"
+                description: ""
             }));
 
         console.log(`[CATALOG LOAD OK] FinalChannels=${channels.length}`);
