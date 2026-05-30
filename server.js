@@ -58,9 +58,6 @@ const STREAM_PREBUFFER_POLL_MS = Number(process.env.STREAM_PREBUFFER_POLL_MS || 
 const STREAM_WARM_REUSE_TTL_MS = Number(process.env.STREAM_WARM_REUSE_TTL_MS || 120000);
 const DYNAMIC_BUFFER_TARGET_SECONDS = Number(process.env.DYNAMIC_BUFFER_TARGET_SECONDS || 60);
 const DYNAMIC_BUFFER_MAX_SECONDS = Number(process.env.DYNAMIC_BUFFER_MAX_SECONDS || 90);
-const PLAYER_RECOVERY_BUFFER_SECONDS = Number(process.env.PLAYER_RECOVERY_BUFFER_SECONDS || 20);
-const PLAYER_RECOVERY_TIMEOUT_MS = Number(process.env.PLAYER_RECOVERY_TIMEOUT_MS || 60000);
-const PLAYER_RECOVERY_POLL_MS = Number(process.env.PLAYER_RECOVERY_POLL_MS || STREAM_PREBUFFER_POLL_MS);
 const LIVE_BUFFER_SEGMENTS = Number(process.env.LIVE_BUFFER_SEGMENTS || 36);
 const LIVE_PLAYLIST_SEGMENTS = Number(process.env.LIVE_PLAYLIST_SEGMENTS || 10);
 const LIVE_DELAY_SEGMENTS = Number(process.env.LIVE_DELAY_SEGMENTS || 1);
@@ -78,9 +75,9 @@ const STARTUP_SOURCE_REFRESH_COOLDOWN_MS = Number(process.env.STARTUP_SOURCE_REF
 const PLAYER_SEGMENT_SLOW_MS = Number(process.env.PLAYER_SEGMENT_SLOW_MS || 2500);
 const PLAYER_SEGMENT_GAP_WARN_MS = Number(process.env.PLAYER_SEGMENT_GAP_WARN_MS || 30000);
 const PLAYER_SESSION_IDLE_RESET_MS = Number(process.env.PLAYER_SESSION_IDLE_RESET_MS || 60000);
-const PLAYER_SESSION_CLOSE_IDLE_MS = Number(process.env.PLAYER_SESSION_CLOSE_IDLE_MS || 25000);
+const PLAYER_SESSION_CLOSE_IDLE_MS = Number(process.env.PLAYER_SESSION_CLOSE_IDLE_MS || 60000);
 const ADDON_TYPE = "tv";
-const RELEASE_VERSION = "1.8.0";
+const RELEASE_VERSION = "1.8.1";
 
 function decodeConfig(configKey) {
     try {
@@ -1308,12 +1305,25 @@ function resetLiveBufferForUpstreamEpoch(buffer, parsed, manifestKeys, label = "
 function updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl, context = {}) {
     const cacheKey = getHLSCacheKey(sourceUrl);
     const parsed = parseHLSMediaPlaylist(playlist, baseUrl);
+    let buffer = memoryCache.liveBuffers[cacheKey];
 
-    if (parsed.info.isMaster || !parsed.info.isLive || parsed.segments.length === 0) {
+    if (parsed.info.isMaster) {
         return { playlist, info: parsed.info, buffered: false, segments: [] };
     }
 
-    let buffer = memoryCache.liveBuffers[cacheKey];
+    if (!parsed.info.isLive || parsed.segments.length === 0) {
+        if (buffer?.segments?.length) {
+            console.warn(
+                `[HLS TRANSITIONAL FALLBACK] channel="${context.label || "stream"}"` +
+                ` live=${parsed.info.isLive}` +
+                ` segs=${parsed.segments.length}` +
+                ` retained=${buffer.segments.length}`
+            );
+            return buildBufferedPlaylistResult(buffer, playlist, parsed.info, context);
+        }
+        return { playlist, info: parsed.info, buffered: false, segments: [] };
+    }
+
     if (!buffer) {
         buffer = { sourceUrl, baseUrl, headerLines: [], segments: [], segmentMap: {}, lastUpdated: 0, nextOrdinal: 0 };
         memoryCache.liveBuffers[cacheKey] = buffer;
@@ -1522,7 +1532,6 @@ function clearLiveBufferPlaybackRuntime(buffer) {
     delete buffer.playbackCursorLogicalKey;
     delete buffer.playbackCursorOrdinal;
     delete buffer.lastPlayerRequestAt;
-    delete buffer.recovery;
 }
 
 function segmentHasUrl(segment, sourceUrl) {
@@ -1555,112 +1564,6 @@ function noteLiveBufferSegmentRequested(session, sourceUrl) {
     });
 
     return matched;
-}
-
-function waitForActivePlaybackRecovery(buffer, session = null) {
-    const recovery = buffer?.recovery;
-    if (!recovery?.promise || recovery.sessionId !== session?.id) return null;
-    return recovery.promise;
-}
-
-async function recoverPlaybackBuffer(buffer, session, reason = "segment-cache-miss") {
-    if (!buffer || !session?.id || !isSessionActive(session)) return false;
-
-    const existing = waitForActivePlaybackRecovery(buffer, session);
-    if (existing) return existing;
-
-    const targetSeconds = Math.min(PLAYER_RECOVERY_BUFFER_SECONDS, DYNAMIC_BUFFER_MAX_SECONDS);
-    if (targetSeconds <= 0) return false;
-
-    const started = Date.now();
-    const label = session.channelName || "stream";
-    let lastLoggedSeconds = null;
-    let recovery = null;
-
-    const promise = (async () => {
-        console.warn(
-            `[PLAYER RECOVERY] channel="${label}" status=start` +
-            ` reason=${reason}` +
-            ` target=${formatSeconds(targetSeconds)}` +
-            ` timeout=${formatSeconds(PLAYER_RECOVERY_TIMEOUT_MS / 1000)}`
-        );
-
-        while (Date.now() - started < PLAYER_RECOVERY_TIMEOUT_MS) {
-            if (!isSessionActive(session)) {
-                console.log(`[PLAYER RECOVERY] channel="${label}" status=cancelled reason=inactive-session`);
-                return false;
-            }
-
-            touchPlaybackSession(session);
-            queueDynamicPrefetchForBuffer(buffer, { session, label });
-
-            let cachedSeconds = getUsefulCachedDurationForBuffer(buffer, session);
-            if (cachedSeconds >= targetSeconds) {
-                console.log(
-                    `[PLAYER RECOVERY] channel="${label}" status=complete` +
-                    ` cached=${formatSeconds(cachedSeconds)}/${formatSeconds(targetSeconds)}=${formatProgressPercent(cachedSeconds, targetSeconds)}` +
-                    ` elapsed=${Date.now() - started}ms`
-                );
-                return true;
-            }
-
-            try {
-                if (buffer.sourceUrl) {
-                    const hls = await getCachedHLSRaw(buffer.sourceUrl, { session, label });
-                    updateLiveBufferFromPlaylist(buffer.sourceUrl, hls.playlist, hls.baseUrl, { session, label });
-                    cachedSeconds = getUsefulCachedDurationForBuffer(buffer, session);
-                }
-            } catch (err) {
-                console.warn(
-                    `[PLAYER RECOVERY] channel="${label}" status=retry` +
-                    ` err=${err.message}`
-                );
-            }
-
-            if (cachedSeconds !== lastLoggedSeconds) {
-                lastLoggedSeconds = cachedSeconds;
-                console.log(
-                    `[PLAYER RECOVERY] channel="${label}" status=buffering` +
-                    ` cached=${formatSeconds(cachedSeconds)}/${formatSeconds(targetSeconds)}=${formatProgressPercent(cachedSeconds, targetSeconds)}`
-                );
-            }
-
-            if (cachedSeconds >= targetSeconds) {
-                console.log(
-                    `[PLAYER RECOVERY] channel="${label}" status=complete` +
-                    ` cached=${formatSeconds(cachedSeconds)}/${formatSeconds(targetSeconds)}=${formatProgressPercent(cachedSeconds, targetSeconds)}` +
-                    ` elapsed=${Date.now() - started}ms`
-                );
-                return true;
-            }
-
-            await sleep(PLAYER_RECOVERY_POLL_MS);
-        }
-
-        const cachedSeconds = getUsefulCachedDurationForBuffer(buffer, session);
-        console.warn(
-            `[PLAYER RECOVERY] channel="${label}" status=timeout` +
-            ` cached=${formatSeconds(cachedSeconds)}/${formatSeconds(targetSeconds)}=${formatProgressPercent(cachedSeconds, targetSeconds)}` +
-            ` elapsed=${Date.now() - started}ms`
-        );
-        return false;
-    })();
-
-    recovery = {
-        sessionId: session.id,
-        startedAt: started,
-        reason,
-        promise
-    };
-    buffer.recovery = recovery;
-
-    try {
-        return await promise;
-    } finally {
-        if (buffer.recovery === recovery) {
-            delete buffer.recovery;
-        }
-    }
 }
 
 function queueDynamicPrefetchForBuffer(buffer, context = {}) {
@@ -2774,8 +2677,6 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
 
         const playbackSourceUrl = getStartupSourceUrl(c.url, { channel: c, sourceRef, session });
         session.sourceUrl = playbackSourceUrl;
-        const activeRecovery = waitForActivePlaybackRecovery(getLiveBuffer(playbackSourceUrl), session);
-        if (activeRecovery) await activeRecovery;
         const hls = await getCachedHLSRaw(playbackSourceUrl, { session, label: c.name });
         assertSessionActive(session, c.name);
         const buffered = updateLiveBufferFromPlaylist(playbackSourceUrl, hls.playlist, hls.baseUrl, { session, label: c.name });
@@ -2828,8 +2729,6 @@ app.get("/:base64Config/proxy/pl", async (req, res) => {
         const label = session?.channelName || "nested-playlist";
 
         markPlaybackActivity(session);
-        const activeRecovery = waitForActivePlaybackRecovery(getLiveBuffer(sourceUrl), session);
-        if (activeRecovery) await activeRecovery;
         await ensureStreamReady(sourceUrl, label, { session, label });
 
         const hls = await getCachedHLSRaw(sourceUrl, { session, label });
@@ -2886,12 +2785,6 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
                 label: session.channelName,
                 buffer: requested.buffer
             });
-            await recoverPlaybackBuffer(requested.buffer, session, "segment-cache-miss");
-
-            const recovered = getSegmentFromCache(sourceUrl);
-            if (recovered) {
-                return sendCachedSegment(req, res, recovered, "recovery-cache", started, session);
-            }
         }
 
         const waited = await waitForSegmentPrefetch(sourceUrl);
@@ -3098,9 +2991,6 @@ app.get("/:base64Config/debug", async (req, res) => {
                 STREAM_WARM_REUSE_TTL_MS,
                 DYNAMIC_BUFFER_TARGET_SECONDS,
                 DYNAMIC_BUFFER_MAX_SECONDS,
-                PLAYER_RECOVERY_BUFFER_SECONDS,
-                PLAYER_RECOVERY_TIMEOUT_MS,
-                PLAYER_RECOVERY_POLL_MS,
                 LIVE_BUFFER_SEGMENTS,
                 LIVE_PLAYLIST_SEGMENTS,
                 LIVE_DELAY_SEGMENTS,
