@@ -308,10 +308,14 @@ function formatProgressPercent(value, target) {
     return `${percent}%`;
 }
 
+function getDynamicBufferGoalSeconds() {
+    return Math.min(DYNAMIC_BUFFER_TARGET_SECONDS, DYNAMIC_BUFFER_MAX_SECONDS);
+}
+
 function getBufferStatus(cachedSeconds) {
     if (cachedSeconds < STREAM_PREBUFFER_SECONDS) return "warming";
-    if (cachedSeconds < DYNAMIC_BUFFER_TARGET_SECONDS) return "filling";
     if (cachedSeconds >= DYNAMIC_BUFFER_MAX_SECONDS) return "full";
+    if (cachedSeconds < getDynamicBufferGoalSeconds()) return "filling";
     return "healthy";
 }
 
@@ -1036,13 +1040,22 @@ async function fetchSegmentToCache(sourceUrl, context = {}) {
             return null;
         }
 
+        if (!isCompleteSegmentResponse(response.status, response.headers)) {
+            console.warn(
+                `[SEG PREFETCH SKIP] segment=${getSegmentLabel(sourceUrl)}` +
+                ` status=${response.status}` +
+                ` reason=partial-response`
+            );
+            return null;
+        }
+
         storeSegmentInCache(sourceUrl, buffer, response.headers, response.status);
         delete memoryCache.segmentPrefetchFailures[key];
-        const cachedSeconds = context.buffer ? getCachedDurationForSegments(context.buffer.segments) : null;
+        const cachedSeconds = context.buffer ? getUsefulCachedDurationForBuffer(context.buffer, context.session) : null;
         console.log(
             `[SEG PREFETCH OK] bytes=${formatBytes(buffer.length)} time=${Date.now() - started}ms` +
             `${cachedSeconds !== null
-                ? ` cached=${formatSeconds(cachedSeconds)}/${formatSeconds(DYNAMIC_BUFFER_TARGET_SECONDS)}=${formatProgressPercent(cachedSeconds, DYNAMIC_BUFFER_TARGET_SECONDS)}`
+                ? ` cached=${formatSeconds(cachedSeconds)}/${formatSeconds(getDynamicBufferGoalSeconds())}=${formatProgressPercent(cachedSeconds, getDynamicBufferGoalSeconds())}`
                 : ""}`
         );
         return getSegmentFromCache(sourceUrl);
@@ -1194,10 +1207,11 @@ function updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl, context = {}
 
     let buffer = memoryCache.liveBuffers[cacheKey];
     if (!buffer) {
-        buffer = { headerLines: [], segments: [], segmentMap: {}, lastUpdated: 0 };
+        buffer = { headerLines: [], segments: [], segmentMap: {}, lastUpdated: 0, nextOrdinal: 0 };
         memoryCache.liveBuffers[cacheKey] = buffer;
     }
 
+    buffer.nextOrdinal = buffer.nextOrdinal || 0;
     buffer.headerLines = parsed.headerLines;
     buffer.lastUpdated = Date.now();
 
@@ -1211,6 +1225,7 @@ function updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl, context = {}
                 ...incoming,
                 sourceUrl: incoming.url,
                 cacheUrl: incoming.url,
+                ordinal: ++buffer.nextOrdinal,
                 firstSeenAt: Date.now(),
                 lastSeenAt: Date.now(),
                 altUrls: [incoming.url]
@@ -1235,7 +1250,7 @@ function updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl, context = {}
 
     queueDynamicPrefetchForBuffer(buffer, context);
 
-    const selected = selectBufferedSegments(buffer);
+    const selected = selectBufferedSegments(buffer, context.session);
     const rebuilt = buildPlaylistFromBufferedSegments(buffer, selected.segments);
     return {
         playlist: rebuilt || playlist,
@@ -1244,16 +1259,37 @@ function updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl, context = {}
         bufferSize: buffer.segments.length,
         playlistSegments: selected.segments.length,
         cachedSeconds: getCachedDurationForSegments(selected.segments),
+        aheadSeconds: getUsefulCachedDurationForBuffer(buffer, context.session),
         segments: selected.segments
     };
 }
 
-function selectBufferedSegments(buffer) {
+function selectBufferedSegments(buffer, session = null) {
     if (!buffer?.segments?.length) return { segments: [] };
     const delayed = LIVE_DELAY_SEGMENTS > 0 && buffer.segments.length > 2
         ? buffer.segments.slice(0, Math.max(1, buffer.segments.length - LIVE_DELAY_SEGMENTS))
         : buffer.segments.slice();
-    return { segments: delayed.slice(-LIVE_PLAYLIST_SEGMENTS) };
+    const cursor = getPlaybackCursor(buffer, session);
+
+    if (!cursor) {
+        return { segments: delayed.slice(-LIVE_PLAYLIST_SEGMENTS) };
+    }
+
+    const cursorIndex = delayed.findIndex(segment => segment.logicalKey === cursor.logicalKey);
+    if (cursorIndex >= 0) {
+        const historySegments = 2;
+        const start = Math.max(0, cursorIndex - historySegments);
+        return { segments: delayed.slice(start, start + LIVE_PLAYLIST_SEGMENTS) };
+    }
+
+    const retainedAhead = delayed.filter(segment => {
+        return (segment.ordinal || 0) > (cursor.ordinal || 0);
+    });
+    return {
+        segments: retainedAhead.length
+            ? retainedAhead.slice(0, LIVE_PLAYLIST_SEGMENTS)
+            : delayed.slice(-LIVE_PLAYLIST_SEGMENTS)
+    };
 }
 
 function buildPlaylistFromBufferedSegments(buffer, selectedSegments) {
@@ -1290,6 +1326,62 @@ function getCachedDurationForSegments(segments) {
     }, 0);
 }
 
+function getPlaybackCursor(buffer, session = null) {
+    if (!buffer || !session?.id || buffer.playbackCursorSessionId !== session.id) return null;
+    if (!buffer.playbackCursorLogicalKey) return null;
+    return {
+        logicalKey: buffer.playbackCursorLogicalKey,
+        ordinal: buffer.playbackCursorOrdinal || 0
+    };
+}
+
+function getUsefulBufferSegments(buffer, session = null) {
+    if (!buffer?.segments?.length) return [];
+    const cursor = getPlaybackCursor(buffer, session);
+    if (!cursor) return buffer.segments.slice();
+
+    const cursorIndex = buffer.segments.findIndex(segment => segment.logicalKey === cursor.logicalKey);
+    if (cursorIndex >= 0) {
+        return buffer.segments.slice(cursorIndex + 1);
+    }
+
+    return buffer.segments.filter(segment => {
+        return (segment.ordinal || 0) > (cursor.ordinal || 0);
+    });
+}
+
+function getUsefulCachedDurationForBuffer(buffer, session = null) {
+    return getCachedDurationForSegments(getUsefulBufferSegments(buffer, session));
+}
+
+function segmentHasUrl(segment, sourceUrl) {
+    if (!segment || !sourceUrl) return false;
+    return [
+        segment.cacheUrl,
+        segment.url,
+        segment.sourceUrl,
+        ...(Array.isArray(segment.altUrls) ? segment.altUrls : [])
+    ].filter(Boolean).includes(sourceUrl);
+}
+
+function noteLiveBufferSegmentRequested(session, sourceUrl) {
+    if (!session?.id || !sourceUrl) return;
+
+    Object.values(memoryCache.liveBuffers).forEach(buffer => {
+        const requested = buffer?.segments?.find(segment => segmentHasUrl(segment, sourceUrl));
+        if (!requested) return;
+
+        const previous = getPlaybackCursor(buffer, session);
+        if (previous && (requested.ordinal || 0) < (previous.ordinal || 0)) return;
+
+        buffer.playbackCursorSessionId = session.id;
+        buffer.playbackCursorLogicalKey = requested.logicalKey;
+        buffer.playbackCursorOrdinal = requested.ordinal || 0;
+        buffer.lastPlayerRequestAt = Date.now();
+        queueDynamicPrefetchForBuffer(buffer, { session, label: session.channelName });
+    });
+}
+
 function queueDynamicPrefetchForBuffer(buffer, context = {}) {
     if (!buffer?.segments?.length) return;
     if (context.session && !isSessionActive(context.session)) {
@@ -1297,12 +1389,20 @@ function queueDynamicPrefetchForBuffer(buffer, context = {}) {
         return;
     }
 
-    const cachedSeconds = getCachedDurationForSegments(buffer.segments);
-    if (cachedSeconds >= DYNAMIC_BUFFER_MAX_SECONDS) return;
+    const usefulSegments = getUsefulBufferSegments(buffer, context.session);
+    const cachedSeconds = getCachedDurationForSegments(usefulSegments);
+    const targetSeconds = getDynamicBufferGoalSeconds();
+    if (cachedSeconds >= targetSeconds) return;
 
-    const candidates = buffer.segments
+    let projectedSeconds = cachedSeconds;
+    const candidates = usefulSegments
         .filter(segment => !getCachedSegmentForLogicalSegment(segment))
-        .slice(-SEGMENT_PREFETCH_AHEAD);
+        .slice(0, SEGMENT_PREFETCH_AHEAD)
+        .filter(segment => {
+            if (projectedSeconds >= targetSeconds) return false;
+            projectedSeconds += Number(segment.duration) || 0;
+            return true;
+        });
 
     const queued = candidates.reduce((count, segment) => {
         return count + (queueSegmentPrefetch(segment.sourceUrl || segment.url, { ...context, buffer }) ? 1 : 0);
@@ -1311,7 +1411,7 @@ function queueDynamicPrefetchForBuffer(buffer, context = {}) {
     if (queued > 0) {
         console.log(
             `[DYNAMIC BUFFER] status=${getBufferStatus(cachedSeconds)}` +
-            ` cached=${formatSeconds(cachedSeconds)}/${formatSeconds(DYNAMIC_BUFFER_TARGET_SECONDS)}=${formatProgressPercent(cachedSeconds, DYNAMIC_BUFFER_TARGET_SECONDS)}` +
+            ` cached=${formatSeconds(cachedSeconds)}/${formatSeconds(targetSeconds)}=${formatProgressPercent(cachedSeconds, targetSeconds)}` +
             ` max=${formatSeconds(DYNAMIC_BUFFER_MAX_SECONDS)}` +
             ` queued=${queued}` +
             ` candidates=${candidates.length}` +
@@ -1404,7 +1504,7 @@ async function prebufferInitialStream(sourceUrl, label = "stream", context = {})
         `[STARTUP PHASE 2] channel="${label}" prebuffering` +
         ` target=${formatSeconds(STREAM_PREBUFFER_SECONDS)}` +
         ` timeout=${formatSeconds(STREAM_PREBUFFER_TIMEOUT / 1000)}` +
-        ` dynamicTarget=${formatSeconds(DYNAMIC_BUFFER_TARGET_SECONDS)}` +
+        ` dynamicTarget=${formatSeconds(getDynamicBufferGoalSeconds())}` +
         ` poll=${STREAM_PREBUFFER_POLL_MS}ms`
     );
 
@@ -1506,19 +1606,22 @@ async function ensureStreamReady(sourceUrl, label = "stream", context = {}) {
     }
 
     const buffer = getLiveBuffer(startupSourceUrl);
-    const cachedBufferSeconds = getCachedDurationForSegments(buffer?.segments || []);
+    const hasActivePlaybackCursor = Boolean(getPlaybackCursor(buffer, context.session));
+    const cachedBufferSeconds = hasActivePlaybackCursor
+        ? getUsefulCachedDurationForBuffer(buffer, context.session)
+        : getCachedDurationForSegments(buffer?.segments || []);
     if (!state.promise && cachedBufferSeconds >= STREAM_PREBUFFER_SECONDS) {
         state.status = "ready";
         state.readyAt = Date.now();
         state.lastError = null;
     }
 
-    if (state.status === "ready" && cachedBufferSeconds >= STREAM_PREBUFFER_SECONDS) {
+    if (state.status === "ready" && (hasActivePlaybackCursor || cachedBufferSeconds >= STREAM_PREBUFFER_SECONDS)) {
         assertSessionActive(context.session, label);
         queueDynamicPrefetchForBuffer(buffer, context);
         console.log(
             `[STARTUP REUSE] channel="${label}" ready-cache` +
-            ` cached=${formatSeconds(cachedBufferSeconds)}/${formatSeconds(DYNAMIC_BUFFER_TARGET_SECONDS)}=${formatProgressPercent(cachedBufferSeconds, DYNAMIC_BUFFER_TARGET_SECONDS)}`
+            ` cached=${formatSeconds(cachedBufferSeconds)}/${formatSeconds(getDynamicBufferGoalSeconds())}=${formatProgressPercent(cachedBufferSeconds, getDynamicBufferGoalSeconds())}`
         );
         return { status: "ready", reused: true };
     }
@@ -1972,6 +2075,7 @@ async function refreshStartupChannelSource(context = {}, currentSourceUrl, label
             if (!refreshed?.url) continue;
 
             if (refreshed.url !== currentSourceUrl) {
+                resetStreamRuntimeForSource(currentSourceUrl, label, "source-refresh");
                 setStartupSourceUrl(context, refreshed.url);
                 console.log(
                     `[STARTUP SOURCE REFRESH] channel="${label}"` +
@@ -2233,6 +2337,41 @@ app.get("/:base64Config/poster/:id.svg", async (req, res) => {
     }
 });
 
+function isCompleteSegmentResponse(status, headers = {}) {
+    if (status === 200) return true;
+    if (status !== 206) return false;
+
+    const match = String(headers["content-range"] || "").match(/^bytes\s+(\d+)-(\d+)\/(\d+)$/i);
+    if (!match) return false;
+
+    const start = Number(match[1]);
+    const end = Number(match[2]);
+    const total = Number(match[3]);
+    return start === 0 && Number.isFinite(total) && total > 0 && end === total - 1;
+}
+
+function parseSingleByteRange(rangeHeader, total) {
+    const match = String(rangeHeader || "").match(/^bytes=(\d*)-(\d*)$/i);
+    if (!match || (!match[1] && !match[2])) return null;
+
+    if (!match[1]) {
+        const suffixLength = Number(match[2]);
+        if (!Number.isFinite(suffixLength) || suffixLength <= 0) return null;
+        return {
+            start: Math.max(0, total - suffixLength),
+            end: total - 1
+        };
+    }
+
+    const start = Number(match[1]);
+    const requestedEnd = match[2] ? Number(match[2]) : total - 1;
+    if (!Number.isFinite(start) || !Number.isFinite(requestedEnd) || start < 0 || start >= total) return null;
+
+    const end = Math.min(requestedEnd, total - 1);
+    if (start > end) return null;
+    return { start, end };
+}
+
 function sendCachedSegment(req, res, cached, source = "cache", started = Date.now(), session = null) {
     const buffer = cached.buffer;
     const total = buffer.length;
@@ -2250,20 +2389,16 @@ function sendCachedSegment(req, res, cached, source = "cache", started = Date.no
     res.setHeader("X-Kronos-Cache", "HIT");
 
     if (rangeHeader) {
-        const match = String(rangeHeader).match(/bytes=(\d*)-(\d*)/);
-        if (match) {
-            if (match[1] !== "") start = Number(match[1]);
-            if (match[2] !== "") end = Number(match[2]);
-            if (!Number.isFinite(start)) start = 0;
-            if (!Number.isFinite(end) || end >= total) end = total - 1;
-            if (start > end || start >= total) {
-                res.status(416);
-                res.setHeader("Content-Range", `bytes */${total}`);
-                return res.end();
-            }
-            status = 206;
-            res.setHeader("Content-Range", `bytes ${start}-${end}/${total}`);
+        const parsedRange = parseSingleByteRange(rangeHeader, total);
+        if (!parsedRange) {
+            res.status(416);
+            res.setHeader("Content-Range", `bytes */${total}`);
+            return res.end();
         }
+        start = parsedRange.start;
+        end = parsedRange.end;
+        status = 206;
+        res.setHeader("Content-Range", `bytes ${start}-${end}/${total}`);
     }
 
     const chunk = buffer.subarray(start, end + 1);
@@ -2372,8 +2507,8 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
             ` segs=${info.segmentCount}` +
             `${info.mediaSequence !== null ? ` seq=${info.mediaSequence}` : ""}` +
             `${buffered.buffered ? ` buffer=${buffered.bufferSize} out=${buffered.playlistSegments}` : ""}` +
-            `${buffered.cachedSeconds !== undefined
-                ? ` cached=${formatSeconds(buffered.cachedSeconds)}/${formatSeconds(DYNAMIC_BUFFER_TARGET_SECONDS)}=${formatProgressPercent(buffered.cachedSeconds, DYNAMIC_BUFFER_TARGET_SECONDS)}`
+            `${buffered.aheadSeconds !== undefined
+                ? ` cached=${formatSeconds(buffered.aheadSeconds)}/${formatSeconds(getDynamicBufferGoalSeconds())}=${formatProgressPercent(buffered.aheadSeconds, getDynamicBufferGoalSeconds())}`
                 : ""}`
         );
 
@@ -2424,8 +2559,8 @@ app.get("/:base64Config/proxy/pl", async (req, res) => {
             ` segs=${info.segmentCount}` +
             `${info.mediaSequence !== null ? ` seq=${info.mediaSequence}` : ""}` +
             `${buffered.buffered ? ` buffer=${buffered.bufferSize} out=${buffered.playlistSegments}` : ""}` +
-            `${buffered.cachedSeconds !== undefined
-                ? ` cached=${formatSeconds(buffered.cachedSeconds)}/${formatSeconds(DYNAMIC_BUFFER_TARGET_SECONDS)}=${formatProgressPercent(buffered.cachedSeconds, DYNAMIC_BUFFER_TARGET_SECONDS)}`
+            `${buffered.aheadSeconds !== undefined
+                ? ` cached=${formatSeconds(buffered.aheadSeconds)}/${formatSeconds(getDynamicBufferGoalSeconds())}=${formatProgressPercent(buffered.aheadSeconds, getDynamicBufferGoalSeconds())}`
                 : ""}`
         );
 
@@ -2453,6 +2588,7 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
         sourceUrl = decodeProxyUrl(req.query.u);
         const session = getRequestPlaybackSession(req);
         markPlaybackActivity(session);
+        noteLiveBufferSegmentRequested(session, sourceUrl);
 
         const cached = getSegmentFromCache(sourceUrl);
         if (cached) {
@@ -2507,7 +2643,7 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
 
         res.on("finish", () => {
             const durationMs = Date.now() - started;
-            if (storeable && cacheChunks.length > 0 && (response.status === 200 || response.status === 206)) {
+            if (storeable && cacheChunks.length > 0 && isCompleteSegmentResponse(response.status, response.headers)) {
                 storeSegmentInCache(sourceUrl, Buffer.concat(cacheChunks), response.headers, response.status);
             }
             markPlaybackActivity(session);
