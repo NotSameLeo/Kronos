@@ -301,6 +301,13 @@ function formatSeconds(value) {
     return `${Math.round(Number(value || 0))}s`;
 }
 
+function formatProgressPercent(value, target) {
+    const numericTarget = Number(target || 0);
+    if (numericTarget <= 0) return "0%";
+    const percent = Math.max(0, Math.min(100, Math.round((Number(value || 0) / numericTarget) * 100)));
+    return `${percent}%`;
+}
+
 function getBufferStatus(cachedSeconds) {
     if (cachedSeconds < STREAM_PREBUFFER_SECONDS) return "warming";
     if (cachedSeconds < DYNAMIC_BUFFER_TARGET_SECONDS) return "filling";
@@ -1031,7 +1038,13 @@ async function fetchSegmentToCache(sourceUrl, context = {}) {
 
         storeSegmentInCache(sourceUrl, buffer, response.headers, response.status);
         delete memoryCache.segmentPrefetchFailures[key];
-        console.log(`[SEG PREFETCH OK] bytes=${formatBytes(buffer.length)} time=${Date.now() - started}ms`);
+        const cachedSeconds = context.buffer ? getCachedDurationForSegments(context.buffer.segments) : null;
+        console.log(
+            `[SEG PREFETCH OK] bytes=${formatBytes(buffer.length)} time=${Date.now() - started}ms` +
+            `${cachedSeconds !== null
+                ? ` cached=${formatSeconds(cachedSeconds)}/${formatSeconds(DYNAMIC_BUFFER_TARGET_SECONDS)}=${formatProgressPercent(cachedSeconds, DYNAMIC_BUFFER_TARGET_SECONDS)}`
+                : ""}`
+        );
         return getSegmentFromCache(sourceUrl);
     })();
 
@@ -1059,7 +1072,8 @@ function queueSegmentPrefetch(sourceUrl, context = {}) {
         sourceUrl,
         sessionKey: context.session?.key || null,
         sessionId: context.session?.id || null,
-        label: context.label || context.session?.channelName || "stream"
+        label: context.label || context.session?.channelName || "stream",
+        buffer: context.buffer || null
     });
     processSegmentPrefetchQueue();
     return true;
@@ -1074,6 +1088,7 @@ function processSegmentPrefetchQueue() {
         const sourceUrl = typeof item === "string" ? item : item.sourceUrl;
         const session = typeof item === "string" || !item.sessionKey ? null : { key: item.sessionKey, id: item.sessionId };
         const label = typeof item === "string" ? "stream" : item.label;
+        const buffer = typeof item === "string" ? null : item.buffer;
 
         if (session && !isSessionActive(session)) {
             console.log(`[PREFETCH SKIP] channel="${label}" reason=inactive-session`);
@@ -1086,7 +1101,7 @@ function processSegmentPrefetchQueue() {
         if (getSegmentFromCache(sourceUrl) || memoryCache.segmentInflight[key]) continue;
 
         memoryCache.segmentPrefetchActive += 1;
-        fetchSegmentToCache(sourceUrl, session ? { session, label } : { label })
+        fetchSegmentToCache(sourceUrl, session ? { session, label, buffer } : { label, buffer })
             .catch(err => {
                 const cooldownMs = noteSegmentPrefetchFailure(sourceUrl, err);
                 console.error(
@@ -1290,14 +1305,13 @@ function queueDynamicPrefetchForBuffer(buffer, context = {}) {
         .slice(-SEGMENT_PREFETCH_AHEAD);
 
     const queued = candidates.reduce((count, segment) => {
-        return count + (queueSegmentPrefetch(segment.sourceUrl || segment.url, context) ? 1 : 0);
+        return count + (queueSegmentPrefetch(segment.sourceUrl || segment.url, { ...context, buffer }) ? 1 : 0);
     }, 0);
 
     if (queued > 0) {
         console.log(
             `[DYNAMIC BUFFER] status=${getBufferStatus(cachedSeconds)}` +
-            ` cached=${formatSeconds(cachedSeconds)}` +
-            ` target=${formatSeconds(DYNAMIC_BUFFER_TARGET_SECONDS)}` +
+            ` cached=${formatSeconds(cachedSeconds)}/${formatSeconds(DYNAMIC_BUFFER_TARGET_SECONDS)}=${formatProgressPercent(cachedSeconds, DYNAMIC_BUFFER_TARGET_SECONDS)}` +
             ` max=${formatSeconds(DYNAMIC_BUFFER_MAX_SECONDS)}` +
             ` queued=${queued}` +
             ` candidates=${candidates.length}` +
@@ -1417,7 +1431,7 @@ async function prebufferInitialStream(sourceUrl, label = "stream", context = {})
                 `[STARTUP PHASE 2 PROGRESS] channel="${label}"` +
                 ` cache=${hls.cacheStatus || "refresh"}` +
                 `${hls.age !== undefined ? ` age=${hls.age}ms` : ""}` +
-                ` cached=${formatSeconds(cachedSeconds)}/${formatSeconds(STREAM_PREBUFFER_SECONDS)}` +
+                ` cached=${formatSeconds(cachedSeconds)}/${formatSeconds(STREAM_PREBUFFER_SECONDS)}=${formatProgressPercent(cachedSeconds, STREAM_PREBUFFER_SECONDS)}` +
                 ` status=${getBufferStatus(cachedSeconds)}` +
                 ` candidateSegs=${candidates.length}` +
                 ` prefetchActive=${memoryCache.segmentPrefetchActive}` +
@@ -1427,8 +1441,7 @@ async function prebufferInitialStream(sourceUrl, label = "stream", context = {})
             if (cachedSeconds >= STREAM_PREBUFFER_SECONDS) {
                 console.log(
                     `[STARTUP COMPLETE] channel="${label}" stream-ready` +
-                    ` startBuffer=${formatSeconds(cachedSeconds)}` +
-                    ` target=${formatSeconds(STREAM_PREBUFFER_SECONDS)}` +
+                    ` cached=${formatSeconds(cachedSeconds)}/${formatSeconds(STREAM_PREBUFFER_SECONDS)}=${formatProgressPercent(cachedSeconds, STREAM_PREBUFFER_SECONDS)}` +
                     ` elapsed=${Date.now() - started}ms`
                 );
                 return { status: "ready", cachedSeconds };
@@ -1505,7 +1518,7 @@ async function ensureStreamReady(sourceUrl, label = "stream", context = {}) {
         queueDynamicPrefetchForBuffer(buffer, context);
         console.log(
             `[STARTUP REUSE] channel="${label}" ready-cache` +
-            ` cached=${formatSeconds(cachedBufferSeconds)}`
+            ` cached=${formatSeconds(cachedBufferSeconds)}/${formatSeconds(DYNAMIC_BUFFER_TARGET_SECONDS)}=${formatProgressPercent(cachedBufferSeconds, DYNAMIC_BUFFER_TARGET_SECONDS)}`
         );
         return { status: "ready", reused: true };
     }
@@ -2359,7 +2372,9 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
             ` segs=${info.segmentCount}` +
             `${info.mediaSequence !== null ? ` seq=${info.mediaSequence}` : ""}` +
             `${buffered.buffered ? ` buffer=${buffered.bufferSize} out=${buffered.playlistSegments}` : ""}` +
-            `${buffered.cachedSeconds !== undefined ? ` cached=${formatSeconds(buffered.cachedSeconds)}` : ""}`
+            `${buffered.cachedSeconds !== undefined
+                ? ` cached=${formatSeconds(buffered.cachedSeconds)}/${formatSeconds(DYNAMIC_BUFFER_TARGET_SECONDS)}=${formatProgressPercent(buffered.cachedSeconds, DYNAMIC_BUFFER_TARGET_SECONDS)}`
+                : ""}`
         );
 
         res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
@@ -2409,7 +2424,9 @@ app.get("/:base64Config/proxy/pl", async (req, res) => {
             ` segs=${info.segmentCount}` +
             `${info.mediaSequence !== null ? ` seq=${info.mediaSequence}` : ""}` +
             `${buffered.buffered ? ` buffer=${buffered.bufferSize} out=${buffered.playlistSegments}` : ""}` +
-            `${buffered.cachedSeconds !== undefined ? ` cached=${formatSeconds(buffered.cachedSeconds)}` : ""}`
+            `${buffered.cachedSeconds !== undefined
+                ? ` cached=${formatSeconds(buffered.cachedSeconds)}/${formatSeconds(DYNAMIC_BUFFER_TARGET_SECONDS)}=${formatProgressPercent(buffered.cachedSeconds, DYNAMIC_BUFFER_TARGET_SECONDS)}`
+                : ""}`
         );
 
         res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
