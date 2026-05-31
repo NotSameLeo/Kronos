@@ -56,7 +56,7 @@ const STREAM_PREBUFFER_SECONDS = Number(process.env.STREAM_PREBUFFER_SECONDS || 
 const STREAM_PREBUFFER_TIMEOUT = Number(process.env.STREAM_PREBUFFER_TIMEOUT || 70000);
 const STREAM_PREBUFFER_POLL_MS = Number(process.env.STREAM_PREBUFFER_POLL_MS || 1200);
 const STREAM_WARM_REUSE_TTL_MS = Number(process.env.STREAM_WARM_REUSE_TTL_MS || 120000);
-const DYNAMIC_BUFFER_TARGET_SECONDS = Number(process.env.DYNAMIC_BUFFER_TARGET_SECONDS || 60);
+const DYNAMIC_BUFFER_TARGET_SECONDS = Number(process.env.DYNAMIC_BUFFER_TARGET_SECONDS || 70);
 const DYNAMIC_BUFFER_MAX_SECONDS = Number(process.env.DYNAMIC_BUFFER_MAX_SECONDS || 90);
 const LIVE_BUFFER_SEGMENTS = Number(process.env.LIVE_BUFFER_SEGMENTS || 36);
 const LIVE_PLAYLIST_SEGMENTS = Number(process.env.LIVE_PLAYLIST_SEGMENTS || 10);
@@ -75,9 +75,9 @@ const STARTUP_SOURCE_REFRESH_COOLDOWN_MS = Number(process.env.STARTUP_SOURCE_REF
 const PLAYER_SEGMENT_SLOW_MS = Number(process.env.PLAYER_SEGMENT_SLOW_MS || 2500);
 const PLAYER_SEGMENT_GAP_WARN_MS = Number(process.env.PLAYER_SEGMENT_GAP_WARN_MS || 30000);
 const PLAYER_SESSION_IDLE_RESET_MS = Number(process.env.PLAYER_SESSION_IDLE_RESET_MS || 60000);
-const PLAYER_SESSION_CLOSE_IDLE_MS = Number(process.env.PLAYER_SESSION_CLOSE_IDLE_MS || 60000);
+const PLAYER_SESSION_CLOSE_IDLE_MS = Number(process.env.PLAYER_SESSION_CLOSE_IDLE_MS || 25000);
 const ADDON_TYPE = "tv";
-const RELEASE_VERSION = "1.8.1";
+const RELEASE_VERSION = "1.7.1";
 
 function decodeConfig(configKey) {
     try {
@@ -301,21 +301,10 @@ function formatSeconds(value) {
     return `${Math.round(Number(value || 0))}s`;
 }
 
-function formatProgressPercent(value, target) {
-    const numericTarget = Number(target || 0);
-    if (numericTarget <= 0) return "0%";
-    const percent = Math.max(0, Math.min(100, Math.round((Number(value || 0) / numericTarget) * 100)));
-    return `${percent}%`;
-}
-
-function getDynamicBufferGoalSeconds() {
-    return Math.min(DYNAMIC_BUFFER_TARGET_SECONDS, DYNAMIC_BUFFER_MAX_SECONDS);
-}
-
 function getBufferStatus(cachedSeconds) {
     if (cachedSeconds < STREAM_PREBUFFER_SECONDS) return "warming";
+    if (cachedSeconds < DYNAMIC_BUFFER_TARGET_SECONDS) return "filling";
     if (cachedSeconds >= DYNAMIC_BUFFER_MAX_SECONDS) return "full";
-    if (cachedSeconds < getDynamicBufferGoalSeconds()) return "filling";
     return "healthy";
 }
 
@@ -615,7 +604,7 @@ function getWarmStreamRuntimeInfo(sourceUrl) {
     }
 
     const ageMs = Date.now() - buffer.lastUpdated;
-    const cachedSeconds = getUsefulCachedDurationForBuffer(buffer);
+    const cachedSeconds = getCachedDurationForSegments(buffer.segments);
     return {
         reusable: ageMs <= STREAM_WARM_REUSE_TTL_MS && cachedSeconds > 0,
         ageMs,
@@ -627,31 +616,11 @@ function getWarmStreamRuntimeInfo(sourceUrl) {
 function prepareStreamRuntimeForNewSession(sourceUrl, label = "stream") {
     const warm = getWarmStreamRuntimeInfo(sourceUrl);
     if (warm.reusable) {
-        const cacheKey = getHLSCacheKey(sourceUrl);
-        const buffer = getLiveBuffer(sourceUrl);
-        clearLiveBufferPlaybackRuntime(buffer);
-
-        const state = memoryCache.streamStates[cacheKey] || {
-            status: "idle",
-            promise: null,
-            readyAt: 0,
-            lastError: null,
-            generation: 0
-        };
-        state.generation = (state.generation || 0) + 1;
-        state.status = "idle";
-        state.promise = null;
-        state.readyAt = 0;
-        state.lastError = null;
-        state.requiresValidation = true;
-        memoryCache.streamStates[cacheKey] = state;
-
         console.log(
             `[STREAM WARM REUSE] channel="${label}"` +
             ` age=${warm.ageMs}ms` +
             ` cached=${formatSeconds(warm.cachedSeconds)}` +
-            ` segs=${warm.segmentCount}` +
-            ` status=pending-validation`
+            ` segs=${warm.segmentCount}`
         );
         return;
     }
@@ -747,8 +716,6 @@ function parseHLSMediaPlaylist(playlist, baseUrl) {
     const lines = text.split(/\r?\n/);
     const headerLines = [];
     const segments = [];
-    const activeSegmentContext = {};
-    let pendingSegmentPrefixLines = [];
     let pendingSegmentLines = [];
     let pendingDuration = null;
     const originalMediaSequence = Number.isFinite(info.mediaSequence) ? info.mediaSequence : 0;
@@ -760,24 +727,8 @@ function parseHLSMediaPlaylist(playlist, baseUrl) {
         if (!trimmed) continue;
         if (trimmed.startsWith("#EXT-X-ENDLIST")) continue;
 
-        if (trimmed.startsWith("#EXT-X-KEY:") || trimmed.startsWith("#EXT-X-MAP:")) {
-            const contextKey = trimmed.split(":")[0];
-            activeSegmentContext[contextKey] = normalizeHeaderLineToAbsolute(line, baseUrl);
-            continue;
-        }
-
-        if (trimmed === "#EXT-X-DISCONTINUITY" || trimmed.startsWith("#EXT-X-PROGRAM-DATE-TIME:")) {
-            pendingSegmentPrefixLines.push(normalizeHeaderLineToAbsolute(line, baseUrl));
-            continue;
-        }
-
         if (trimmed.startsWith("#EXTINF")) {
-            pendingSegmentLines = [
-                ...Object.values(activeSegmentContext),
-                ...pendingSegmentPrefixLines,
-                normalizeHeaderLineToAbsolute(line, baseUrl)
-            ];
-            pendingSegmentPrefixLines = [];
+            pendingSegmentLines = [normalizeHeaderLineToAbsolute(line, baseUrl)];
             const durationMatch = trimmed.match(/^#EXTINF:([0-9.]+)/);
             pendingDuration = durationMatch ? Number(durationMatch[1]) : null;
             continue;
@@ -817,33 +768,20 @@ function rewriteHLSPlaylistThroughKronos(playlist, baseUrl, hostBase, configKey,
     const proxiedSegment = absUrl => `${hostBase}/${configKey}/proxy/seg?u=${encodeProxyUrl(absUrl)}${sidParam}`;
     const proxiedPlaylist = absUrl => `${hostBase}/${configKey}/proxy/pl?u=${encodeProxyUrl(absUrl)}${sidParam}`;
     const proxyForUrl = absUrl => isHlsUrl(absUrl) ? proxiedPlaylist(absUrl) : proxiedSegment(absUrl);
-    const info = analyzeHLSPlaylist(playlist);
 
     return String(playlist || "").split(/\r?\n/).map(line => {
         const trimmed = line.trim();
         if (!trimmed) return line;
 
         if (trimmed.startsWith("#")) {
-            const headerProxy = (
-                trimmed.startsWith("#EXT-X-MEDIA:") ||
-                trimmed.startsWith("#EXT-X-I-FRAME-STREAM-INF:")
-            )
-                ? proxiedPlaylist
-                : (
-                    trimmed.startsWith("#EXT-X-KEY:") ||
-                    trimmed.startsWith("#EXT-X-SESSION-KEY:") ||
-                    trimmed.startsWith("#EXT-X-MAP:")
-                )
-                    ? proxiedSegment
-                    : proxyForUrl;
             return line.replace(/URI=("([^"]+)"|'([^']+)')/g, (match, quoted, doubleUri, singleUri) => {
                 const uri = doubleUri || singleUri;
                 const quote = quoted.startsWith("'") ? "'" : '"';
-                return `URI=${quote}${headerProxy(toAbsoluteUrl(uri, baseUrl))}${quote}`;
+                return `URI=${quote}${proxyForUrl(toAbsoluteUrl(uri, baseUrl))}${quote}`;
             });
         }
 
-        return (info.isMaster ? proxiedPlaylist : proxiedSegment)(toAbsoluteUrl(trimmed, baseUrl));
+        return proxyForUrl(toAbsoluteUrl(trimmed, baseUrl));
     }).join("\n");
 }
 
@@ -1091,24 +1029,9 @@ async function fetchSegmentToCache(sourceUrl, context = {}) {
             return null;
         }
 
-        if (!isCompleteSegmentResponse(response.status, response.headers)) {
-            console.warn(
-                `[SEG PREFETCH SKIP] segment=${getSegmentLabel(sourceUrl)}` +
-                ` status=${response.status}` +
-                ` reason=partial-response`
-            );
-            return null;
-        }
-
         storeSegmentInCache(sourceUrl, buffer, response.headers, response.status);
         delete memoryCache.segmentPrefetchFailures[key];
-        const cachedSeconds = context.buffer ? getUsefulCachedDurationForBuffer(context.buffer, context.session) : null;
-        console.log(
-            `[SEG PREFETCH OK] bytes=${formatBytes(buffer.length)} time=${Date.now() - started}ms` +
-            `${cachedSeconds !== null
-                ? ` cached=${formatSeconds(cachedSeconds)}/${formatSeconds(getDynamicBufferGoalSeconds())}=${formatProgressPercent(cachedSeconds, getDynamicBufferGoalSeconds())}`
-                : ""}`
-        );
+        console.log(`[SEG PREFETCH OK] bytes=${formatBytes(buffer.length)} time=${Date.now() - started}ms`);
         return getSegmentFromCache(sourceUrl);
     })();
 
@@ -1136,8 +1059,7 @@ function queueSegmentPrefetch(sourceUrl, context = {}) {
         sourceUrl,
         sessionKey: context.session?.key || null,
         sessionId: context.session?.id || null,
-        label: context.label || context.session?.channelName || "stream",
-        buffer: context.buffer || null
+        label: context.label || context.session?.channelName || "stream"
     });
     processSegmentPrefetchQueue();
     return true;
@@ -1152,7 +1074,6 @@ function processSegmentPrefetchQueue() {
         const sourceUrl = typeof item === "string" ? item : item.sourceUrl;
         const session = typeof item === "string" || !item.sessionKey ? null : { key: item.sessionKey, id: item.sessionId };
         const label = typeof item === "string" ? "stream" : item.label;
-        const buffer = typeof item === "string" ? null : item.buffer;
 
         if (session && !isSessionActive(session)) {
             console.log(`[PREFETCH SKIP] channel="${label}" reason=inactive-session`);
@@ -1165,7 +1086,7 @@ function processSegmentPrefetchQueue() {
         if (getSegmentFromCache(sourceUrl) || memoryCache.segmentInflight[key]) continue;
 
         memoryCache.segmentPrefetchActive += 1;
-        fetchSegmentToCache(sourceUrl, session ? { session, label, buffer } : { label, buffer })
+        fetchSegmentToCache(sourceUrl, session ? { session, label } : { label })
             .catch(err => {
                 const cooldownMs = noteSegmentPrefetchFailure(sourceUrl, err);
                 console.error(
@@ -1248,135 +1169,22 @@ function getLiveBuffer(sourceUrl) {
     return memoryCache.liveBuffers[getHLSCacheKey(sourceUrl)] || null;
 }
 
-function getParsedManifestKeys(parsed) {
-    return (parsed?.segments || []).map(segment => segment.logicalKey || getSegmentLogicalKey(segment)).filter(Boolean);
-}
-
-function manifestsOverlap(leftKeys, rightKeys) {
-    const right = new Set(rightKeys || []);
-    return (leftKeys || []).some(key => right.has(key));
-}
-
-function buildBufferedPlaylistResult(buffer, fallbackPlaylist, fallbackInfo, context = {}) {
-    queueDynamicPrefetchForBuffer(buffer, context);
-
-    const selected = selectBufferedSegments(buffer, context.session);
-    const rebuilt = buildPlaylistFromBufferedSegments(buffer, selected.segments);
-    return {
-        playlist: rebuilt || fallbackPlaylist,
-        info: rebuilt ? analyzeHLSPlaylist(rebuilt) : fallbackInfo,
-        buffered: Boolean(rebuilt),
-        bufferSize: buffer.segments.length,
-        playlistSegments: selected.segments.length,
-        cachedSeconds: getCachedDurationForSegments(selected.segments),
-        aheadSeconds: getUsefulCachedDurationForBuffer(buffer, context.session),
-        segments: selected.segments
-    };
-}
-
-function resetLiveBufferForUpstreamEpoch(buffer, parsed, manifestKeys, label = "stream") {
-    const previousSequence = buffer.lastUpstreamMediaSequence;
-    const nextSequence = parsed.info.mediaSequence;
-    const reusedUrls = new Set((parsed.segments || []).map(segment => segment.url).filter(Boolean));
-    let removedReusedCacheEntries = 0;
-
-    (buffer.segments || []).forEach(segment => {
-        [segment?.cacheUrl, segment?.url, segment?.sourceUrl, ...(Array.isArray(segment?.altUrls) ? segment.altUrls : [])]
-            .filter(url => reusedUrls.has(url))
-            .forEach(url => {
-                if (deleteSegmentCacheEntryByUrl(url)) removedReusedCacheEntries += 1;
-            });
-    });
-
-    buffer.segments = [];
-    buffer.segmentMap = {};
-    buffer.currentManifestKeys = [];
-    buffer.pendingEpochReset = null;
-    buffer.markNextSegmentDiscontinuity = true;
-
-    console.warn(
-        `[HLS EPOCH RESET] channel="${label}"` +
-        ` upstreamSeq=${previousSequence}->${nextSequence}` +
-        ` incomingSegs=${manifestKeys.length}` +
-        ` removedReusedCache=${removedReusedCacheEntries}`
-    );
-}
-
 function updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl, context = {}) {
     const cacheKey = getHLSCacheKey(sourceUrl);
     const parsed = parseHLSMediaPlaylist(playlist, baseUrl);
+
+    if (parsed.info.isMaster || !parsed.info.isLive || parsed.segments.length === 0) {
+        return { playlist, info: parsed.info, buffered: false, segments: [] };
+    }
+
     let buffer = memoryCache.liveBuffers[cacheKey];
-
-    if (parsed.info.isMaster) {
-        return { playlist, info: parsed.info, buffered: false, segments: [] };
-    }
-
-    if (!parsed.info.isLive || parsed.segments.length === 0) {
-        if (buffer?.segments?.length) {
-            console.warn(
-                `[HLS TRANSITIONAL FALLBACK] channel="${context.label || "stream"}"` +
-                ` live=${parsed.info.isLive}` +
-                ` segs=${parsed.segments.length}` +
-                ` retained=${buffer.segments.length}`
-            );
-            return buildBufferedPlaylistResult(buffer, playlist, parsed.info, context);
-        }
-        return { playlist, info: parsed.info, buffered: false, segments: [] };
-    }
-
     if (!buffer) {
-        buffer = { sourceUrl, baseUrl, headerLines: [], segments: [], segmentMap: {}, lastUpdated: 0, nextOrdinal: 0 };
+        buffer = { headerLines: [], segments: [], segmentMap: {}, lastUpdated: 0 };
         memoryCache.liveBuffers[cacheKey] = buffer;
     }
 
-    buffer.nextOrdinal = buffer.nextOrdinal || 0;
-    buffer.sourceUrl = sourceUrl;
-    buffer.baseUrl = baseUrl;
     buffer.headerLines = parsed.headerLines;
     buffer.lastUpdated = Date.now();
-    const manifestKeys = getParsedManifestKeys(parsed);
-    const previousManifestKeys = buffer.currentManifestKeys || [];
-    const previousSequence = buffer.lastUpstreamMediaSequence;
-    const nextSequence = parsed.info.mediaSequence;
-    const sequenceRegressed = Number.isFinite(previousSequence) &&
-        Number.isFinite(nextSequence) &&
-        nextSequence < previousSequence;
-
-    if (sequenceRegressed) {
-        const rollbackDistance = previousSequence - nextSequence;
-        const strongRegression = rollbackDistance >= Math.max(3, previousManifestKeys.length);
-        const overlapsPrevious = manifestsOverlap(previousManifestKeys, manifestKeys);
-        const pending = buffer.pendingEpochReset;
-        const confirmsNewEpoch = pending &&
-            Number.isFinite(pending.mediaSequence) &&
-            nextSequence >= pending.mediaSequence &&
-            (
-                manifestsOverlap(pending.manifestKeys, manifestKeys) ||
-                nextSequence === pending.mediaSequence
-            );
-
-        if (confirmsNewEpoch && (!overlapsPrevious || strongRegression)) {
-            resetLiveBufferForUpstreamEpoch(buffer, parsed, manifestKeys, context.label || "stream");
-        } else {
-            buffer.pendingEpochReset = {
-                mediaSequence: nextSequence,
-                manifestKeys,
-                seenAt: Date.now()
-            };
-            console.warn(
-                `[HLS EPOCH ${overlapsPrevious ? "STALE" : "PENDING"}] channel="${context.label || "stream"}"` +
-                ` upstreamSeq=${previousSequence}->${nextSequence}` +
-                ` incomingSegs=${manifestKeys.length}` +
-                ` overlap=${overlapsPrevious ? "yes" : "no"}`
-            );
-            return buildBufferedPlaylistResult(buffer, playlist, parsed.info, context);
-        }
-    } else {
-        buffer.pendingEpochReset = null;
-    }
-
-    buffer.currentManifestKeys = manifestKeys;
-    buffer.lastUpstreamMediaSequence = nextSequence;
 
     parsed.segments.forEach(incoming => {
         const key = incoming.logicalKey || getSegmentLogicalKey(incoming);
@@ -1388,13 +1196,10 @@ function updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl, context = {}
                 ...incoming,
                 sourceUrl: incoming.url,
                 cacheUrl: incoming.url,
-                ordinal: ++buffer.nextOrdinal,
                 firstSeenAt: Date.now(),
                 lastSeenAt: Date.now(),
-                discontinuity: Boolean(buffer.markNextSegmentDiscontinuity),
                 altUrls: [incoming.url]
             };
-            buffer.markNextSegmentDiscontinuity = false;
             buffer.segments.push(buffer.segmentMap[key]);
         } else {
             Object.assign(existing, mergeLiveSegment(existing, incoming));
@@ -1402,7 +1207,7 @@ function updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl, context = {}
     });
 
     buffer.segments = buffer.segments
-        .sort((a, b) => (a.ordinal || 0) - (b.ordinal || 0))
+        .sort((a, b) => (a.sequence || 0) - (b.sequence || 0))
         .slice(-LIVE_BUFFER_SEGMENTS);
 
     buffer.segmentMap = {};
@@ -1413,42 +1218,33 @@ function updateLiveBufferFromPlaylist(sourceUrl, playlist, baseUrl, context = {}
         buffer.segmentMap[key] = segment;
     });
 
-    return buildBufferedPlaylistResult(buffer, playlist, parsed.info, context);
+    queueDynamicPrefetchForBuffer(buffer, context);
+
+    const selected = selectBufferedSegments(buffer);
+    const rebuilt = buildPlaylistFromBufferedSegments(buffer, selected.segments);
+    return {
+        playlist: rebuilt || playlist,
+        info: rebuilt ? analyzeHLSPlaylist(rebuilt) : parsed.info,
+        buffered: Boolean(rebuilt),
+        bufferSize: buffer.segments.length,
+        playlistSegments: selected.segments.length,
+        cachedSeconds: getCachedDurationForSegments(selected.segments),
+        segments: selected.segments
+    };
 }
 
-function selectBufferedSegments(buffer, session = null) {
+function selectBufferedSegments(buffer) {
     if (!buffer?.segments?.length) return { segments: [] };
-    const cursor = getPlaybackCursor(buffer, session);
-    const selectable = cursor ? buffer.segments.slice() : getCurrentManifestSegments(buffer);
-    const delayed = LIVE_DELAY_SEGMENTS > 0 && selectable.length > 2
-        ? selectable.slice(0, Math.max(1, selectable.length - LIVE_DELAY_SEGMENTS))
-        : selectable;
-
-    if (!cursor) {
-        return { segments: delayed.slice(-LIVE_PLAYLIST_SEGMENTS) };
-    }
-
-    const cursorIndex = delayed.findIndex(segment => segment.logicalKey === cursor.logicalKey);
-    if (cursorIndex >= 0) {
-        const historySegments = 2;
-        const start = Math.max(0, cursorIndex - historySegments);
-        return { segments: delayed.slice(start, start + LIVE_PLAYLIST_SEGMENTS) };
-    }
-
-    const retainedAhead = delayed.filter(segment => {
-        return (segment.ordinal || 0) > (cursor.ordinal || 0);
-    });
-    return {
-        segments: retainedAhead.length
-            ? retainedAhead.slice(0, LIVE_PLAYLIST_SEGMENTS)
-            : delayed.slice(-LIVE_PLAYLIST_SEGMENTS)
-    };
+    const delayed = LIVE_DELAY_SEGMENTS > 0 && buffer.segments.length > 2
+        ? buffer.segments.slice(0, Math.max(1, buffer.segments.length - LIVE_DELAY_SEGMENTS))
+        : buffer.segments.slice();
+    return { segments: delayed.slice(-LIVE_PLAYLIST_SEGMENTS) };
 }
 
 function buildPlaylistFromBufferedSegments(buffer, selectedSegments) {
     if (!buffer || !selectedSegments?.length) return null;
 
-    const firstSeq = selectedSegments[0].ordinal || selectedSegments[0].sequence;
+    const firstSeq = selectedSegments[0].sequence;
     let hasMediaSequence = false;
     const headerLines = (buffer.headerLines || []).map(line => {
         if (String(line).trim().startsWith("#EXT-X-MEDIA-SEQUENCE:")) {
@@ -1464,14 +1260,11 @@ function buildPlaylistFromBufferedSegments(buffer, selectedSegments) {
         ...headerLines,
         ...selectedSegments.flatMap(segment => {
             const outputUrl = segment.cacheUrl || segment.url;
-            const lines = (segment.lines || []).map(line => {
+            return (segment.lines || []).map(line => {
                 const trimmed = String(line).trim();
                 if (!trimmed || trimmed.startsWith("#")) return line;
                 return outputUrl;
             });
-            return segment.discontinuity && !lines.some(line => String(line).trim() === "#EXT-X-DISCONTINUITY")
-                ? ["#EXT-X-DISCONTINUITY", ...lines]
-                : lines;
         })
     ].join("\n") + "\n";
 }
@@ -1482,90 +1275,6 @@ function getCachedDurationForSegments(segments) {
     }, 0);
 }
 
-function getContiguousCachedDurationForSegments(segments) {
-    let total = 0;
-    for (const segment of segments || []) {
-        if (!getCachedSegmentForLogicalSegment(segment)) break;
-        total += Number(segment.duration) || 0;
-    }
-    return total;
-}
-
-function getCurrentManifestSegments(buffer) {
-    if (!buffer?.segments?.length) return [];
-    const manifestKeys = new Set(buffer.currentManifestKeys || []);
-    const current = buffer.segments.filter(segment => manifestKeys.has(segment.logicalKey));
-    return current.length ? current : buffer.segments.slice(-LIVE_PLAYLIST_SEGMENTS);
-}
-
-function getPlaybackCursor(buffer, session = null) {
-    if (!buffer || !session?.id || buffer.playbackCursorSessionId !== session.id) return null;
-    if (!buffer.playbackCursorLogicalKey) return null;
-    return {
-        logicalKey: buffer.playbackCursorLogicalKey,
-        ordinal: buffer.playbackCursorOrdinal || 0
-    };
-}
-
-function getUsefulBufferSegments(buffer, session = null) {
-    if (!buffer?.segments?.length) return [];
-    const cursor = getPlaybackCursor(buffer, session);
-    if (!cursor) return getCurrentManifestSegments(buffer);
-
-    const cursorIndex = buffer.segments.findIndex(segment => segment.logicalKey === cursor.logicalKey);
-    if (cursorIndex >= 0) {
-        return buffer.segments.slice(cursorIndex + 1);
-    }
-
-    return buffer.segments.filter(segment => {
-        return (segment.ordinal || 0) > (cursor.ordinal || 0);
-    });
-}
-
-function getUsefulCachedDurationForBuffer(buffer, session = null) {
-    return getContiguousCachedDurationForSegments(getUsefulBufferSegments(buffer, session));
-}
-
-function clearLiveBufferPlaybackRuntime(buffer) {
-    if (!buffer) return;
-    delete buffer.playbackCursorSessionId;
-    delete buffer.playbackCursorLogicalKey;
-    delete buffer.playbackCursorOrdinal;
-    delete buffer.lastPlayerRequestAt;
-}
-
-function segmentHasUrl(segment, sourceUrl) {
-    if (!segment || !sourceUrl) return false;
-    return [
-        segment.cacheUrl,
-        segment.url,
-        segment.sourceUrl,
-        ...(Array.isArray(segment.altUrls) ? segment.altUrls : [])
-    ].filter(Boolean).includes(sourceUrl);
-}
-
-function noteLiveBufferSegmentRequested(session, sourceUrl) {
-    if (!session?.id || !sourceUrl) return null;
-    let matched = null;
-
-    Object.values(memoryCache.liveBuffers).forEach(buffer => {
-        const requested = buffer?.segments?.find(segment => segmentHasUrl(segment, sourceUrl));
-        if (!requested) return;
-
-        const previous = getPlaybackCursor(buffer, session);
-        if (previous && (requested.ordinal || 0) < (previous.ordinal || 0)) return;
-        matched = { buffer, requested };
-
-        buffer.playbackCursorSessionId = session.id;
-        buffer.playbackCursorLogicalKey = requested.logicalKey;
-        buffer.playbackCursorOrdinal = requested.ordinal || 0;
-        buffer.lastPlayerRequestAt = Date.now();
-        queueDynamicPrefetchForBuffer(buffer, { session, label: session.channelName });
-    });
-
-    return matched;
-}
-
 function queueDynamicPrefetchForBuffer(buffer, context = {}) {
     if (!buffer?.segments?.length) return;
     if (context.session && !isSessionActive(context.session)) {
@@ -1573,29 +1282,22 @@ function queueDynamicPrefetchForBuffer(buffer, context = {}) {
         return;
     }
 
-    const usefulSegments = getUsefulBufferSegments(buffer, context.session);
-    const cachedSeconds = getContiguousCachedDurationForSegments(usefulSegments);
-    const targetSeconds = getDynamicBufferGoalSeconds();
-    if (cachedSeconds >= targetSeconds) return;
+    const cachedSeconds = getCachedDurationForSegments(buffer.segments);
+    if (cachedSeconds >= DYNAMIC_BUFFER_MAX_SECONDS) return;
 
-    let projectedSeconds = cachedSeconds;
-    const candidates = usefulSegments
+    const candidates = buffer.segments
         .filter(segment => !getCachedSegmentForLogicalSegment(segment))
-        .slice(0, SEGMENT_PREFETCH_AHEAD)
-        .filter(segment => {
-            if (projectedSeconds >= targetSeconds) return false;
-            projectedSeconds += Number(segment.duration) || 0;
-            return true;
-        });
+        .slice(-SEGMENT_PREFETCH_AHEAD);
 
     const queued = candidates.reduce((count, segment) => {
-        return count + (queueSegmentPrefetch(segment.sourceUrl || segment.url, { ...context, buffer }) ? 1 : 0);
+        return count + (queueSegmentPrefetch(segment.sourceUrl || segment.url, context) ? 1 : 0);
     }, 0);
 
     if (queued > 0) {
         console.log(
             `[DYNAMIC BUFFER] status=${getBufferStatus(cachedSeconds)}` +
-            ` cached=${formatSeconds(cachedSeconds)}/${formatSeconds(targetSeconds)}=${formatProgressPercent(cachedSeconds, targetSeconds)}` +
+            ` cached=${formatSeconds(cachedSeconds)}` +
+            ` target=${formatSeconds(DYNAMIC_BUFFER_TARGET_SECONDS)}` +
             ` max=${formatSeconds(DYNAMIC_BUFFER_MAX_SECONDS)}` +
             ` queued=${queued}` +
             ` candidates=${candidates.length}` +
@@ -1688,7 +1390,7 @@ async function prebufferInitialStream(sourceUrl, label = "stream", context = {})
         `[STARTUP PHASE 2] channel="${label}" prebuffering` +
         ` target=${formatSeconds(STREAM_PREBUFFER_SECONDS)}` +
         ` timeout=${formatSeconds(STREAM_PREBUFFER_TIMEOUT / 1000)}` +
-        ` dynamicTarget=${formatSeconds(getDynamicBufferGoalSeconds())}` +
+        ` dynamicTarget=${formatSeconds(DYNAMIC_BUFFER_TARGET_SECONDS)}` +
         ` poll=${STREAM_PREBUFFER_POLL_MS}ms`
     );
 
@@ -1707,7 +1409,7 @@ async function prebufferInitialStream(sourceUrl, label = "stream", context = {})
             const buffered = updateLiveBufferFromPlaylist(currentSourceUrl, hls.playlist, hls.baseUrl, context);
             const candidates = (buffered.segments || []).slice(-SEGMENT_PREFETCH_AHEAD);
 
-            const cachedSeconds = getContiguousCachedDurationForSegments(candidates);
+            const cachedSeconds = getCachedDurationForSegments(candidates);
             refreshableErrors = hls.cacheStatus === "stale-fallback" && isStartupSourceRefreshableError(hls)
                 ? refreshableErrors + 1
                 : 0;
@@ -1715,7 +1417,7 @@ async function prebufferInitialStream(sourceUrl, label = "stream", context = {})
                 `[STARTUP PHASE 2 PROGRESS] channel="${label}"` +
                 ` cache=${hls.cacheStatus || "refresh"}` +
                 `${hls.age !== undefined ? ` age=${hls.age}ms` : ""}` +
-                ` cached=${formatSeconds(cachedSeconds)}/${formatSeconds(STREAM_PREBUFFER_SECONDS)}=${formatProgressPercent(cachedSeconds, STREAM_PREBUFFER_SECONDS)}` +
+                ` cached=${formatSeconds(cachedSeconds)}/${formatSeconds(STREAM_PREBUFFER_SECONDS)}` +
                 ` status=${getBufferStatus(cachedSeconds)}` +
                 ` candidateSegs=${candidates.length}` +
                 ` prefetchActive=${memoryCache.segmentPrefetchActive}` +
@@ -1725,7 +1427,8 @@ async function prebufferInitialStream(sourceUrl, label = "stream", context = {})
             if (cachedSeconds >= STREAM_PREBUFFER_SECONDS) {
                 console.log(
                     `[STARTUP COMPLETE] channel="${label}" stream-ready` +
-                    ` cached=${formatSeconds(cachedSeconds)}/${formatSeconds(STREAM_PREBUFFER_SECONDS)}=${formatProgressPercent(cachedSeconds, STREAM_PREBUFFER_SECONDS)}` +
+                    ` startBuffer=${formatSeconds(cachedSeconds)}` +
+                    ` target=${formatSeconds(STREAM_PREBUFFER_SECONDS)}` +
                     ` elapsed=${Date.now() - started}ms`
                 );
                 return { status: "ready", cachedSeconds };
@@ -1785,25 +1488,24 @@ async function ensureStreamReady(sourceUrl, label = "stream", context = {}) {
     let state = memoryCache.streamStates[cacheKey];
 
     if (!state) {
-        state = { status: "idle", promise: null, readyAt: 0, lastError: null, generation: 0, requiresValidation: false };
+        state = { status: "idle", promise: null, readyAt: 0, lastError: null, generation: 0 };
         memoryCache.streamStates[cacheKey] = state;
     }
 
     const buffer = getLiveBuffer(startupSourceUrl);
-    const hasActivePlaybackCursor = Boolean(getPlaybackCursor(buffer, context.session));
-    const cachedBufferSeconds = getUsefulCachedDurationForBuffer(buffer, context.session);
-    if (!state.promise && !state.requiresValidation && cachedBufferSeconds >= STREAM_PREBUFFER_SECONDS) {
+    const cachedBufferSeconds = getCachedDurationForSegments(buffer?.segments || []);
+    if (!state.promise && cachedBufferSeconds >= STREAM_PREBUFFER_SECONDS) {
         state.status = "ready";
         state.readyAt = Date.now();
         state.lastError = null;
     }
 
-    if (state.status === "ready" && (hasActivePlaybackCursor || cachedBufferSeconds >= STREAM_PREBUFFER_SECONDS)) {
+    if (state.status === "ready" && cachedBufferSeconds >= STREAM_PREBUFFER_SECONDS) {
         assertSessionActive(context.session, label);
         queueDynamicPrefetchForBuffer(buffer, context);
         console.log(
             `[STARTUP REUSE] channel="${label}" ready-cache` +
-            ` cached=${formatSeconds(cachedBufferSeconds)}/${formatSeconds(getDynamicBufferGoalSeconds())}=${formatProgressPercent(cachedBufferSeconds, getDynamicBufferGoalSeconds())}`
+            ` cached=${formatSeconds(cachedBufferSeconds)}`
         );
         return { status: "ready", reused: true };
     }
@@ -1824,7 +1526,6 @@ async function ensureStreamReady(sourceUrl, label = "stream", context = {}) {
             if (initial.info?.isMaster) {
                 state.status = "ready";
                 state.readyAt = Date.now();
-                state.requiresValidation = false;
                 console.log(`[STARTUP COMPLETE] channel="${label}" master-playlist-ready`);
                 return { status: "ready", master: true };
             }
@@ -1834,7 +1535,6 @@ async function ensureStreamReady(sourceUrl, label = "stream", context = {}) {
             state.status = "ready";
             state.readyAt = Date.now();
             state.lastError = null;
-            state.requiresValidation = false;
 
             // After startup, immediately do a background refresh cycle so the cache
             // is in the optimal state for the player's first actual playlist poll.
@@ -2259,7 +1959,6 @@ async function refreshStartupChannelSource(context = {}, currentSourceUrl, label
             if (!refreshed?.url) continue;
 
             if (refreshed.url !== currentSourceUrl) {
-                resetStreamRuntimeForSource(currentSourceUrl, label, "source-refresh");
                 setStartupSourceUrl(context, refreshed.url);
                 console.log(
                     `[STARTUP SOURCE REFRESH] channel="${label}"` +
@@ -2521,41 +2220,6 @@ app.get("/:base64Config/poster/:id.svg", async (req, res) => {
     }
 });
 
-function isCompleteSegmentResponse(status, headers = {}) {
-    if (status === 200) return true;
-    if (status !== 206) return false;
-
-    const match = String(headers["content-range"] || "").match(/^bytes\s+(\d+)-(\d+)\/(\d+)$/i);
-    if (!match) return false;
-
-    const start = Number(match[1]);
-    const end = Number(match[2]);
-    const total = Number(match[3]);
-    return start === 0 && Number.isFinite(total) && total > 0 && end === total - 1;
-}
-
-function parseSingleByteRange(rangeHeader, total) {
-    const match = String(rangeHeader || "").match(/^bytes=(\d*)-(\d*)$/i);
-    if (!match || (!match[1] && !match[2])) return null;
-
-    if (!match[1]) {
-        const suffixLength = Number(match[2]);
-        if (!Number.isFinite(suffixLength) || suffixLength <= 0) return null;
-        return {
-            start: Math.max(0, total - suffixLength),
-            end: total - 1
-        };
-    }
-
-    const start = Number(match[1]);
-    const requestedEnd = match[2] ? Number(match[2]) : total - 1;
-    if (!Number.isFinite(start) || !Number.isFinite(requestedEnd) || start < 0 || start >= total) return null;
-
-    const end = Math.min(requestedEnd, total - 1);
-    if (start > end) return null;
-    return { start, end };
-}
-
 function sendCachedSegment(req, res, cached, source = "cache", started = Date.now(), session = null) {
     const buffer = cached.buffer;
     const total = buffer.length;
@@ -2573,16 +2237,20 @@ function sendCachedSegment(req, res, cached, source = "cache", started = Date.no
     res.setHeader("X-Kronos-Cache", "HIT");
 
     if (rangeHeader) {
-        const parsedRange = parseSingleByteRange(rangeHeader, total);
-        if (!parsedRange) {
-            res.status(416);
-            res.setHeader("Content-Range", `bytes */${total}`);
-            return res.end();
+        const match = String(rangeHeader).match(/bytes=(\d*)-(\d*)/);
+        if (match) {
+            if (match[1] !== "") start = Number(match[1]);
+            if (match[2] !== "") end = Number(match[2]);
+            if (!Number.isFinite(start)) start = 0;
+            if (!Number.isFinite(end) || end >= total) end = total - 1;
+            if (start > end || start >= total) {
+                res.status(416);
+                res.setHeader("Content-Range", `bytes */${total}`);
+                return res.end();
+            }
+            status = 206;
+            res.setHeader("Content-Range", `bytes ${start}-${end}/${total}`);
         }
-        start = parsedRange.start;
-        end = parsedRange.end;
-        status = 206;
-        res.setHeader("Content-Range", `bytes ${start}-${end}/${total}`);
     }
 
     const chunk = buffer.subarray(start, end + 1);
@@ -2691,9 +2359,7 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
             ` segs=${info.segmentCount}` +
             `${info.mediaSequence !== null ? ` seq=${info.mediaSequence}` : ""}` +
             `${buffered.buffered ? ` buffer=${buffered.bufferSize} out=${buffered.playlistSegments}` : ""}` +
-            `${buffered.aheadSeconds !== undefined
-                ? ` cached=${formatSeconds(buffered.aheadSeconds)}/${formatSeconds(getDynamicBufferGoalSeconds())}=${formatProgressPercent(buffered.aheadSeconds, getDynamicBufferGoalSeconds())}`
-                : ""}`
+            `${buffered.cachedSeconds !== undefined ? ` cached=${formatSeconds(buffered.cachedSeconds)}` : ""}`
         );
 
         res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
@@ -2743,9 +2409,7 @@ app.get("/:base64Config/proxy/pl", async (req, res) => {
             ` segs=${info.segmentCount}` +
             `${info.mediaSequence !== null ? ` seq=${info.mediaSequence}` : ""}` +
             `${buffered.buffered ? ` buffer=${buffered.bufferSize} out=${buffered.playlistSegments}` : ""}` +
-            `${buffered.aheadSeconds !== undefined
-                ? ` cached=${formatSeconds(buffered.aheadSeconds)}/${formatSeconds(getDynamicBufferGoalSeconds())}=${formatProgressPercent(buffered.aheadSeconds, getDynamicBufferGoalSeconds())}`
-                : ""}`
+            `${buffered.cachedSeconds !== undefined ? ` cached=${formatSeconds(buffered.cachedSeconds)}` : ""}`
         );
 
         res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
@@ -2772,19 +2436,10 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
         sourceUrl = decodeProxyUrl(req.query.u);
         const session = getRequestPlaybackSession(req);
         markPlaybackActivity(session);
-        const requested = noteLiveBufferSegmentRequested(session, sourceUrl);
 
         const cached = getSegmentFromCache(sourceUrl);
         if (cached) {
             return sendCachedSegment(req, res, cached, "cache", started, session);
-        }
-
-        if (requested?.buffer && session) {
-            queueSegmentPrefetch(sourceUrl, {
-                session,
-                label: session.channelName,
-                buffer: requested.buffer
-            });
         }
 
         const waited = await waitForSegmentPrefetch(sourceUrl);
@@ -2835,7 +2490,7 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
 
         res.on("finish", () => {
             const durationMs = Date.now() - started;
-            if (storeable && cacheChunks.length > 0 && isCompleteSegmentResponse(response.status, response.headers)) {
+            if (storeable && cacheChunks.length > 0 && (response.status === 200 || response.status === 206)) {
                 storeSegmentInCache(sourceUrl, Buffer.concat(cacheChunks), response.headers, response.status);
             }
             markPlaybackActivity(session);
