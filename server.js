@@ -24,7 +24,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "2.0.0";
+const RELEASE_VERSION = "3.1.0";
 const ADDON_TYPE = "tv";
 const CATALOG_TTL = 30 * 60 * 1000;
 const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 20000);
@@ -59,6 +59,10 @@ const SLOW_SEGMENT_MS = Number(process.env.SLOW_SEGMENT_MS || 4000);
 // the player can never time out / crash waiting. Only the very first open does a
 // short, capped prime wait to build the initial cushion.
 const RETAIN_SEGMENTS = Number(process.env.RETAIN_SEGMENTS || 12);   // ~2min retained & served
+// HARD anti-jump guarantee: the live edge of the playlist we serve advances by at
+// most this many segments per request, even if the upstream buffer jumped ahead.
+// The player therefore never finds its current segment missing → never jumps/seeks.
+const MAX_EDGE_ADVANCE = Number(process.env.MAX_EDGE_ADVANCE || 2);
 const MIN_START_SEGMENTS = Number(process.env.MIN_START_SEGMENTS || 3); // initial cushion
 const PRIME_TIMEOUT_MS = Number(process.env.PRIME_TIMEOUT_MS || 18000);  // max FIRST-open wait
 const POLLER_IDLE_STOP_MS = Number(process.env.POLLER_IDLE_STOP_MS || 90000); // stop if player gone
@@ -384,6 +388,37 @@ async function getChannelById(configKey, config, id) {
 // HLS proxy — transparent: fetch, rewrite URLs, return as-is.
 // No buffering, no startup phases, no playlist rebuild, no session machinery.
 // ─────────────────────────────────────────────────────────────────────────────
+// ── Upstream connection gate (provider max_connections=1) ───────────────────────
+// EVERY upstream request (playlist polls, segment prefetch, player-demand fetch)
+// goes through this single-slot mutex, so we NEVER open two connections at once
+// (which the provider aborts → cascade → player crash). Player-demand and playlist
+// polls take priority over background prefetch.
+let upstreamBusy = false;
+const upstreamWaiters = [];   // { resolve, prio }
+function acquireUpstream(prio) {
+    if (!upstreamBusy) { upstreamBusy = true; return Promise.resolve(); }
+    return new Promise(resolve => {
+        const w = { resolve };
+        if (prio) {
+            const i = upstreamWaiters.findIndex(x => !x.prio);
+            if (i === -1) upstreamWaiters.push(Object.assign(w, { prio: true }));
+            else upstreamWaiters.splice(i, 0, Object.assign(w, { prio: true }));
+        } else {
+            upstreamWaiters.push(Object.assign(w, { prio: false }));
+        }
+    });
+}
+function releaseUpstream() {
+    const w = upstreamWaiters.shift();
+    if (w) w.resolve();        // hand the slot to the next waiter (stays busy)
+    else upstreamBusy = false;
+}
+async function withUpstream(fn, prio = false) {
+    await acquireUpstream(prio);
+    try { return await fn(); }
+    finally { releaseUpstream(); }
+}
+
 // Fetch a manifest with bounded retries. Retries on invalid body (Xtream stream
 // spin-up) and on network/timeout errors, until MANIFEST_RETRIES or the deadline.
 async function fetchUpstreamHLS(sourceUrl, label = "stream") {
@@ -396,7 +431,7 @@ async function fetchUpstreamHLS(sourceUrl, label = "stream") {
             await sleep(MANIFEST_RETRY_DELAY);
         }
         try {
-            const r = await axios.get(sourceUrl, {
+            const r = await withUpstream(() => axios.get(sourceUrl, {
                 timeout: HLS_REQUEST_TIMEOUT,
                 maxRedirects: 5,
                 headers: {
@@ -406,7 +441,7 @@ async function fetchUpstreamHLS(sourceUrl, label = "stream") {
                     "Connection": "keep-alive"
                 },
                 validateStatus: s => s >= 200 && s < 300
-            });
+            }), true);
             const finalUrl = r.request?.res?.responseUrl || sourceUrl;
             const text = String(r.data || "").trim();
             if (!text.startsWith("#EXTM3U")) {
@@ -514,15 +549,15 @@ function evictSegCache() {
     }
 }
 
-async function fetchSegToCache(id, url) {
+async function fetchSegToCache(id, url, prio = false) {
     const hit = getSegFromCache(id);
     if (hit) return hit;
-    if (segInflight.has(id)) return segInflight.get(id);
+    if (segInflight.has(id)) return segInflight.get(id);   // dedup: never two fetches of same seg
     if (!url) return null;
 
     const p = (async () => {
         const started = Date.now();
-        const r = await axios.get(url, {
+        const r = await withUpstream(() => axios.get(url, {
             responseType: "arraybuffer",
             timeout: SEG_REQUEST_TIMEOUT,
             maxRedirects: 5,
@@ -531,11 +566,11 @@ async function fetchSegToCache(id, url) {
             maxContentLength: SEGMENT_CACHE_MAX_ITEM_BYTES,
             maxBodyLength: SEGMENT_CACHE_MAX_ITEM_BYTES,
             validateStatus: s => s === 200
-        });
+        }), prio);
         const buf = Buffer.from(r.data);
         storeSeg(id, buf, r.headers, 200);
         const ms = Date.now() - started;
-        console.log(`[PREFETCH OK] ${getSegmentLabel(url)} bytes=${formatBytes(buf.length)} time=${ms}ms speed=${formatSpeed(buf.length, ms)}`);
+        console.log(`[SEG FETCH${prio ? " *" : ""}] ${getSegmentLabel(url)} bytes=${formatBytes(buf.length)} time=${ms}ms speed=${formatSpeed(buf.length, ms)}`);
         return getSegFromCache(id);
     })();
 
@@ -833,7 +868,7 @@ function parseSegments(playlist, baseUrl) {
 function stopPoller(rt, reason) {
     rt.running = false;
     if (rt.timer) { clearTimeout(rt.timer); rt.timer = null; }
-    rt.segs = []; rt.byId = new Set(); rt.seqBase = 0; rt.lastSeq = -1;
+    rt.segs = []; rt.byId = new Set(); rt.seqBase = 0; rt.lastSeq = -1; rt.servedEdge = null;
     console.log(`[POLLER STOP] channel="${rt.label}" reason=${reason}`);
 }
 
@@ -851,7 +886,7 @@ function ensureChannel(url, label) {
         rt = {
             url, label, segs: [], byId: new Set(), seqBase: 0, generation: 0,
             target: 6, lastSeq: -1, isMaster: false, lastPlayerAt: Date.now(),
-            running: false, timer: null
+            running: false, timer: null, servedEdge: null
         };
         channels.set(url, rt);
     }
@@ -897,8 +932,12 @@ function ingestPlaylist(rt, playlist, baseUrl, info) {
     // generation (mixed into the id) to avoid serving stale cached segments.
     if (rt.lastSeq >= 0 && seq < rt.lastSeq) {
         rt.generation++;
-        rt.segs = []; rt.byId = new Set(); rt.seqBase = 0;
-        console.log(`[CHANNEL RESTART] channel="${rt.label}" seq ${rt.lastSeq}->${seq} gen=${rt.generation}`);
+        // Continue the absolute sequence forward (don't reset to 0) so the player's
+        // MEDIA-SEQUENCE never goes backward → it rejoins live moving forward instead
+        // of "jumping to the beginning". New generation keeps stale cache out.
+        rt.seqBase = rt.seqBase + rt.segs.length;
+        rt.segs = []; rt.byId = new Set();
+        console.log(`[CHANNEL RESTART] channel="${rt.label}" seq ${rt.lastSeq}->${seq} gen=${rt.generation} continuing seqBase=${rt.seqBase}`);
     }
     rt.lastSeq = seq;
 
@@ -924,11 +963,20 @@ function ingestPlaylist(rt, playlist, baseUrl, info) {
 }
 
 function buildServedPlaylist(rt, hostBase, configKey) {
-    // Serve the ENTIRE retained buffer: the player starts ~3 target-durations from
-    // the end (its cushion) but keeps the full retained depth behind it as fall-back,
-    // so a stall/slow stretch never drops its current segment out of the playlist.
-    const win = rt.segs;
-    const mediaSeq = rt.seqBase;
+    const lo = rt.seqBase;
+    const hi = rt.seqBase + rt.segs.length - 1;
+
+    // ANTI-JUMP: advance the served live edge by at most MAX_EDGE_ADVANCE per request,
+    // so the player's timeline NEVER jumps even if the upstream buffer leapt ahead.
+    // Newer segments are simply held back (still prefetched) until the edge catches up.
+    if (rt.servedEdge == null || rt.servedEdge > hi) rt.servedEdge = hi;       // (re)attach at edge
+    else rt.servedEdge = Math.min(hi, rt.servedEdge + MAX_EDGE_ADVANCE);
+    if (rt.servedEdge < lo) rt.servedEdge = lo;                                // never before buffer
+
+    const endIdx = rt.servedEdge - rt.seqBase;
+    const startIdx = Math.max(0, endIdx - RETAIN_SEGMENTS + 1);   // full retained depth behind edge
+    const win = rt.segs.slice(startIdx, endIdx + 1);
+    const mediaSeq = rt.seqBase + startIdx;
     const target = Math.max(1, Math.ceil(Math.max(rt.target || 6, ...win.map(s => s.duration || 0))));
     const lines = [
         "#EXTM3U",
@@ -940,7 +988,7 @@ function buildServedPlaylist(rt, hostBase, configKey) {
         lines.push(`#EXTINF:${Number(s.duration || rt.target || 6).toFixed(3)},`);
         lines.push(`${hostBase}/${configKey}/proxy/seg?s=${encodeURIComponent(s.id)}`);
     }
-    return { playlist: lines.join("\n") + "\n", count: win.length, mediaSeq };
+    return { playlist: lines.join("\n") + "\n", count: win.length, mediaSeq, edge: rt.servedEdge, hi };
 }
 
 function setPlaylistHeaders(res) {
@@ -986,9 +1034,9 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
             return res.status(502).send("#EXTM3U\n#EXT-X-ENDLIST\n");
         }
 
-        const { playlist, count, mediaSeq } = buildServedPlaylist(rt, host, configKey);
+        const { playlist, count, mediaSeq, edge, hi } = buildServedPlaylist(rt, host, configKey);
         setPlaylistHeaders(res);
-        console.log(`[HLS SERVE] channel="${ch.name}" window=${count}/${rt.segs.length} seq=${mediaSeq} gen=${rt.generation} cache=${segCache.size}/${formatBytes(segCacheBytes)} prefetch=${prefetchActive}+${prefetchQueue.length} waited=${Date.now() - t0}ms`);
+        console.log(`[HLS SERVE] channel="${ch.name}" window=${count} seq=${mediaSeq} edge=${edge}/${hi}${edge < hi ? ` (held ${hi - edge})` : ""} gen=${rt.generation} cache=${segCache.size}/${formatBytes(segCacheBytes)} prefetch=${prefetchActive}+${prefetchQueue.length} waited=${Date.now() - t0}ms`);
         res.send(playlist);
     } catch (err) {
         console.error(`[HLS ERROR] ${err.message}`);
@@ -1045,22 +1093,22 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
             return res.status(400).end();
         }
 
-        // Cache path for known segIds. A cached entry is ALWAYS a full 200, so we can
-        // safely satisfy Range requests by slicing it (no extra upstream connection —
-        // important with max_connections=1).
+        // HLS segment: serve from cache (Range-sliceable, always a full 200). On a
+        // miss, fetch it through the SERIAL upstream gate with PRIORITY — never open a
+        // competing connection (that's what the provider aborts under max_connections=1).
+        // fetchSegToCache dedups with any in-flight prefetch, so we just await it.
         if (segId) {
             const cached = getSegFromCache(segId);
             if (cached) return sendCachedSeg(req, res, cached, segId, "HIT");
 
-            // A prefetch for this exact segment is already in flight: WAIT for it
-            // (long enough to cover a slow segment) instead of opening a second
-            // upstream connection — essential with max_connections=1.
-            if (segInflight.has(segId)) {
-                const e = await Promise.race([segInflight.get(segId), sleep(SEG_REQUEST_TIMEOUT).then(() => null)]);
-                if (e) return sendCachedSeg(req, res, e, segId, "HIT-WAIT");
-            }
+            const wasInflight = segInflight.has(segId);
+            const entry = await fetchSegToCache(segId, sourceUrl, true);
+            if (entry) return sendCachedSeg(req, res, entry, segId, wasInflight ? "WAIT" : "MISS");
+            return res.status(502).end();
         }
 
+        // Direct (non-HLS) continuous stream: straight passthrough (its own single
+        // connection, no prefetch competing).
         await streamSegment(req, res, sourceUrl, segId, started);
     } catch (err) {
         console.error(`[SEG ERROR] ${getSegmentLabel(sourceUrl)} ${err.message}`);
