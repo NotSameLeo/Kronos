@@ -51,6 +51,8 @@ const SEGMENT_CACHE_TTL = Number(process.env.SEGMENT_CACHE_TTL || 90 * 1000);
 const SEGMENT_CACHE_MAX_BYTES = Number(process.env.SEGMENT_CACHE_MAX_BYTES || 256 * 1024 * 1024);
 const SEGMENT_CACHE_MAX_ITEMS = Number(process.env.SEGMENT_CACHE_MAX_ITEMS || 48);
 const SEGMENT_CACHE_MAX_ITEM_BYTES = Number(process.env.SEGMENT_CACHE_MAX_ITEM_BYTES || 24 * 1024 * 1024);
+const SEGMENT_PLAYER_RETRIES = Number(process.env.SEGMENT_PLAYER_RETRIES || 2);
+const SEGMENT_PLAYER_RETRY_DELAY_MS = Number(process.env.SEGMENT_PLAYER_RETRY_DELAY_MS || 350);
 const SLOW_SEGMENT_MS = Number(process.env.SLOW_SEGMENT_MS || 4000);
 
 // ── Background poller + retained buffer ─────────────────────────────────────────
@@ -283,14 +285,13 @@ function selectProgrammeWindow(programmes) {
 function formatEpgDescription(programmes) {
     const { current, next } = selectProgrammeWindow(programmes);
     const lines = [];
-    if (current) lines.push(formatProgramme("In onda", current, true));
-    if (next) lines.push(formatProgramme(current ? "A seguire" : "Prossimamente", next, false));
-    return lines.join("\n");
+    if (current) lines.push(formatProgramme("€🔴 In Onda", current));
+    if (next) lines.push(formatProgramme("🟡 A Seguire", next));
+    return lines.join("\n\n");
 }
 
-function formatProgramme(label, programme, includeDescription) {
-    const summary = includeDescription && programme.desc ? ` - ${String(programme.desc).slice(0, 500)}` : "";
-    return `${label}: ${programme.title} (${formatTime(programme.start)} - ${formatTime(programme.stop)})${summary}`;
+function formatProgramme(label, programme) {
+    return `${label} (${formatTime(programme.start)} - ${formatTime(programme.stop)})\n${programme.title}:\n${String(programme.desc || "").slice(0, 500)}`;
 }
 
 function getEpgMatchKeys(values) {
@@ -676,6 +677,7 @@ const segInflight = new Map();    // segId -> Promise<entry|null>
 let segCacheBytes = 0;
 let prefetchActive = 0;
 const prefetchQueue = [];
+const playerDemandIds = new Set();
 
 function getSegFromCache(id) {
     const e = segCache.get(id);
@@ -740,6 +742,28 @@ async function fetchSegToCache(id, url, prio = false) {
     finally { segInflight.delete(id); }
 }
 
+async function fetchSegForPlayer(id) {
+    playerDemandIds.add(id);
+    try {
+        let lastErr = null;
+        for (let attempt = 0; attempt <= SEGMENT_PLAYER_RETRIES; attempt++) {
+            try {
+                const entry = await fetchSegToCache(id, segRegistry.get(id), true);
+                if (entry) return entry;
+                lastErr = new Error("Segment fetch returned empty");
+            } catch (err) {
+                lastErr = err;
+            }
+            console.warn(`[SEG RETRY] ${getSegmentLabel(segRegistry.get(id) || id)} attempt=${attempt + 1}/${SEGMENT_PLAYER_RETRIES + 1} reason=${lastErr.message}`);
+            if (attempt < SEGMENT_PLAYER_RETRIES) await sleep(SEGMENT_PLAYER_RETRY_DELAY_MS);
+        }
+        throw lastErr || new Error("Segment fetch failed");
+    } finally {
+        playerDemandIds.delete(id);
+        pumpPrefetch();
+    }
+}
+
 function queuePrefetch(ids) {
     const candidates = SEGMENT_PREFETCH_AHEAD > 0 ? ids.slice(-SEGMENT_PREFETCH_AHEAD) : [];
     prefetchQueue.splice(0, prefetchQueue.length, ...prefetchQueue.filter(id => candidates.includes(id)));
@@ -751,6 +775,7 @@ function queuePrefetch(ids) {
 }
 
 function pumpPrefetch() {
+    if (playerDemandIds.size > 0) return;
     while (prefetchActive < SEGMENT_PREFETCH_CONCURRENCY && prefetchQueue.length > 0) {
         const id = prefetchQueue.shift();
         if (getSegFromCache(id) || segInflight.has(id)) continue;
@@ -1162,6 +1187,10 @@ function setPlaylistHeaders(res) {
     res.setHeader("Pragma", "no-cache");
 }
 
+function getWarmStartCount(rt) {
+    return rt.segs.slice(-MIN_START_SEGMENTS).filter(s => getSegFromCache(s.id)).length;
+}
+
 app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
     const t0 = Date.now();
     try {
@@ -1172,15 +1201,16 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         const host = getPublicHost(req);
 
         const rt = ensureChannel(ch.url, ch.name);
-        const fresh = rt.segs.length < MIN_START_SEGMENTS && !rt.isMaster;
-        console.log(`[HLS OPEN] channel="${ch.name}" resolve=${Date.now() - t0}ms depth=${rt.segs.length} ${fresh ? "(priming…)" : "(buffer ready)"}`);
+        const warm = getWarmStartCount(rt);
+        const fresh = !rt.isMaster && (rt.segs.length < MIN_START_SEGMENTS || warm < MIN_START_SEGMENTS);
+        console.log(`[HLS OPEN] channel="${ch.name}" resolve=${Date.now() - t0}ms depth=${rt.segs.length} warm=${warm}/${MIN_START_SEGMENTS} ${fresh ? "(priming…)" : "(buffer ready)"}`);
 
         // FIRST open only: short, capped wait for the initial cushion. Re-opens and
         // continuous polls never block here — the buffer is already deep — so the
         // player's manifest request is always answered fast (no timeout/crash).
         if (fresh) {
             const deadline = Date.now() + PRIME_TIMEOUT_MS;
-            while (rt.running && !rt.isMaster && rt.segs.length < MIN_START_SEGMENTS && Date.now() < deadline) {
+            while (rt.running && !rt.isMaster && (rt.segs.length < MIN_START_SEGMENTS || getWarmStartCount(rt) < MIN_START_SEGMENTS) && Date.now() < deadline) {
                 rt.lastPlayerAt = Date.now();
                 await sleep(700);
             }
@@ -1267,7 +1297,7 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
             if (cached) return sendCachedSeg(req, res, cached, segId, "HIT");
 
             const wasInflight = segInflight.has(segId);
-            const entry = await fetchSegToCache(segId, sourceUrl, true);
+            const entry = await fetchSegForPlayer(segId);
             if (entry) return sendCachedSeg(req, res, entry, segId, wasInflight ? "WAIT" : "MISS");
             return res.status(502).end();
         }
@@ -1459,6 +1489,7 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`📦 Node ${process.version}`);
     console.log(`🔁 manifest retryWindow=${MANIFEST_RETRY_WINDOW_MS / 1000}s delay=${MANIFEST_RETRY_DELAY_MS / 1000}s`);
     console.log(`⏩ prefetch ahead=${SEGMENT_PREFETCH_AHEAD} concurrency=${SEGMENT_PREFETCH_CONCURRENCY} cacheTTL=${SEGMENT_CACHE_TTL / 1000}s`);
+    console.log(`🩹 segment playerRetry=${SEGMENT_PLAYER_RETRIES} delay=${SEGMENT_PLAYER_RETRY_DELAY_MS}ms`);
     console.log(`🪟 buffer: retain/serve=${RETAIN_SEGMENTS} prime=${MIN_START_SEGMENTS}segs/${PRIME_TIMEOUT_MS / 1000}s idleStop=${POLLER_IDLE_STOP_MS / 1000}s`);
     console.log("=".repeat(60) + "\n");
 });
