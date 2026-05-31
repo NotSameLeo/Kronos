@@ -24,7 +24,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "4.0.0";
+const RELEASE_VERSION = "3.1.0";
 const ADDON_TYPE = "tv";
 const CATALOG_TTL = 30 * 60 * 1000;
 const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 20000);
@@ -38,14 +38,14 @@ const MANIFEST_RETRY_DEADLINE = Number(process.env.MANIFEST_RETRY_DEADLINE || 28
 
 // Light read-ahead segment cache — absorbs upstream jitter, does NOT create
 // bandwidth. Kept small and simple on purpose (no Range caching = no corruption).
-// Provider exposes max_connections=1, so concurrency 1: the prefetcher is the ONLY
-// upstream connection and the player reads from cache.
+const SEGMENT_PREFETCH_AHEAD = Number(process.env.SEGMENT_PREFETCH_AHEAD || 3);
+// Provider exposes max_connections=1, so concurrency 1 by default: in steady state
+// the prefetcher is the ONLY upstream connection and the player reads from cache.
+// (Raising this only helps if your provider tolerates parallel segment fetches.)
 const SEGMENT_PREFETCH_CONCURRENCY = Number(process.env.SEGMENT_PREFETCH_CONCURRENCY || 1);
-// Cache TTL must exceed the retained-buffer duration so retained segments are never
-// evicted out from under the player (then re-fetched).
-const SEGMENT_CACHE_TTL = Number(process.env.SEGMENT_CACHE_TTL || 300 * 1000);
-const SEGMENT_CACHE_MAX_BYTES = Number(process.env.SEGMENT_CACHE_MAX_BYTES || 400 * 1024 * 1024);
-const SEGMENT_CACHE_MAX_ITEMS = Number(process.env.SEGMENT_CACHE_MAX_ITEMS || 40);
+const SEGMENT_CACHE_TTL = Number(process.env.SEGMENT_CACHE_TTL || 90 * 1000);
+const SEGMENT_CACHE_MAX_BYTES = Number(process.env.SEGMENT_CACHE_MAX_BYTES || 256 * 1024 * 1024);
+const SEGMENT_CACHE_MAX_ITEMS = Number(process.env.SEGMENT_CACHE_MAX_ITEMS || 48);
 const SEGMENT_CACHE_MAX_ITEM_BYTES = Number(process.env.SEGMENT_CACHE_MAX_ITEM_BYTES || 24 * 1024 * 1024);
 const SLOW_SEGMENT_MS = Number(process.env.SLOW_SEGMENT_MS || 4000);
 
@@ -58,15 +58,13 @@ const SLOW_SEGMENT_MS = Number(process.env.SLOW_SEGMENT_MS || 4000);
 // IMMEDIATELY (non-blocking) from our buffer — no manifest is ever held hostage, so
 // the player can never time out / crash waiting. Only the very first open does a
 // short, capped prime wait to build the initial cushion.
-const RETAIN_SEGMENTS = Number(process.env.RETAIN_SEGMENTS || 18);   // ~3min retained & served
-// HARD anti-jump guarantee: the served live edge advances by at most this many
-// segments per request, even if the upstream buffer leapt ahead → no forward jump.
+const RETAIN_SEGMENTS = Number(process.env.RETAIN_SEGMENTS || 12);   // ~2min retained & served
+// HARD anti-jump guarantee: the live edge of the playlist we serve advances by at
+// most this many segments per request, even if the upstream buffer jumped ahead.
+// The player therefore never finds its current segment missing → never jumps/seeks.
 const MAX_EDGE_ADVANCE = Number(process.env.MAX_EDGE_ADVANCE || 2);
-const MIN_START_SEGMENTS = Number(process.env.MIN_START_SEGMENTS || 3); // initial cushion depth
-const PRIME_TIMEOUT_MS = Number(process.env.PRIME_TIMEOUT_MS || 22000);  // max FIRST-open wait
-// How far behind the live edge the player is told to start (deterministic cushion
-// via #EXT-X-START). The retained buffer is much deeper, for stall insurance.
-const TARGET_CUSHION_SECONDS = Number(process.env.TARGET_CUSHION_SECONDS || 30);
+const MIN_START_SEGMENTS = Number(process.env.MIN_START_SEGMENTS || 3); // initial cushion
+const PRIME_TIMEOUT_MS = Number(process.env.PRIME_TIMEOUT_MS || 18000);  // max FIRST-open wait
 const POLLER_IDLE_STOP_MS = Number(process.env.POLLER_IDLE_STOP_MS || 90000); // stop if player gone
 const POLL_MIN_MS = Number(process.env.POLL_MIN_MS || 2000);
 const POLL_MAX_MS = Number(process.env.POLL_MAX_MS || 5000);
@@ -842,87 +840,61 @@ app.get("/:base64Config/poster/:id.svg", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Playback engine — single-connection poller + DVR buffer + smooth serve
-//
-// Built for slow, tokenized, on-demand HLS (Comedy Central is the benchmark):
-//  • segment identity = FILENAME (token-independent) → no phantom re-downloads
-//  • absolute, monotonic sequence numbers → the player timeline never jumps back
-//  • ONE serialized upstream connection (max_connections=1) → no aborts
-//  • deep retained buffer + #EXT-X-START cushion + smooth edge → no forward jumps
-//  • restart-aware (on-demand teardown) → continues forward with a fresh generation
+// Playback — background poller + retained buffer + non-blocking serve
 // ─────────────────────────────────────────────────────────────────────────────
-const channels = new Map();     // channelUrl -> runtime
-let activeChannelUrl = null;    // only ONE channel touches the upstream at a time
+const channels = new Map();      // channelUrl -> runtime
+let activeChannelUrl = null;     // only ONE channel polls upstream (max_connections=1)
 
-function shortLabel(s) { return String(s || "stream").replace(/\s*\([^)]*\)\s*$/, "").trim().slice(0, 24); }
-function fileNameOf(url) {
-    try { return (decodeURIComponent(new URL(url).pathname).split("/").filter(Boolean).pop() || "").toLowerCase(); }
-    catch { return (String(url).split("?")[0].split("#")[0].split("/").filter(Boolean).pop() || "").toLowerCase(); }
-}
-function segIndexOf(filename) {
-    const m = String(filename).match(/(\d+)\.[a-z0-9]+$/i);   // trailing number before extension
-    return m ? Number(m[1]) : -1;
-}
-
-// Parse a media playlist into ordered segments. Identity is the token-free FILENAME.
-function parseMediaPlaylist(playlist, baseUrl) {
-    const segs = [];
+function parseSegments(playlist, baseUrl) {
+    const out = [];
     let dur = 0;
     for (const raw of String(playlist || "").split(/\r?\n/)) {
         const t = raw.trim();
         if (!t || t.startsWith("#EXT-X-ENDLIST")) continue;
-        if (t.startsWith("#EXTINF")) { const m = t.match(/#EXTINF:([0-9.]+)/); dur = m ? Number(m[1]) : 0; continue; }
+        if (t.startsWith("#EXTINF")) {
+            const m = t.match(/#EXTINF:([0-9.]+)/);
+            dur = m ? Number(m[1]) : 0;
+            continue;
+        }
         if (t.startsWith("#")) continue;
-        if (isHlsUrl(t)) continue;
+        if (isHlsUrl(t)) continue;   // nested playlist (handled elsewhere)
         const abs = toAbsoluteUrl(t, baseUrl);
-        const filename = fileNameOf(abs);
-        segs.push({ filename, realUrl: abs, duration: dur || 0, index: segIndexOf(filename) });
+        out.push({ segId: segIdFor(abs), realUrl: abs, duration: dur || 6 });
         dur = 0;
     }
-    return segs;
-}
-
-function newRuntime(url, label) {
-    return {
-        url, label, key: hashKey(url).slice(0, 8),
-        segs: [],            // [{ id, absSeq, duration }] chronological, absSeq ascending
-        byId: new Map(),     // id -> seg
-        nextAbs: 0,          // monotonic absSeq counter (never reset)
-        generation: 0,
-        target: 6,
-        lastMaxIndex: -1,    // restart detection via filename numbering
-        lastUpSeq: -1,       // restart detection via upstream MEDIA-SEQUENCE
-        servedEdge: null,    // absSeq of newest segment shown to the player (smoothed)
-        isMaster: false,
-        lastPlayerAt: Date.now(),
-        running: false, timer: null
-    };
+    return out;
 }
 
 function stopPoller(rt, reason) {
     rt.running = false;
     if (rt.timer) { clearTimeout(rt.timer); rt.timer = null; }
-    console.log(`[IDLE] ${shortLabel(rt.label)} — poller stopped (${reason})`);
-    // Keep the buffer: if reopened soon, segments are still cached. A genuine upstream
-    // restart is handled by the generation bump on the next ingest.
+    rt.segs = []; rt.byId = new Set(); rt.seqBase = 0; rt.lastSeq = -1; rt.servedEdge = null;
+    console.log(`[POLLER STOP] channel="${rt.label}" reason=${reason}`);
 }
 
 function ensureChannel(url, label) {
-    // max_connections=1: only one channel may touch the upstream. Stop the previous.
+    // max_connections=1: stop any other channel's poller before starting this one.
     if (activeChannelUrl && activeChannelUrl !== url) {
         const other = channels.get(activeChannelUrl);
-        if (other && other.running) stopPoller(other, "switched channel");
+        if (other && other.running) stopPoller(other, "channel-switch");
         prefetchQueue.length = 0;
     }
     activeChannelUrl = url;
 
     let rt = channels.get(url);
-    if (!rt) { rt = newRuntime(url, label); channels.set(url, rt); }
+    if (!rt) {
+        rt = {
+            url, label, segs: [], byId: new Set(), seqBase: 0, generation: 0,
+            target: 6, lastSeq: -1, isMaster: false, lastPlayerAt: Date.now(),
+            running: false, timer: null, servedEdge: null
+        };
+        channels.set(url, rt);
+    }
     rt.label = label;
     rt.lastPlayerAt = Date.now();
     if (!rt.running) {
         rt.running = true;
-        console.log(`[LIVE] ${shortLabel(label)} — poller started`);
+        console.log(`[POLLER START] channel="${label}"`);
         pollChannelLoop(rt);
     }
     return rt;
@@ -931,99 +903,92 @@ function ensureChannel(url, label) {
 async function pollChannelLoop(rt) {
     if (!rt.running) return;
     if (Date.now() - rt.lastPlayerAt > POLLER_IDLE_STOP_MS) {
-        stopPoller(rt, "player gone");
+        stopPoller(rt, "player-idle");
         if (activeChannelUrl === rt.url) activeChannelUrl = null;
         return;
     }
     try {
-        const { data, finalUrl, info } = await fetchUpstreamHLS(rt.url, shortLabel(rt.label));
-        if (info.isMaster) { rt.isMaster = true; stopPoller(rt, "master playlist"); return; }
+        const { data, finalUrl, info } = await fetchUpstreamHLS(rt.url, rt.label);
+        if (info.isMaster) {
+            rt.isMaster = true;
+            stopPoller(rt, "master-playlist");   // master is served passthrough, no buffer
+            return;
+        }
         if (info.isLive) ingestPlaylist(rt, data, finalUrl, info);
     } catch (e) {
-        console.warn(`[POLL ERR] ${shortLabel(rt.label)} — ${e.message}`);
+        console.warn(`[POLLER ERR] channel="${rt.label}" ${e.message}`);
     }
     if (!rt.running) return;
-    const delay = Math.max(POLL_MIN_MS, Math.min(POLL_MAX_MS, Math.round((rt.target || 6) * 500)));
+    const delay = Math.max(POLL_MIN_MS, Math.min(POLL_MAX_MS, (rt.target || 6) * 500));
     rt.timer = setTimeout(() => pollChannelLoop(rt), delay);
     if (rt.timer.unref) rt.timer.unref();
 }
 
 function ingestPlaylist(rt, playlist, baseUrl, info) {
     rt.target = info.targetDuration || rt.target;
-    const parsed = parseMediaPlaylist(playlist, baseUrl);
-    if (!parsed.length) return;
-
-    const upSeq = Number(info.mediaSequence || 0);
-    const maxIndex = parsed.reduce((m, s) => Math.max(m, s.index), -1);
-    // Restart: the on-demand stream was torn down and restarted → filename numbering
-    // reset OR upstream MEDIA-SEQUENCE went backward. Bump generation so reused
-    // filenames get fresh ids (no stale cache); keep absSeq advancing FORWARD so the
-    // player rejoins live moving forward, never "back to the beginning".
-    const indexReset = maxIndex >= 0 && rt.lastMaxIndex >= 0 && maxIndex < rt.lastMaxIndex;
-    const seqReset = rt.lastUpSeq >= 0 && upSeq < rt.lastUpSeq;
-    if (rt.segs.length && (indexReset || seqReset)) {
+    const seq = Number(info.mediaSequence || 0);
+    // Restart detection: an on-demand stream that was torn down restarts at a LOWER
+    // media-sequence. Same segment paths now hold DIFFERENT content, so we bump a
+    // generation (mixed into the id) to avoid serving stale cached segments.
+    if (rt.lastSeq >= 0 && seq < rt.lastSeq) {
         rt.generation++;
-        rt.lastMaxIndex = -1;
-        console.log(`[RESTART] ${shortLabel(rt.label)} — upstream restarted, continuing forward (gen ${rt.generation}, seq ${rt.nextAbs})`);
+        // Continue the absolute sequence forward (don't reset to 0) so the player's
+        // MEDIA-SEQUENCE never goes backward → it rejoins live moving forward instead
+        // of "jumping to the beginning". New generation keeps stale cache out.
+        rt.seqBase = rt.seqBase + rt.segs.length;
+        rt.segs = []; rt.byId = new Set();
+        console.log(`[CHANNEL RESTART] channel="${rt.label}" seq ${rt.lastSeq}->${seq} gen=${rt.generation} continuing seqBase=${rt.seqBase}`);
     }
-    rt.lastUpSeq = upSeq;
-    if (maxIndex >= 0) rt.lastMaxIndex = Math.max(rt.lastMaxIndex, maxIndex);
+    rt.lastSeq = seq;
 
     let added = 0;
-    for (const s of parsed) {
-        const id = `${rt.key}:g${rt.generation}:${s.filename}`;
-        registerSeg(id, s.realUrl);                 // refresh the token-bearing URL
+    for (const s of parseSegments(playlist, baseUrl)) {
+        const id = `g${rt.generation}:${s.segId}`;
+        registerSeg(id, s.realUrl);          // always refresh the token-bearing URL
         if (!rt.byId.has(id)) {
-            const seg = { id, absSeq: rt.nextAbs++, duration: s.duration || rt.target || 6 };
-            rt.byId.set(id, seg);
-            rt.segs.push(seg);
+            rt.byId.add(id);
+            rt.segs.push({ id, duration: s.duration });
             added++;
         }
     }
     while (rt.segs.length > RETAIN_SEGMENTS) {
         const dropped = rt.segs.shift();
         rt.byId.delete(dropped.id);
+        rt.seqBase++;
     }
     if (added > 0) {
-        queuePrefetch(rt.segs.map(s => s.id));      // keep the whole retained buffer warm
-        const lo = rt.segs[0].absSeq, hi = rt.segs[rt.segs.length - 1].absSeq;
-        console.log(`[POLL +${added}] ${shortLabel(rt.label)} — buffer ${rt.segs.length}/${RETAIN_SEGMENTS} (seq ${lo}..${hi}) cache ${segCache.size}/${formatBytes(segCacheBytes)}`);
+        queuePrefetch(rt.segs.map(s => s.id));   // keep the retained buffer warm (oldest first)
+        console.log(`[BUFFER] channel="${rt.label}" +${added} depth=${rt.segs.length}/${RETAIN_SEGMENTS} seqBase=${rt.seqBase} cache=${segCache.size}/${formatBytes(segCacheBytes)} prefetch=${prefetchActive}+${prefetchQueue.length}`);
     }
 }
 
 function buildServedPlaylist(rt, hostBase, configKey) {
-    const lo = rt.segs[0].absSeq;
-    const hi = rt.segs[rt.segs.length - 1].absSeq;
+    const lo = rt.seqBase;
+    const hi = rt.seqBase + rt.segs.length - 1;
 
-    // Smoothly advance the served live edge (≤ MAX_EDGE_ADVANCE per request). Newer
-    // segments are held back (still prefetched) so the edge never leaps → no jump.
-    if (rt.servedEdge == null || rt.servedEdge > hi) rt.servedEdge = hi;
+    // ANTI-JUMP: advance the served live edge by at most MAX_EDGE_ADVANCE per request,
+    // so the player's timeline NEVER jumps even if the upstream buffer leapt ahead.
+    // Newer segments are simply held back (still prefetched) until the edge catches up.
+    if (rt.servedEdge == null || rt.servedEdge > hi) rt.servedEdge = hi;       // (re)attach at edge
     else rt.servedEdge = Math.min(hi, rt.servedEdge + MAX_EDGE_ADVANCE);
-    if (rt.servedEdge < lo) rt.servedEdge = lo;
+    if (rt.servedEdge < lo) rt.servedEdge = lo;                                // never before buffer
 
-    const endPos = rt.servedEdge - lo;
-    const win = rt.segs.slice(0, endPos + 1);        // full retained tail up to the edge
-    const mediaSeq = win[0].absSeq;
+    const endIdx = rt.servedEdge - rt.seqBase;
+    const startIdx = Math.max(0, endIdx - RETAIN_SEGMENTS + 1);   // full retained depth behind edge
+    const win = rt.segs.slice(startIdx, endIdx + 1);
+    const mediaSeq = rt.seqBase + startIdx;
     const target = Math.max(1, Math.ceil(Math.max(rt.target || 6, ...win.map(s => s.duration || 0))));
-
-    // Deterministic cushion: tell the player to start TARGET_CUSHION seconds behind
-    // our live edge (bounded by what we actually have). The deep retained tail then
-    // absorbs slow segments without the player ever starving at the edge.
-    const totalSec = win.reduce((a, s) => a + (s.duration || rt.target || 6), 0);
-    const cushion = Math.min(TARGET_CUSHION_SECONDS, Math.max(0, totalSec - (rt.target || 6)));
-
     const lines = [
         "#EXTM3U",
         "#EXT-X-VERSION:3",
         `#EXT-X-TARGETDURATION:${target}`,
         `#EXT-X-MEDIA-SEQUENCE:${mediaSeq}`
     ];
-    if (cushion > 0) lines.push(`#EXT-X-START:TIME-OFFSET=-${cushion.toFixed(1)},PRECISE=YES`);
     for (const s of win) {
         lines.push(`#EXTINF:${Number(s.duration || rt.target || 6).toFixed(3)},`);
         lines.push(`${hostBase}/${configKey}/proxy/seg?s=${encodeURIComponent(s.id)}`);
     }
-    return { playlist: lines.join("\n") + "\n", count: win.length, mediaSeq, edge: rt.servedEdge, hi, cushion };
+    return { playlist: lines.join("\n") + "\n", count: win.length, mediaSeq, edge: rt.servedEdge, hi };
 }
 
 function setPlaylistHeaders(res) {
@@ -1040,44 +1005,41 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         const ch = await getChannelById(configKey, config, req.params.id);
         if (!ch) return res.status(404).send("#EXTM3U\n#EXT-X-ENDLIST\n");
         const host = getPublicHost(req);
-        const rt = ensureChannel(ch.url, ch.name);
 
-        // FIRST open only: brief, capped wait to build the initial cushion. Re-opens
-        // and continuous polls are answered instantly (buffer already deep) so the
-        // player's manifest request never hangs → no timeout/crash.
-        if (!rt.isMaster && rt.segs.length < MIN_START_SEGMENTS) {
-            console.log(`[OPEN] ${shortLabel(ch.name)} — priming (buffer ${rt.segs.length})`);
+        const rt = ensureChannel(ch.url, ch.name);
+        const fresh = rt.segs.length < MIN_START_SEGMENTS && !rt.isMaster;
+        console.log(`[HLS OPEN] channel="${ch.name}" resolve=${Date.now() - t0}ms depth=${rt.segs.length} ${fresh ? "(priming…)" : "(buffer ready)"}`);
+
+        // FIRST open only: short, capped wait for the initial cushion. Re-opens and
+        // continuous polls never block here — the buffer is already deep — so the
+        // player's manifest request is always answered fast (no timeout/crash).
+        if (fresh) {
             const deadline = Date.now() + PRIME_TIMEOUT_MS;
             while (rt.running && !rt.isMaster && rt.segs.length < MIN_START_SEGMENTS && Date.now() < deadline) {
                 rt.lastPlayerAt = Date.now();
-                await sleep(600);
+                await sleep(700);
             }
         }
 
         if (rt.isMaster) {
-            const { data, finalUrl } = await fetchUpstreamHLS(ch.url, shortLabel(ch.name));
+            const { data, finalUrl } = await fetchUpstreamHLS(ch.url, ch.name);
             const { rewritten } = rewriteHLSUrls(data, finalUrl, host, configKey);
             setPlaylistHeaders(res);
-            console.log(`[SERVE] ${shortLabel(ch.name)} — master playlist`);
+            console.log(`[HLS SERVE] channel="${ch.name}" type=master`);
             return res.send(rewritten);
         }
 
         if (!rt.segs.length) {
-            console.warn(`[OPEN FAIL] ${shortLabel(ch.name)} — no segments after ${Date.now() - t0}ms`);
+            console.warn(`[HLS EMPTY] channel="${ch.name}" no segments after ${Date.now() - t0}ms`);
             return res.status(502).send("#EXTM3U\n#EXT-X-ENDLIST\n");
         }
 
-        const { playlist, count, mediaSeq, edge, hi, cushion } = buildServedPlaylist(rt, host, configKey);
+        const { playlist, count, mediaSeq, edge, hi } = buildServedPlaylist(rt, host, configKey);
         setPlaylistHeaders(res);
-        const waited = Date.now() - t0;
-        console.log(
-            `[SERVE] ${shortLabel(ch.name)} — ${count} segs, seq ${mediaSeq}..${edge}` +
-            `${hi > edge ? ` (+${hi - edge} held)` : ""} cushion ${Math.round(cushion)}s` +
-            `${waited > 80 ? ` waited ${waited}ms` : ""}`
-        );
+        console.log(`[HLS SERVE] channel="${ch.name}" window=${count} seq=${mediaSeq} edge=${edge}/${hi}${edge < hi ? ` (held ${hi - edge})` : ""} gen=${rt.generation} cache=${segCache.size}/${formatBytes(segCacheBytes)} prefetch=${prefetchActive}+${prefetchQueue.length} waited=${Date.now() - t0}ms`);
         res.send(playlist);
     } catch (err) {
-        console.error(`[OPEN ERR] ${err.message}`);
+        console.error(`[HLS ERROR] ${err.message}`);
         if (!res.headersSent) res.status(502).send("#EXTM3U\n#EXT-X-ENDLIST\n");
     }
 });
@@ -1089,55 +1051,67 @@ app.get("/:base64Config/proxy/pl", async (req, res) => {
         decodeConfig(configKey);
         if (!req.query.u) return res.status(400).send("#EXTM3U\n");
         const sourceUrl = decodeProxyUrl(req.query.u);
-        const { data, finalUrl } = await fetchUpstreamHLS(sourceUrl, "nested");
+        const { data, finalUrl } = await fetchUpstreamHLS(sourceUrl, "nested-playlist");
         const { rewritten } = rewriteHLSUrls(data, finalUrl, getPublicHost(req), configKey);
         setPlaylistHeaders(res);
         res.send(rewritten);
     } catch (err) {
-        console.error(`[PL ERR] ${err.message}`);
+        console.error(`[PL ERROR] ${err.message}`);
         if (!res.headersSent) res.status(502).send("#EXTM3U\n#EXT-X-ENDLIST\n");
     }
 });
 
 app.get("/:base64Config/proxy/seg", async (req, res) => {
-    const t0 = Date.now();
+    const started = Date.now();
     let sourceUrl = null;
     let segId = null;
+
     try {
         decodeConfig(req.params.base64Config);
 
-        // Any segment activity keeps the active channel's poller alive (so a 2x stall
-        // that pauses playlist polling doesn't let the stream get torn down).
+        // Any segment activity counts as the player being alive → keep the poller
+        // running even if the player paused polling the playlist (e.g. during a 2x stall).
         if (activeChannelUrl) {
             const rt = channels.get(activeChannelUrl);
             if (rt) rt.lastPlayerAt = Date.now();
         }
 
         if (req.query.s) {
+            // HLS segment: stable id → resolve freshest token-bearing URL.
             segId = String(req.query.s);
             sourceUrl = segRegistry.get(segId);
-            if (!sourceUrl) {           // unknown id (restart/aged out) → make the player refresh
-                console.warn(`[GET 404] ${segId} — unknown segment, player should refresh`);
+            if (!sourceUrl) {
+                // Unknown id (server restarted / aged out). Tell the player to refresh
+                // the playlist rather than serve garbage.
+                console.warn(`[SEG MISS-ID] ${segId} not in registry`);
                 return res.status(404).end();
             }
-            const cached = getSegFromCache(segId);
-            if (cached) return sendCachedSeg(req, res, cached, segId, "cache");
+        } else if (req.query.u) {
+            // Direct (non-HLS) stream URL — continuous, never cached.
+            sourceUrl = decodeProxyUrl(req.query.u);
+        } else {
+            return res.status(400).end();
+        }
 
-            // Miss → fetch through the SERIAL gate with priority; dedups with any
-            // in-flight prefetch. NEVER opens a competing connection (max_connections=1).
+        // HLS segment: serve from cache (Range-sliceable, always a full 200). On a
+        // miss, fetch it through the SERIAL upstream gate with PRIORITY — never open a
+        // competing connection (that's what the provider aborts under max_connections=1).
+        // fetchSegToCache dedups with any in-flight prefetch, so we just await it.
+        if (segId) {
+            const cached = getSegFromCache(segId);
+            if (cached) return sendCachedSeg(req, res, cached, segId, "HIT");
+
             const wasInflight = segInflight.has(segId);
             const entry = await fetchSegToCache(segId, sourceUrl, true);
-            if (entry) return sendCachedSeg(req, res, entry, segId, wasInflight ? "wait" : "fetch");
+            if (entry) return sendCachedSeg(req, res, entry, segId, wasInflight ? "WAIT" : "MISS");
             return res.status(502).end();
         }
 
-        if (req.query.u) {              // direct (non-HLS) continuous stream → passthrough
-            sourceUrl = decodeProxyUrl(req.query.u);
-            return streamSegment(req, res, sourceUrl, t0);
-        }
-        return res.status(400).end();
+        // Direct (non-HLS) continuous stream: straight passthrough (its own single
+        // connection, no prefetch competing).
+        await streamSegment(req, res, sourceUrl, segId, started);
     } catch (err) {
-        console.error(`[GET ERR] ${getSegmentLabel(sourceUrl)} ${err.message}`);
+        console.error(`[SEG ERROR] ${getSegmentLabel(sourceUrl)} ${err.message}`);
         if (!res.headersSent) res.status(502).end();
         else if (!res.destroyed) res.destroy(err);
     }
@@ -1170,18 +1144,18 @@ function sendCachedSeg(req, res, entry, segId, label) {
             res.status(206);
             res.setHeader("Content-Range", `bytes ${start}-${end}/${total}`);
             res.setHeader("Content-Length", chunk.length);
-            console.log(`[GET ${label}] ${name} ${formatBytes(chunk.length)} (range ${start}-${end})`);
+            console.log(`[SEG ${label}] ${name} range=${start}-${end}/${total}`);
             return res.end(chunk);
         }
     }
 
     res.setHeader("Content-Length", total);
-    console.log(`[GET ${label}] ${name} ${formatBytes(total)}`);
+    console.log(`[SEG ${label}] ${name} bytes=${formatBytes(total)}`);
     return res.end(buf);
 }
 
-// Direct passthrough for non-HLS continuous streams (?u=). Its own single connection.
-async function streamSegment(req, res, sourceUrl, started) {
+// Stream a segment straight through, caching it (by segId) on the way if full 200.
+async function streamSegment(req, res, sourceUrl, segId, started) {
     const headers = { "User-Agent": UPSTREAM_UA, "Accept": "*/*", "Accept-Encoding": "identity", "Connection": "keep-alive" };
     if (req.headers.range) headers.Range = req.headers.range;
 
@@ -1202,19 +1176,36 @@ async function streamSegment(req, res, sourceUrl, started) {
         if (response.headers[h]) res.setHeader(h, response.headers[h]);
     });
     res.setHeader("X-Kronos-Relay", "1");
+    res.setHeader("X-Kronos-Cache", "MISS");
     res.status(response.status);
 
+    // Only cache full 200 HLS segments (segId present, no Range).
+    const collect = (segId && response.status === 200 && !req.headers.range);
+    const chunks = collect ? [] : null;
     let bytes = 0;
-    upstream.on("data", chunk => { bytes += chunk.length; });
+    let overflow = false;
+
+    upstream.on("data", chunk => {
+        bytes += chunk.length;
+        if (chunks && !overflow) {
+            if (bytes > SEGMENT_CACHE_MAX_ITEM_BYTES) { overflow = true; chunks.length = 0; }
+            else chunks.push(chunk);
+        }
+    });
+
     res.on("finish", () => {
         const ms = Date.now() - started;
-        console.log(`[GET direct] ${getSegmentLabel(sourceUrl)} ${formatBytes(bytes)} ${ms}ms ${formatSpeed(bytes, ms)}`);
+        if (chunks && !overflow && chunks.length) storeSeg(segId, Buffer.concat(chunks), response.headers, 200);
+        const slow = ms >= SLOW_SEGMENT_MS ? " SLOW" : "";
+        console.log(`[SEG] ${getSegmentLabel(sourceUrl)} status=${response.status} bytes=${formatBytes(bytes)} time=${ms}ms speed=${formatSpeed(bytes, ms)}${slow}`);
     });
+
     res.on("close", () => { if (!res.writableEnded && upstream?.destroy) upstream.destroy(); });
     upstream.on("error", err => {
         if (!res.headersSent) res.status(502).end();
         else res.destroy(err);
     });
+
     upstream.pipe(res);
 }
 
@@ -1251,9 +1242,7 @@ app.get("/:base64Config/stats", (req, res) => {
             prefetchQueue: prefetchQueue.length
         },
         channels: [...channels.values()].map(rt => ({
-            label: rt.label, depth: rt.segs.length,
-            seq: rt.segs.length ? `${rt.segs[0].absSeq}..${rt.segs[rt.segs.length - 1].absSeq}` : null,
-            servedEdge: rt.servedEdge, generation: rt.generation,
+            label: rt.label, depth: rt.segs.length, seqBase: rt.seqBase, generation: rt.generation,
             running: rt.running, isMaster: rt.isMaster, idleMs: Date.now() - rt.lastPlayerAt
         })),
         activeChannel: activeChannelUrl ? (channels.get(activeChannelUrl)?.label || "?") : null
@@ -1298,7 +1287,7 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`🌐 http://0.0.0.0:${PORT}`);
     console.log(`📦 Node ${process.version}`);
     console.log(`🔁 manifest retry=${MANIFEST_RETRIES} delay=${MANIFEST_RETRY_DELAY}ms`);
-    console.log(`⏩ prefetch concurrency=${SEGMENT_PREFETCH_CONCURRENCY} (serialized) cacheTTL=${SEGMENT_CACHE_TTL / 1000}s`);
-    console.log(`🪟 buffer: retain=${RETAIN_SEGMENTS} cushion=${TARGET_CUSHION_SECONDS}s prime=${MIN_START_SEGMENTS}segs/${PRIME_TIMEOUT_MS / 1000}s edgeStep=${MAX_EDGE_ADVANCE} idleStop=${POLLER_IDLE_STOP_MS / 1000}s`);
+    console.log(`⏩ prefetch ahead=${SEGMENT_PREFETCH_AHEAD} concurrency=${SEGMENT_PREFETCH_CONCURRENCY} cacheTTL=${SEGMENT_CACHE_TTL / 1000}s`);
+    console.log(`🪟 buffer: retain/serve=${RETAIN_SEGMENTS} prime=${MIN_START_SEGMENTS}segs/${PRIME_TIMEOUT_MS / 1000}s idleStop=${POLLER_IDLE_STOP_MS / 1000}s`);
     console.log("=".repeat(60) + "\n");
 });
