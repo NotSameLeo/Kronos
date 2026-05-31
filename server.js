@@ -49,21 +49,21 @@ const SEGMENT_CACHE_MAX_ITEMS = Number(process.env.SEGMENT_CACHE_MAX_ITEMS || 48
 const SEGMENT_CACHE_MAX_ITEM_BYTES = Number(process.env.SEGMENT_CACHE_MAX_ITEM_BYTES || 24 * 1024 * 1024);
 const SLOW_SEGMENT_MS = Number(process.env.SLOW_SEGMENT_MS || 4000);
 
-// Window warm-up — for channels whose upstream exposes a too-shallow live window
-// (e.g. starts fresh at seq=0 with 1 segment). We wait for the window to accumulate
-// a minimum amount of content before handing it to the player, so it starts with a
-// real cushion instead of starving at the live edge. Self-gating: does nothing when
-// the window is already deep, and bails if the window isn't growing.
-// Warm-up target is SEGMENT-COUNT based (robust to the provider's changing
-// targetDuration). We hold the channel open until the live window is at least
-// this many segments deep, so the player attaches BEHIND the live edge (cushion)
-// instead of pinned to the bleeding edge of a freshly-started stream.
-const MIN_START_SEGMENTS = Number(process.env.MIN_START_SEGMENTS || 4);
-const WINDOW_WARM_TIMEOUT = Number(process.env.WINDOW_WARM_TIMEOUT || 45000);
-const WINDOW_WARM_POLL = Number(process.env.WINDOW_WARM_POLL || 2500);
-// Only warm a channel when it's a fresh (re)open. If the same channel was served
-// within this window, it's continuous playback → skip the wait, just refresh.
-const REWARM_AFTER_MS = Number(process.env.REWARM_AFTER_MS || 45000);
+// ── Background poller + retained buffer ─────────────────────────────────────────
+// These channels are ON-DEMAND: the upstream starts a fresh encoder (seq=0, 1 seg)
+// when first requested and tears it down when nobody fetches → on resume it restarts
+// from scratch. To make playback seamless we run a background poller per active
+// channel that (a) keeps the upstream stream ALIVE, (b) accumulates a deep retained
+// buffer, and (c) prefetches segments. The player is then served a deep window
+// IMMEDIATELY (non-blocking) from our buffer — no manifest is ever held hostage, so
+// the player can never time out / crash waiting. Only the very first open does a
+// short, capped prime wait to build the initial cushion.
+const RETAIN_SEGMENTS = Number(process.env.RETAIN_SEGMENTS || 12);   // ~2min retained & served
+const MIN_START_SEGMENTS = Number(process.env.MIN_START_SEGMENTS || 3); // initial cushion
+const PRIME_TIMEOUT_MS = Number(process.env.PRIME_TIMEOUT_MS || 18000);  // max FIRST-open wait
+const POLLER_IDLE_STOP_MS = Number(process.env.POLLER_IDLE_STOP_MS || 90000); // stop if player gone
+const POLL_MIN_MS = Number(process.env.POLL_MIN_MS || 2000);
+const POLL_MAX_MS = Number(process.env.POLL_MAX_MS || 5000);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // In-memory caches (catalog/EPG/logos only — no playback buffering anymore)
@@ -805,95 +805,148 @@ app.get("/:base64Config/poster/:id.svg", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Playback — pass-through HLS
+// Playback — background poller + retained buffer + non-blocking serve
 // ─────────────────────────────────────────────────────────────────────────────
-// Fetch the manifest; if it's a live media playlist with a too-shallow window
-// (a freshly-started on-demand stream), keep re-polling until it accumulates at
-// least MIN_START_SEGMENTS, so the player attaches BEHIND the live edge with a
-// real cushion. Bails only if the window is sliding (capped) and won't deepen.
-const lastWarmServe = new Map();   // sourceUrl -> last served timestamp (set only AFTER serving)
-const warmInflight = new Map();    // sourceUrl -> in-progress fetchWithWarmWindow promise
+const channels = new Map();      // channelUrl -> runtime
+let activeChannelUrl = null;     // only ONE channel polls upstream (max_connections=1)
 
-function noteWarmServe(url) {
-    lastWarmServe.set(url, Date.now());
-    if (lastWarmServe.size > 2000) {
-        const oldest = lastWarmServe.keys().next().value;
-        if (oldest !== undefined && oldest !== url) lastWarmServe.delete(oldest);
+function parseSegments(playlist, baseUrl) {
+    const out = [];
+    let dur = 0;
+    for (const raw of String(playlist || "").split(/\r?\n/)) {
+        const t = raw.trim();
+        if (!t || t.startsWith("#EXT-X-ENDLIST")) continue;
+        if (t.startsWith("#EXTINF")) {
+            const m = t.match(/#EXTINF:([0-9.]+)/);
+            dur = m ? Number(m[1]) : 0;
+            continue;
+        }
+        if (t.startsWith("#")) continue;
+        if (isHlsUrl(t)) continue;   // nested playlist (handled elsewhere)
+        const abs = toAbsoluteUrl(t, baseUrl);
+        out.push({ segId: segIdFor(abs), realUrl: abs, duration: dur || 6 });
+        dur = 0;
     }
+    return out;
 }
 
-function fetchWithWarmWindow(sourceUrl, label) {
-    // Dedup: concurrent player polls during a warm share the SAME warm — they all
-    // receive the deep window instead of one of them slipping through with segs=1.
-    if (warmInflight.has(sourceUrl)) return warmInflight.get(sourceUrl);
-    const p = (async () => {
-        const last = lastWarmServe.get(sourceUrl) || 0;
-        const skipWarm = Date.now() - last < REWARM_AFTER_MS;   // continuous playback → don't wait
-
-        let best = await fetchUpstreamHLS(sourceUrl, label);
-        if (skipWarm || best.info.isMaster || !best.info.isLive || best.info.segmentCount >= MIN_START_SEGMENTS) {
-            noteWarmServe(sourceUrl);
-            return best;
-        }
-
-        const startSegs = best.info.segmentCount;
-        const started = Date.now();
-        console.log(`[HLS WARM START] channel="${label}" segs=${startSegs}/${MIN_START_SEGMENTS} — building cushion before the player attaches`);
-
-        while (best.info.segmentCount < MIN_START_SEGMENTS && Date.now() - started < WINDOW_WARM_TIMEOUT) {
-            await sleep(WINDOW_WARM_POLL);
-            const next = await fetchUpstreamHLS(sourceUrl, label);
-            if (next.info.isMaster || !next.info.isLive) { best = next; break; }
-
-            const grew = next.info.segmentCount > best.info.segmentCount;
-            // The window is SLIDING (capped) if media-sequence advances. Only then is
-            // it "as deep as it gets" — bail. If it's NOT sliding and just hasn't grown
-            // yet, the encoder simply hasn't produced the next segment: keep waiting.
-            const sliding = Number(next.info.mediaSequence || 0) > Number(best.info.mediaSequence || 0);
-            console.log(`[HLS WARM] channel="${label}" segs=${next.info.segmentCount}/${MIN_START_SEGMENTS} seq=${next.info.mediaSequence} waited=${Date.now() - started}ms`);
-            best = next;
-            if (!grew && sliding) {
-                console.log(`[HLS WARM CAPPED] channel="${label}" window won't deepen (sliding at ${best.info.segmentCount} segs) — serving what we have`);
-                break;
-            }
-        }
-        noteWarmServe(sourceUrl);
-        console.log(`[HLS WARM DONE] channel="${label}" segs=${startSegs}→${best.info.segmentCount} waited=${Date.now() - started}ms`);
-        return best;
-    })();
-
-    warmInflight.set(sourceUrl, p);
-    p.finally(() => { if (warmInflight.get(sourceUrl) === p) warmInflight.delete(sourceUrl); });
-    return p;
+function stopPoller(rt, reason) {
+    rt.running = false;
+    if (rt.timer) { clearTimeout(rt.timer); rt.timer = null; }
+    rt.segs = []; rt.byId = new Set(); rt.seqBase = 0; rt.lastSeq = -1;
+    console.log(`[POLLER STOP] channel="${rt.label}" reason=${reason}`);
 }
 
-async function servePlaylist(res, sourceUrl, host, configKey, label, doWarm = true) {
-    const { data, finalUrl, info } = doWarm
-        ? await fetchWithWarmWindow(sourceUrl, label)
-        : await fetchUpstreamHLS(sourceUrl, label);
-    const { rewritten, segIds } = rewriteHLSUrls(data, finalUrl, host, configKey);
-
-    // Single-connection provider: keep the prefetcher focused ONLY on the current
-    // channel. Drop pending prefetch from a previously-watched channel so a switch
-    // never holds two upstream connections at once. Prefetch the WHOLE served window
-    // in playlist order (oldest first) so the player gets cache HITs no matter where
-    // it attaches — with concurrency 1 this is the single upstream connection while
-    // the player reads from RAM.
-    if (!info.isMaster && info.isLive && segIds.length) {
+function ensureChannel(url, label) {
+    // max_connections=1: stop any other channel's poller before starting this one.
+    if (activeChannelUrl && activeChannelUrl !== url) {
+        const other = channels.get(activeChannelUrl);
+        if (other && other.running) stopPoller(other, "channel-switch");
         prefetchQueue.length = 0;
-        queuePrefetch(segIds);
     }
+    activeChannelUrl = url;
 
+    let rt = channels.get(url);
+    if (!rt) {
+        rt = {
+            url, label, segs: [], byId: new Set(), seqBase: 0, generation: 0,
+            target: 6, lastSeq: -1, isMaster: false, lastPlayerAt: Date.now(),
+            running: false, timer: null
+        };
+        channels.set(url, rt);
+    }
+    rt.label = label;
+    rt.lastPlayerAt = Date.now();
+    if (!rt.running) {
+        rt.running = true;
+        console.log(`[POLLER START] channel="${label}"`);
+        pollChannelLoop(rt);
+    }
+    return rt;
+}
+
+async function pollChannelLoop(rt) {
+    if (!rt.running) return;
+    if (Date.now() - rt.lastPlayerAt > POLLER_IDLE_STOP_MS) {
+        stopPoller(rt, "player-idle");
+        if (activeChannelUrl === rt.url) activeChannelUrl = null;
+        return;
+    }
+    try {
+        const { data, finalUrl, info } = await fetchUpstreamHLS(rt.url, rt.label);
+        if (info.isMaster) {
+            rt.isMaster = true;
+            stopPoller(rt, "master-playlist");   // master is served passthrough, no buffer
+            return;
+        }
+        if (info.isLive) ingestPlaylist(rt, data, finalUrl, info);
+    } catch (e) {
+        console.warn(`[POLLER ERR] channel="${rt.label}" ${e.message}`);
+    }
+    if (!rt.running) return;
+    const delay = Math.max(POLL_MIN_MS, Math.min(POLL_MAX_MS, (rt.target || 6) * 500));
+    rt.timer = setTimeout(() => pollChannelLoop(rt), delay);
+    if (rt.timer.unref) rt.timer.unref();
+}
+
+function ingestPlaylist(rt, playlist, baseUrl, info) {
+    rt.target = info.targetDuration || rt.target;
+    const seq = Number(info.mediaSequence || 0);
+    // Restart detection: an on-demand stream that was torn down restarts at a LOWER
+    // media-sequence. Same segment paths now hold DIFFERENT content, so we bump a
+    // generation (mixed into the id) to avoid serving stale cached segments.
+    if (rt.lastSeq >= 0 && seq < rt.lastSeq) {
+        rt.generation++;
+        rt.segs = []; rt.byId = new Set(); rt.seqBase = 0;
+        console.log(`[CHANNEL RESTART] channel="${rt.label}" seq ${rt.lastSeq}->${seq} gen=${rt.generation}`);
+    }
+    rt.lastSeq = seq;
+
+    let added = 0;
+    for (const s of parseSegments(playlist, baseUrl)) {
+        const id = `g${rt.generation}:${s.segId}`;
+        registerSeg(id, s.realUrl);          // always refresh the token-bearing URL
+        if (!rt.byId.has(id)) {
+            rt.byId.add(id);
+            rt.segs.push({ id, duration: s.duration });
+            added++;
+        }
+    }
+    while (rt.segs.length > RETAIN_SEGMENTS) {
+        const dropped = rt.segs.shift();
+        rt.byId.delete(dropped.id);
+        rt.seqBase++;
+    }
+    if (added > 0) {
+        queuePrefetch(rt.segs.map(s => s.id));   // keep the retained buffer warm (oldest first)
+        console.log(`[BUFFER] channel="${rt.label}" +${added} depth=${rt.segs.length}/${RETAIN_SEGMENTS} seqBase=${rt.seqBase} cache=${segCache.size}/${formatBytes(segCacheBytes)} prefetch=${prefetchActive}+${prefetchQueue.length}`);
+    }
+}
+
+function buildServedPlaylist(rt, hostBase, configKey) {
+    // Serve the ENTIRE retained buffer: the player starts ~3 target-durations from
+    // the end (its cushion) but keeps the full retained depth behind it as fall-back,
+    // so a stall/slow stretch never drops its current segment out of the playlist.
+    const win = rt.segs;
+    const mediaSeq = rt.seqBase;
+    const target = Math.max(1, Math.ceil(Math.max(rt.target || 6, ...win.map(s => s.duration || 0))));
+    const lines = [
+        "#EXTM3U",
+        "#EXT-X-VERSION:3",
+        `#EXT-X-TARGETDURATION:${target}`,
+        `#EXT-X-MEDIA-SEQUENCE:${mediaSeq}`
+    ];
+    for (const s of win) {
+        lines.push(`#EXTINF:${Number(s.duration || rt.target || 6).toFixed(3)},`);
+        lines.push(`${hostBase}/${configKey}/proxy/seg?s=${encodeURIComponent(s.id)}`);
+    }
+    return { playlist: lines.join("\n") + "\n", count: win.length, mediaSeq };
+}
+
+function setPlaylistHeaders(res) {
     res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, no-transform");
     res.setHeader("Pragma", "no-cache");
-    console.log(
-        `[HLS SERVE] channel="${label}" type=${info.isMaster ? "master" : "media"} live=${info.isLive}` +
-        ` segs=${info.segmentCount}${info.targetDuration ? ` target=${info.targetDuration}s` : ""}` +
-        `${info.mediaSequence != null ? ` seq=${info.mediaSequence}` : ""}` +
-        ` cache=${segCache.size}/${formatBytes(segCacheBytes)} prefetch=${prefetchActive}+${prefetchQueue.length}`
-    );
-    res.send(rewritten);
 }
 
 app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
@@ -903,8 +956,40 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         const config = decodeConfig(configKey);
         const ch = await getChannelById(configKey, config, req.params.id);
         if (!ch) return res.status(404).send("#EXTM3U\n#EXT-X-ENDLIST\n");
-        console.log(`[HLS OPEN] channel="${ch.name}" — request hit Kronos (resolve=${Date.now() - t0}ms)`);
-        await servePlaylist(res, ch.url, getPublicHost(req), configKey, ch.name, true);
+        const host = getPublicHost(req);
+
+        const rt = ensureChannel(ch.url, ch.name);
+        const fresh = rt.segs.length < MIN_START_SEGMENTS && !rt.isMaster;
+        console.log(`[HLS OPEN] channel="${ch.name}" resolve=${Date.now() - t0}ms depth=${rt.segs.length} ${fresh ? "(priming…)" : "(buffer ready)"}`);
+
+        // FIRST open only: short, capped wait for the initial cushion. Re-opens and
+        // continuous polls never block here — the buffer is already deep — so the
+        // player's manifest request is always answered fast (no timeout/crash).
+        if (fresh) {
+            const deadline = Date.now() + PRIME_TIMEOUT_MS;
+            while (rt.running && !rt.isMaster && rt.segs.length < MIN_START_SEGMENTS && Date.now() < deadline) {
+                rt.lastPlayerAt = Date.now();
+                await sleep(700);
+            }
+        }
+
+        if (rt.isMaster) {
+            const { data, finalUrl } = await fetchUpstreamHLS(ch.url, ch.name);
+            const { rewritten } = rewriteHLSUrls(data, finalUrl, host, configKey);
+            setPlaylistHeaders(res);
+            console.log(`[HLS SERVE] channel="${ch.name}" type=master`);
+            return res.send(rewritten);
+        }
+
+        if (!rt.segs.length) {
+            console.warn(`[HLS EMPTY] channel="${ch.name}" no segments after ${Date.now() - t0}ms`);
+            return res.status(502).send("#EXTM3U\n#EXT-X-ENDLIST\n");
+        }
+
+        const { playlist, count, mediaSeq } = buildServedPlaylist(rt, host, configKey);
+        setPlaylistHeaders(res);
+        console.log(`[HLS SERVE] channel="${ch.name}" window=${count}/${rt.segs.length} seq=${mediaSeq} gen=${rt.generation} cache=${segCache.size}/${formatBytes(segCacheBytes)} prefetch=${prefetchActive}+${prefetchQueue.length} waited=${Date.now() - t0}ms`);
+        res.send(playlist);
     } catch (err) {
         console.error(`[HLS ERROR] ${err.message}`);
         if (!res.headersSent) res.status(502).send("#EXTM3U\n#EXT-X-ENDLIST\n");
@@ -912,12 +997,16 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
 });
 
 app.get("/:base64Config/proxy/pl", async (req, res) => {
+    // Nested/variant playlist (only reached for master streams): simple passthrough.
     try {
         const configKey = req.params.base64Config;
         decodeConfig(configKey);
         if (!req.query.u) return res.status(400).send("#EXTM3U\n");
-        // Nested/variant playlist: no warm-up (it's polled repeatedly, not a fresh open).
-        await servePlaylist(res, decodeProxyUrl(req.query.u), getPublicHost(req), configKey, "nested-playlist", false);
+        const sourceUrl = decodeProxyUrl(req.query.u);
+        const { data, finalUrl } = await fetchUpstreamHLS(sourceUrl, "nested-playlist");
+        const { rewritten } = rewriteHLSUrls(data, finalUrl, getPublicHost(req), configKey);
+        setPlaylistHeaders(res);
+        res.send(rewritten);
     } catch (err) {
         console.error(`[PL ERROR] ${err.message}`);
         if (!res.headersSent) res.status(502).send("#EXTM3U\n#EXT-X-ENDLIST\n");
@@ -931,6 +1020,13 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
 
     try {
         decodeConfig(req.params.base64Config);
+
+        // Any segment activity counts as the player being alive → keep the poller
+        // running even if the player paused polling the playlist (e.g. during a 2x stall).
+        if (activeChannelUrl) {
+            const rt = channels.get(activeChannelUrl);
+            if (rt) rt.lastPlayerAt = Date.now();
+        }
 
         if (req.query.s) {
             // HLS segment: stable id → resolve freshest token-bearing URL.
@@ -1096,7 +1192,12 @@ app.get("/:base64Config/stats", (req, res) => {
             segRegistry: segRegistry.size,
             prefetchActive,
             prefetchQueue: prefetchQueue.length
-        }
+        },
+        channels: [...channels.values()].map(rt => ({
+            label: rt.label, depth: rt.segs.length, seqBase: rt.seqBase, generation: rt.generation,
+            running: rt.running, isMaster: rt.isMaster, idleMs: Date.now() - rt.lastPlayerAt
+        })),
+        activeChannel: activeChannelUrl ? (channels.get(activeChannelUrl)?.label || "?") : null
     });
 });
 
@@ -1139,6 +1240,6 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`📦 Node ${process.version}`);
     console.log(`🔁 manifest retry=${MANIFEST_RETRIES} delay=${MANIFEST_RETRY_DELAY}ms`);
     console.log(`⏩ prefetch ahead=${SEGMENT_PREFETCH_AHEAD} concurrency=${SEGMENT_PREFETCH_CONCURRENCY} cacheTTL=${SEGMENT_CACHE_TTL / 1000}s`);
-    console.log(`🪟 window warm-up: target=${MIN_START_SEGMENTS} segs timeout=${WINDOW_WARM_TIMEOUT / 1000}s poll=${WINDOW_WARM_POLL / 1000}s rewarm=${REWARM_AFTER_MS / 1000}s`);
+    console.log(`🪟 buffer: retain/serve=${RETAIN_SEGMENTS} prime=${MIN_START_SEGMENTS}segs/${PRIME_TIMEOUT_MS / 1000}s idleStop=${POLLER_IDLE_STOP_MS / 1000}s`);
     console.log("=".repeat(60) + "\n");
 });
