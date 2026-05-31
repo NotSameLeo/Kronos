@@ -1,6 +1,8 @@
 const express = require("express");
 const axios = require("axios");
-const xml2js = require("xml2js");
+const sax = require("sax");
+const zlib = require("zlib");
+const { Readable } = require("stream");
 const path = require("path");
 const crypto = require("crypto");
 
@@ -27,14 +29,16 @@ const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.3
 const RELEASE_VERSION = "3.1.0";
 const ADDON_TYPE = "tv";
 const CATALOG_TTL = 30 * 60 * 1000;
+const EPG_CACHE_TTL = Number(process.env.EPG_CACHE_TTL || 6 * 60 * 60 * 1000);
+const EPG_REQUEST_TIMEOUT = Number(process.env.EPG_REQUEST_TIMEOUT || 60000);
+const EPG_MAX_BYTES = Number(process.env.EPG_MAX_BYTES || 160 * 1024 * 1024);
 const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 20000);
 const SEG_REQUEST_TIMEOUT = Number(process.env.SEG_REQUEST_TIMEOUT || 45000);
 
 // Manifest retry — fixes Xtream "invalid manifest on first hit" (stream spins up
 // server-side on first request, returns garbage, is valid on retry).
-const MANIFEST_RETRIES = Number(process.env.MANIFEST_RETRIES || 3);
-const MANIFEST_RETRY_DELAY = Number(process.env.MANIFEST_RETRY_DELAY || 700);
-const MANIFEST_RETRY_DEADLINE = Number(process.env.MANIFEST_RETRY_DEADLINE || 28000);
+const MANIFEST_RETRY_WINDOW_MS = Number(process.env.MANIFEST_RETRY_WINDOW_MS || 30000);
+const MANIFEST_RETRY_DELAY_MS = Number(process.env.MANIFEST_RETRY_DELAY_MS || 2000);
 
 // Light read-ahead segment cache — absorbs upstream jitter, does NOT create
 // bandwidth. Kept small and simple on purpose (no Range caching = no corruption).
@@ -70,14 +74,16 @@ const POLL_MIN_MS = Number(process.env.POLL_MIN_MS || 2000);
 const POLL_MAX_MS = Number(process.env.POLL_MAX_MS || 5000);
 
 // ─────────────────────────────────────────────────────────────────────────────
-// In-memory caches (catalog/EPG/logos only — no playback buffering anymore)
+// In-memory catalog, EPG and logo caches. Playback state is managed below.
 // ─────────────────────────────────────────────────────────────────────────────
 const memoryCache = {
     channelItems: {},     // configKey -> channels[]
     channelIndex: {},     // configKey -> { id -> channel }
     channelInflight: {},  // configKey -> Promise
+    epgMatchStats: {},    // configKey -> { matched, total, feedChannels }
     lastUpdate: {},       // configKey -> timestamp
-    epgData: {},          // epgUrl -> map
+    epgData: {},          // epgUrl -> { byKey, channelCount, programmeCount }
+    epgLastUpdate: {},    // epgUrl -> timestamp
     logoData: {},         // logoUrl -> data: URI
     isUpdating: {}
 };
@@ -150,43 +156,113 @@ function getSegmentLabel(sourceUrl) {
 // ─────────────────────────────────────────────────────────────────────────────
 // EPG
 // ─────────────────────────────────────────────────────────────────────────────
-async function updateEPGCache(epgUrl) {
+async function updateEPGCache(epgUrl, options = {}) {
     if (!epgUrl) return {};
+    const cached = memoryCache.epgData[epgUrl];
+    if (cached && !options.force && Date.now() - (memoryCache.epgLastUpdate[epgUrl] || 0) < EPG_CACHE_TTL) return cached;
     try {
-        const response = await axios.get(epgUrl, { timeout: 15000 });
-        const parser = new xml2js.Parser({ explicitArray: false, ignoreAttrs: false });
-        const result = await parser.parseStringPromise(response.data);
-        const byChannel = {};
-        if (result.tv && result.tv.programme) {
-            const programmes = Array.isArray(result.tv.programme) ? result.tv.programme : [result.tv.programme];
-            programmes.forEach(prog => {
-                if (!prog.$ || !prog.$.channel || !prog.$.start || !prog.$.stop) return;
-                const start = parseXMLTVDate(prog.$.start);
-                const stop = parseXMLTVDate(prog.$.stop);
-                if (Number.isNaN(start.getTime()) || Number.isNaN(stop.getTime())) return;
-                const key = normalizeEpgId(prog.$.channel);
-                if (!byChannel[key]) byChannel[key] = [];
-                byChannel[key].push({
-                    start, stop,
-                    title: getXmlText(prog.title) || "Programma senza titolo",
-                    desc: getXmlText(prog.desc)
-                });
-            });
-        }
-        const map = {};
-        Object.entries(byChannel).forEach(([k, list]) => {
-            const sel = selectBestProgramme(list);
-            if (!sel) return;
-            const label = sel.isLive ? "In onda" : "EPG disponibile";
-            const desc = sel.desc ? ` - ${sel.desc}` : "";
-            map[k] = `${label}: ${sel.title} (${formatTime(sel.start)} - ${formatTime(sel.stop)})${desc}`;
+        console.log("[EPG FETCH]", epgUrl);
+        const response = await axios.get(epgUrl, {
+            timeout: EPG_REQUEST_TIMEOUT,
+            maxContentLength: EPG_MAX_BYTES,
+            responseType: "arraybuffer",
+            headers: { "User-Agent": `Kronos/${RELEASE_VERSION}`, "Accept": "application/xml, text/xml, application/gzip, */*" }
         });
-        memoryCache.epgData[epgUrl] = map;
-        return map;
-    } catch {
-        return memoryCache.epgData[epgUrl] || {};
+        const { channelDefs, programmesById, programmeCount } = await parseXMLTVBuffer(Buffer.from(response.data));
+
+        const byKey = new Map();
+        const xmlIds = new Set([...channelDefs.keys(), ...programmesById.keys()]);
+        xmlIds.forEach(id => {
+            const programmes = programmesById.get(id) || [];
+            if (!programmes.length) return;
+            const entry = { id, names: channelDefs.get(id) || [], programmes };
+            getEpgMatchKeys([id, ...entry.names]).forEach(key => {
+                const list = byKey.get(key) || [];
+                list.push(entry);
+                byKey.set(key, list);
+            });
+        });
+
+        const data = { byKey, channelCount: xmlIds.size, programmeCount };
+        memoryCache.epgData[epgUrl] = data;
+        memoryCache.epgLastUpdate[epgUrl] = Date.now();
+        console.log(`[EPG OK] channels=${data.channelCount} programmes=${data.programmeCount} keys=${byKey.size}`);
+        return data;
+    } catch (err) {
+        console.warn("[EPG ERROR]", err.message);
+        return cached || { byKey: new Map(), channelCount: 0, programmeCount: 0 };
     }
 }
+
+function parseXMLTVBuffer(buffer) {
+    const isGzip = buffer[0] === 0x1f && buffer[1] === 0x8b;
+    const input = isGzip ? Readable.from([buffer]).pipe(zlib.createGunzip()) : Readable.from([buffer]);
+    const channelDefs = new Map();
+    const programmesById = new Map();
+    const keepAfter = Date.now() - 5 * 60 * 1000;
+
+    return new Promise((resolve, reject) => {
+        const parser = sax.createStream(true, { trim: false, normalize: false });
+        let channel = null;
+        let programme = null;
+        let capture = null;
+        let text = "";
+        let programmeCount = 0;
+
+        const readAttr = (node, name) => {
+            const value = node.attributes?.[name];
+            return typeof value === "string" ? value : (value?.value || "");
+        };
+        const appendText = value => { if (capture) text += value; };
+
+        parser.on("opentag", node => {
+            if (node.name === "channel") {
+                channel = { id: readAttr(node, "id"), names: [] };
+            } else if (node.name === "display-name" && channel) {
+                capture = "display-name"; text = "";
+            } else if (node.name === "programme") {
+                programme = {
+                    channel: readAttr(node, "channel"),
+                    start: parseXMLTVDate(readAttr(node, "start")),
+                    stop: parseXMLTVDate(readAttr(node, "stop")),
+                    title: "",
+                    desc: ""
+                };
+                programmeCount++;
+            } else if ((node.name === "title" || node.name === "desc") && programme) {
+                capture = node.name; text = "";
+            }
+        });
+        parser.on("text", appendText);
+        parser.on("cdata", appendText);
+        parser.on("closetag", name => {
+            if (name === capture) {
+                const value = text.trim();
+                if (name === "display-name" && channel && value) channel.names.push(value);
+                if (name === "title" && programme) programme.title = value;
+                if (name === "desc" && programme) programme.desc = value;
+                capture = null; text = "";
+            }
+            if (name === "channel" && channel) {
+                if (channel.id) channelDefs.set(channel.id, channel.names);
+                channel = null;
+            }
+            if (name === "programme" && programme) {
+                if (programme.channel && !Number.isNaN(programme.start.getTime()) && !Number.isNaN(programme.stop.getTime()) && programme.stop.getTime() >= keepAfter) {
+                    const list = programmesById.get(programme.channel) || [];
+                    list.push({ start: programme.start, stop: programme.stop, title: programme.title || "Programma senza titolo", desc: programme.desc });
+                    programmesById.set(programme.channel, list);
+                }
+                programme = null;
+            }
+        });
+        parser.on("error", reject);
+        input.on("error", reject);
+        parser.on("end", () => resolve({ channelDefs, programmesById, programmeCount }));
+        input.pipe(parser);
+    });
+}
+
 function parseXMLTVDate(str) {
     const m = String(str || "").match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(?:\s*([+-]\d{4}))?/);
     if (!m) return new Date(str);
@@ -194,23 +270,68 @@ function parseXMLTVDate(str) {
     const tz = off ? `${off.slice(0, 3)}:${off.slice(3)}` : "Z";
     return new Date(`${Y}-${Mo}-${D}T${H}:${Mi}:${S}${tz}`);
 }
-function getXmlText(v) { if (!v) return ""; if (typeof v === "string") return v; if (typeof v === "object" && v._) return v._; return ""; }
 function formatTime(d) { return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`; }
-function selectBestProgramme(programmes) {
+function selectProgrammeWindow(programmes) {
     const now = new Date();
     const sorted = programmes.slice().sort((a, b) => a.start - b.start);
-    const live = sorted.find(p => now >= p.start && now <= p.stop);
-    if (live) return { ...live, isLive: true };
-    const future = sorted.find(p => p.start > now);
-    if (future) return { ...future, isLive: false };
-    const latest = sorted[sorted.length - 1];
-    return latest ? { ...latest, isLive: false } : null;
+    const currentIndex = sorted.findIndex(p => now >= p.start && now <= p.stop);
+    const current = currentIndex >= 0 ? sorted[currentIndex] : null;
+    const next = current ? sorted[currentIndex + 1] : sorted.find(p => p.start > now);
+    return { current, next };
 }
-function normalizeEpgId(id) {
-    let k = String(id || "").toLowerCase().trim();
-    k = k.replace(/\.it$/i, "").replace(/[^a-z0-9]/g, "").replace(/hd$/i, "");
-    if (k === "20mediaset") return "20";
-    return k;
+
+function formatEpgDescription(programmes) {
+    const { current, next } = selectProgrammeWindow(programmes);
+    const lines = [];
+    if (current) lines.push(formatProgramme("In onda", current, true));
+    if (next) lines.push(formatProgramme(current ? "A seguire" : "Prossimamente", next, false));
+    return lines.join("\n");
+}
+
+function formatProgramme(label, programme, includeDescription) {
+    const summary = includeDescription && programme.desc ? ` - ${String(programme.desc).slice(0, 500)}` : "";
+    return `${label}: ${programme.title} (${formatTime(programme.start)} - ${formatTime(programme.stop)})${summary}`;
+}
+
+function getEpgMatchKeys(values) {
+    const keys = new Set();
+    const add = value => {
+        let text = String(value || "").trim();
+        if (!text) return;
+        text = text.replace(/\.it$/i, "").replace(/^\s*IT\s*:\s*/i, "");
+        addNormalizedEpgKey(keys, text);
+        addNormalizedEpgKey(keys, text.replace(/\b(?:FHD|FULL\s*HD|HD|HEVC|UHD|4K|SD|H\.?26[45])\b/gi, " "));
+        addNormalizedEpgKey(keys, text.replace(/\b(?:FHD|FULL\s*HD|HD|HEVC|UHD|4K|SD)\s+\d{3,4}\b/gi, " "));
+        addNormalizedEpgKey(keys, text.replace(/\s+\d{3,4}\s*$/, " "));
+    };
+    (Array.isArray(values) ? values : [values]).forEach(add);
+    return [...keys];
+}
+
+function addNormalizedEpgKey(keys, value) {
+    const key = String(value || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+    if (!key) return;
+    keys.add(key);
+    const aliases = {
+        "20mediaset": "20", canale20: "20",
+        discoverymotortrend: "motortrend",
+        nationalgeografic: "nationalgeographic",
+        raisportplus: "raisport"
+    };
+    if (aliases[key]) keys.add(aliases[key]);
+    if (key.startsWith("discovery") && key.length > "discovery".length) keys.add(key.slice("discovery".length));
+}
+
+function findEpgMatch(epgData, channel) {
+    if (!epgData?.byKey) return null;
+    for (const key of getEpgMatchKeys([channel.tvgId, channel.name])) {
+        const entries = epgData.byKey.get(key);
+        if (entries?.length) {
+            const entry = entries.find(item => formatEpgDescription(item.programmes));
+            if (entry) return { ...entry, description: formatEpgDescription(entry.programmes) };
+        }
+    }
+    return null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -326,7 +447,7 @@ async function fetchAndProcessChannels(configKey, config, options = {}) {
     if (memoryCache.channelInflight[configKey] && !options.force) return memoryCache.channelInflight[configKey];
     const promise = (async () => {
         memoryCache.isUpdating[configKey] = true;
-        if (config.e) await updateEPGCache(config.e);
+        const epgData = config.e ? await updateEPGCache(config.e) : null;
         const lists = getConfiguredLists(config);
         const selectedGroups = Array.isArray(config.g) ? config.g : [];
         const selectedSet = new Set(selectedGroups.map(normalizeGroupName));
@@ -337,22 +458,34 @@ async function fetchAndProcessChannels(configKey, config, options = {}) {
             return parseM3UChannels(data, list);
         }));
 
+        let epgMatched = 0;
         const channels = parsedGroups.flat()
             .filter(c => {
                 if (config.gm === "list" || config.gm === "bucket") return true;
                 if (selectedSet.size === 0) return true;
                 return selectedSet.has(normalizeGroupName(c.group));
             })
-            .map(c => ({
-                ...c,
-                name: decorateChannelName(c, lists.length, config.gm),
-                group: config.gm === "bucket" ? bucketGroup : c.group,
-                description: ""
-            }));
+            .map(c => {
+                const epg = findEpgMatch(epgData, c);
+                if (epg) epgMatched++;
+                return {
+                    ...c,
+                    name: decorateChannelName(c, lists.length, config.gm),
+                    group: config.gm === "bucket" ? bucketGroup : c.group,
+                    description: epg?.description || "",
+                    epgId: epg?.id || null
+                };
+            });
 
         memoryCache.channelItems[configKey] = channels;
         memoryCache.channelIndex[configKey] = buildChannelIndex(channels);
+        memoryCache.epgMatchStats[configKey] = {
+            matched: epgMatched,
+            total: channels.length,
+            feedChannels: epgData?.channelCount || 0
+        };
         memoryCache.lastUpdate[configKey] = Date.now();
+        if (config.e) console.log(`[EPG MATCH] matched=${epgMatched}/${channels.length} feedChannels=${epgData?.channelCount || 0}`);
         console.log(`[CATALOG OK] channels=${channels.length} lists=${lists.length}`);
         return channels;
     })();
@@ -395,16 +528,31 @@ async function getChannelById(configKey, config, id) {
 // polls take priority over background prefetch.
 let upstreamBusy = false;
 const upstreamWaiters = [];   // { resolve, prio }
-function acquireUpstream(prio) {
+function acquireUpstream(prio, timeoutMs = 0) {
     if (!upstreamBusy) { upstreamBusy = true; return Promise.resolve(); }
-    return new Promise(resolve => {
-        const w = { resolve };
+    return new Promise((resolve, reject) => {
+        const w = {
+            resolve: () => {
+                if (w.timer) clearTimeout(w.timer);
+                resolve();
+            },
+            prio: !!prio,
+            timer: null
+        };
         if (prio) {
             const i = upstreamWaiters.findIndex(x => !x.prio);
-            if (i === -1) upstreamWaiters.push(Object.assign(w, { prio: true }));
-            else upstreamWaiters.splice(i, 0, Object.assign(w, { prio: true }));
+            if (i === -1) upstreamWaiters.push(w);
+            else upstreamWaiters.splice(i, 0, w);
         } else {
-            upstreamWaiters.push(Object.assign(w, { prio: false }));
+            upstreamWaiters.push(w);
+        }
+        if (timeoutMs > 0) {
+            w.timer = setTimeout(() => {
+                const i = upstreamWaiters.indexOf(w);
+                if (i !== -1) upstreamWaiters.splice(i, 1);
+                reject(new Error("Upstream gate timeout"));
+            }, timeoutMs);
+            if (w.timer.unref) w.timer.unref();
         }
     });
 }
@@ -413,63 +561,76 @@ function releaseUpstream() {
     if (w) w.resolve();        // hand the slot to the next waiter (stays busy)
     else upstreamBusy = false;
 }
-async function withUpstream(fn, prio = false) {
-    await acquireUpstream(prio);
+async function withUpstream(fn, prio = false, timeoutMs = 0) {
+    await acquireUpstream(prio, timeoutMs);
     try { return await fn(); }
     finally { releaseUpstream(); }
 }
 
-// Fetch a manifest with bounded retries. Retries on invalid body (Xtream stream
-// spin-up) and on network/timeout errors, until MANIFEST_RETRIES or the deadline.
+// Fetch a manifest for at most MANIFEST_RETRY_WINDOW_MS. There is no separate
+// retry count: keep trying every MANIFEST_RETRY_DELAY_MS while time remains.
 async function fetchUpstreamHLS(sourceUrl, label = "stream") {
-    const deadline = Date.now() + MANIFEST_RETRY_DEADLINE;
+    const deadline = Date.now() + MANIFEST_RETRY_WINDOW_MS;
     let lastErr = null;
+    let attempt = 0;
 
-    for (let attempt = 0; attempt <= MANIFEST_RETRIES; attempt++) {
-        if (attempt > 0) {
-            if (Date.now() >= deadline) break;
-            await sleep(MANIFEST_RETRY_DELAY);
-        }
+    while (Date.now() < deadline) {
+        attempt++;
         try {
-            const r = await withUpstream(() => axios.get(sourceUrl, {
-                timeout: HLS_REQUEST_TIMEOUT,
-                maxRedirects: 5,
-                headers: {
-                    "User-Agent": UPSTREAM_UA,
-                    "Accept": "application/x-mpegURL, application/vnd.apple.mpegurl, audio/mpegurl, text/plain, */*",
-                    "Accept-Encoding": "gzip, deflate",
-                    "Connection": "keep-alive"
-                },
-                validateStatus: s => s >= 200 && s < 300
-            }), true);
+            const waitMs = Math.max(1, deadline - Date.now());
+            const r = await withUpstream(() => {
+                const requestMs = Math.max(1, Math.min(HLS_REQUEST_TIMEOUT, deadline - Date.now()));
+                return axios.get(sourceUrl, {
+                    timeout: requestMs,
+                    maxRedirects: 5,
+                    headers: {
+                        "User-Agent": UPSTREAM_UA,
+                        "Accept": "application/x-mpegURL, application/vnd.apple.mpegurl, audio/mpegurl, text/plain, */*",
+                        "Accept-Encoding": "gzip, deflate",
+                        "Connection": "keep-alive"
+                    },
+                    validateStatus: s => s >= 200 && s < 300
+                });
+            }, true, waitMs);
             const finalUrl = r.request?.res?.responseUrl || sourceUrl;
             const text = String(r.data || "").trim();
             if (!text.startsWith("#EXTM3U")) {
                 lastErr = new Error("Invalid HLS manifest from upstream");
-                console.warn(`[HLS RETRY] channel="${label}" attempt=${attempt + 1}/${MANIFEST_RETRIES + 1} reason=invalid-body`);
-                continue;
+                console.warn(`[HLS RETRY] channel="${label}" attempt=${attempt} reason=invalid-body`);
+            } else {
+                const info = analyzeHLS(text);
+                if (attempt > 1) console.log(`[HLS RECOVERED] channel="${label}" after=${attempt} attempts`);
+                return { data: r.data, finalUrl, info };
             }
-            const info = analyzeHLS(text);
-            if (attempt > 0) console.log(`[HLS RECOVERED] channel="${label}" after=${attempt + 1} attempts`);
-            return { data: r.data, finalUrl, info };
         } catch (err) {
             lastErr = err;
-            console.warn(`[HLS RETRY] channel="${label}" attempt=${attempt + 1}/${MANIFEST_RETRIES + 1} reason=${err.message}`);
+            console.warn(`[HLS RETRY] channel="${label}" attempt=${attempt} reason=${err.message}`);
         }
+        const sleepMs = Math.min(MANIFEST_RETRY_DELAY_MS, deadline - Date.now());
+        if (sleepMs > 0) await sleep(sleepMs);
     }
     throw lastErr || new Error("Manifest fetch failed");
 }
 
-// Stable identity for a segment, ignoring rotating query tokens. The upstream
-// (Xtream) rotates the token on every playlist refresh, so the same physical
-// segment arrives under a different URL each time. We key everything on the
-// token-free path so the player sees a STABLE proxied URL (no phantom re-downloads
-// / timeline jumps) and the cache deduplicates correctly.
+// Stable identity for a segment, ignoring rotating query tokens and Xtream's
+// rotating /hlsr/ path. The final .ts filename is stable for the physical segment.
 const segRegistry = new Map();    // segId -> latest real upstream URL (with current token)
 const SEG_REGISTRY_MAX = Number(process.env.SEG_REGISTRY_MAX || 4000);
 
-function segIdFor(absUrl) {
-    try { const u = new URL(absUrl); return hashKey(u.origin + u.pathname); }
+function getStableSegmentKey(absUrl, scope = "") {
+    try {
+        const u = new URL(absUrl);
+        const parts = u.pathname.split("/").filter(Boolean);
+        const pathname = parts[0] === "hlsr" && parts.length > 1
+            ? `/hlsr/${parts[parts.length - 1]}`
+            : u.pathname;
+        return `${scope}|${u.origin}${pathname}`;
+    }
+    catch { return `${scope}|${String(absUrl).split("?")[0]}`; }
+}
+
+function segIdFor(absUrl, scope = "") {
+    try { return hashKey(getStableSegmentKey(absUrl, scope)); }
     catch { return hashKey(String(absUrl).split("?")[0]); }
 }
 
@@ -482,12 +643,12 @@ function registerSeg(id, absUrl) {
 }
 
 // Returns { rewritten, segIds } — segIds are stable segment ids in playlist order.
-function rewriteHLSUrls(playlist, baseUrl, hostBase, configKey) {
+function rewriteHLSUrls(playlist, baseUrl, hostBase, configKey, scope = baseUrl) {
     const plUrl = abs => `${hostBase}/${configKey}/proxy/pl?u=${encodeProxyUrl(abs)}`;
     const segIds = [];
     const pick = abs => {
         if (isHlsUrl(abs)) return plUrl(abs);
-        const id = segIdFor(abs);
+        const id = segIdFor(abs, scope);
         registerSeg(id, abs);              // remember the freshest token-bearing URL
         segIds.push(id);
         return `${hostBase}/${configKey}/proxy/seg?s=${id}`;   // STABLE across refreshes
@@ -580,7 +741,9 @@ async function fetchSegToCache(id, url, prio = false) {
 }
 
 function queuePrefetch(ids) {
-    ids.forEach(id => {
+    const candidates = SEGMENT_PREFETCH_AHEAD > 0 ? ids.slice(-SEGMENT_PREFETCH_AHEAD) : [];
+    prefetchQueue.splice(0, prefetchQueue.length, ...prefetchQueue.filter(id => candidates.includes(id)));
+    candidates.forEach(id => {
         if (getSegFromCache(id) || segInflight.has(id) || prefetchQueue.includes(id)) return;
         prefetchQueue.push(id);
     });
@@ -845,7 +1008,7 @@ app.get("/:base64Config/poster/:id.svg", async (req, res) => {
 const channels = new Map();      // channelUrl -> runtime
 let activeChannelUrl = null;     // only ONE channel polls upstream (max_connections=1)
 
-function parseSegments(playlist, baseUrl) {
+function parseSegments(playlist, baseUrl, scope = baseUrl) {
     const out = [];
     let dur = 0;
     for (const raw of String(playlist || "").split(/\r?\n/)) {
@@ -859,7 +1022,7 @@ function parseSegments(playlist, baseUrl) {
         if (t.startsWith("#")) continue;
         if (isHlsUrl(t)) continue;   // nested playlist (handled elsewhere)
         const abs = toAbsoluteUrl(t, baseUrl);
-        out.push({ segId: segIdFor(abs), realUrl: abs, duration: dur || 6 });
+        out.push({ segId: segIdFor(abs, scope), realUrl: abs, duration: dur || 6 });
         dur = 0;
     }
     return out;
@@ -868,7 +1031,9 @@ function parseSegments(playlist, baseUrl) {
 function stopPoller(rt, reason) {
     rt.running = false;
     if (rt.timer) { clearTimeout(rt.timer); rt.timer = null; }
+    prefetchQueue.length = 0;
     rt.segs = []; rt.byId = new Set(); rt.seqBase = 0; rt.lastSeq = -1; rt.servedEdge = null;
+    rt.generation++;
     console.log(`[POLLER STOP] channel="${rt.label}" reason=${reason}`);
 }
 
@@ -942,7 +1107,7 @@ function ingestPlaylist(rt, playlist, baseUrl, info) {
     rt.lastSeq = seq;
 
     let added = 0;
-    for (const s of parseSegments(playlist, baseUrl)) {
+    for (const s of parseSegments(playlist, baseUrl, rt.url)) {
         const id = `g${rt.generation}:${s.segId}`;
         registerSeg(id, s.realUrl);          // always refresh the token-bearing URL
         if (!rt.byId.has(id)) {
@@ -957,7 +1122,7 @@ function ingestPlaylist(rt, playlist, baseUrl, info) {
         rt.seqBase++;
     }
     if (added > 0) {
-        queuePrefetch(rt.segs.map(s => s.id));   // keep the retained buffer warm (oldest first)
+        queuePrefetch(rt.segs.map(s => s.id));   // warm the newest segments near the served live edge
         console.log(`[BUFFER] channel="${rt.label}" +${added} depth=${rt.segs.length}/${RETAIN_SEGMENTS} seqBase=${rt.seqBase} cache=${segCache.size}/${formatBytes(segCacheBytes)} prefetch=${prefetchActive}+${prefetchQueue.length}`);
     }
 }
@@ -1023,7 +1188,7 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
 
         if (rt.isMaster) {
             const { data, finalUrl } = await fetchUpstreamHLS(ch.url, ch.name);
-            const { rewritten } = rewriteHLSUrls(data, finalUrl, host, configKey);
+            const { rewritten } = rewriteHLSUrls(data, finalUrl, host, configKey, ch.url);
             setPlaylistHeaders(res);
             console.log(`[HLS SERVE] channel="${ch.name}" type=master`);
             return res.send(rewritten);
@@ -1052,7 +1217,7 @@ app.get("/:base64Config/proxy/pl", async (req, res) => {
         if (!req.query.u) return res.status(400).send("#EXTM3U\n");
         const sourceUrl = decodeProxyUrl(req.query.u);
         const { data, finalUrl } = await fetchUpstreamHLS(sourceUrl, "nested-playlist");
-        const { rewritten } = rewriteHLSUrls(data, finalUrl, getPublicHost(req), configKey);
+        const { rewritten } = rewriteHLSUrls(data, finalUrl, getPublicHost(req), configKey, sourceUrl);
         setPlaylistHeaders(res);
         res.send(rewritten);
     } catch (err) {
@@ -1109,7 +1274,12 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
 
         // Direct (non-HLS) continuous stream: straight passthrough (its own single
         // connection, no prefetch competing).
-        await streamSegment(req, res, sourceUrl, segId, started);
+        if (activeChannelUrl) {
+            const rt = channels.get(activeChannelUrl);
+            if (rt?.running) stopPoller(rt, "direct-stream");
+            activeChannelUrl = null;
+        }
+        await withUpstream(() => streamSegment(req, res, sourceUrl, segId, started), true);
     } catch (err) {
         console.error(`[SEG ERROR] ${getSegmentLabel(sourceUrl)} ${err.message}`);
         if (!res.headersSent) res.status(502).end();
@@ -1267,11 +1437,12 @@ app.get("/:base64Config/debug", async (req, res) => {
             cache: {
                 channelCount: channels.length,
                 lastUpdate: memoryCache.lastUpdate[configKey],
-                isUpdating: memoryCache.isUpdating[configKey]
+                isUpdating: memoryCache.isUpdating[configKey],
+                epg: memoryCache.epgMatchStats[configKey] || null
             },
             sampleChannels: channels.slice(0, 5).map(c => ({
                 id: c.id, name: c.name, group: c.group, sourceName: c.sourceName,
-                hasUrl: !!c.url, hasLogo: !!c.logo
+                hasUrl: !!c.url, hasLogo: !!c.logo, hasEpg: !!c.description, epgId: c.epgId
             })),
             groups: [...new Set(channels.map(c => c.group))].slice(0, 50),
             constants: { ADDON_TYPE, RELEASE_VERSION, HLS_REQUEST_TIMEOUT, SEG_REQUEST_TIMEOUT }
@@ -1286,7 +1457,7 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log("=".repeat(60));
     console.log(`🌐 http://0.0.0.0:${PORT}`);
     console.log(`📦 Node ${process.version}`);
-    console.log(`🔁 manifest retry=${MANIFEST_RETRIES} delay=${MANIFEST_RETRY_DELAY}ms`);
+    console.log(`🔁 manifest retryWindow=${MANIFEST_RETRY_WINDOW_MS / 1000}s delay=${MANIFEST_RETRY_DELAY_MS / 1000}s`);
     console.log(`⏩ prefetch ahead=${SEGMENT_PREFETCH_AHEAD} concurrency=${SEGMENT_PREFETCH_CONCURRENCY} cacheTTL=${SEGMENT_CACHE_TTL / 1000}s`);
     console.log(`🪟 buffer: retain/serve=${RETAIN_SEGMENTS} prime=${MIN_START_SEGMENTS}segs/${PRIME_TIMEOUT_MS / 1000}s idleStop=${POLLER_IDLE_STOP_MS / 1000}s`);
     console.log("=".repeat(60) + "\n");
