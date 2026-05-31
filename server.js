@@ -39,7 +39,10 @@ const MANIFEST_RETRY_DEADLINE = Number(process.env.MANIFEST_RETRY_DEADLINE || 28
 // Light read-ahead segment cache — absorbs upstream jitter, does NOT create
 // bandwidth. Kept small and simple on purpose (no Range caching = no corruption).
 const SEGMENT_PREFETCH_AHEAD = Number(process.env.SEGMENT_PREFETCH_AHEAD || 3);
-const SEGMENT_PREFETCH_CONCURRENCY = Number(process.env.SEGMENT_PREFETCH_CONCURRENCY || 2);
+// Provider exposes max_connections=1, so concurrency 1 by default: in steady state
+// the prefetcher is the ONLY upstream connection and the player reads from cache.
+// (Raising this only helps if your provider tolerates parallel segment fetches.)
+const SEGMENT_PREFETCH_CONCURRENCY = Number(process.env.SEGMENT_PREFETCH_CONCURRENCY || 1);
 const SEGMENT_CACHE_TTL = Number(process.env.SEGMENT_CACHE_TTL || 90 * 1000);
 const SEGMENT_CACHE_MAX_BYTES = Number(process.env.SEGMENT_CACHE_MAX_BYTES || 256 * 1024 * 1024);
 const SEGMENT_CACHE_MAX_ITEMS = Number(process.env.SEGMENT_CACHE_MAX_ITEMS || 48);
@@ -51,9 +54,13 @@ const SLOW_SEGMENT_MS = Number(process.env.SLOW_SEGMENT_MS || 4000);
 // a minimum amount of content before handing it to the player, so it starts with a
 // real cushion instead of starving at the live edge. Self-gating: does nothing when
 // the window is already deep, and bails if the window isn't growing.
-const MIN_START_SECONDS = Number(process.env.MIN_START_SECONDS || 30);
-const WINDOW_WARM_TIMEOUT = Number(process.env.WINDOW_WARM_TIMEOUT || 40000);
-const WINDOW_WARM_POLL = Number(process.env.WINDOW_WARM_POLL || 3000);
+// Warm-up target is SEGMENT-COUNT based (robust to the provider's changing
+// targetDuration). We hold the channel open until the live window is at least
+// this many segments deep, so the player attaches BEHIND the live edge (cushion)
+// instead of pinned to the bleeding edge of a freshly-started stream.
+const MIN_START_SEGMENTS = Number(process.env.MIN_START_SEGMENTS || 4);
+const WINDOW_WARM_TIMEOUT = Number(process.env.WINDOW_WARM_TIMEOUT || 45000);
+const WINDOW_WARM_POLL = Number(process.env.WINDOW_WARM_POLL || 2500);
 // Only warm a channel when it's a fresh (re)open. If the same channel was served
 // within this window, it's continuous playback → skip the wait, just refresh.
 const REWARM_AFTER_MS = Number(process.env.REWARM_AFTER_MS || 45000);
@@ -800,19 +807,20 @@ app.get("/:base64Config/poster/:id.svg", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // Playback — pass-through HLS
 // ─────────────────────────────────────────────────────────────────────────────
-// Serve a playlist (channel entry or nested) + kick prefetch of the segments
-// nearest the live edge so they're ready when the player asks for them.
-// How many seconds of content a media playlist currently exposes.
-function windowSeconds(info) {
-    const dur = info.targetDuration || 6;
-    return (info.segmentCount || 0) * dur;
-}
-
-// Fetch the manifest; if it's a live media playlist with a too-shallow window,
-// keep re-polling (up to a deadline) until it accumulates >= MIN_START_SECONDS,
-// so the player starts with a cushion. Bails out if the window stops growing.
+// Fetch the manifest; if it's a live media playlist with a too-shallow window
+// (a freshly-started on-demand stream), keep re-polling until it accumulates at
+// least MIN_START_SEGMENTS, so the player attaches BEHIND the live edge with a
+// real cushion. Bails only if the window is sliding (capped) and won't deepen.
 const lastWarmServe = new Map();   // sourceUrl -> last served timestamp (set only AFTER serving)
 const warmInflight = new Map();    // sourceUrl -> in-progress fetchWithWarmWindow promise
+
+function noteWarmServe(url) {
+    lastWarmServe.set(url, Date.now());
+    if (lastWarmServe.size > 2000) {
+        const oldest = lastWarmServe.keys().next().value;
+        if (oldest !== undefined && oldest !== url) lastWarmServe.delete(oldest);
+    }
+}
 
 function fetchWithWarmWindow(sourceUrl, label) {
     // Dedup: concurrent player polls during a warm share the SAME warm — they all
@@ -823,25 +831,34 @@ function fetchWithWarmWindow(sourceUrl, label) {
         const skipWarm = Date.now() - last < REWARM_AFTER_MS;   // continuous playback → don't wait
 
         let best = await fetchUpstreamHLS(sourceUrl, label);
-        if (skipWarm || best.info.isMaster || !best.info.isLive || windowSeconds(best.info) >= MIN_START_SECONDS) {
-            lastWarmServe.set(sourceUrl, Date.now());
+        if (skipWarm || best.info.isMaster || !best.info.isLive || best.info.segmentCount >= MIN_START_SEGMENTS) {
+            noteWarmServe(sourceUrl);
             return best;
         }
 
         const startSegs = best.info.segmentCount;
         const started = Date.now();
-        while (windowSeconds(best.info) < MIN_START_SECONDS && Date.now() - started < WINDOW_WARM_TIMEOUT) {
+        console.log(`[HLS WARM START] channel="${label}" segs=${startSegs}/${MIN_START_SEGMENTS} — building cushion before the player attaches`);
+
+        while (best.info.segmentCount < MIN_START_SEGMENTS && Date.now() - started < WINDOW_WARM_TIMEOUT) {
             await sleep(WINDOW_WARM_POLL);
             const next = await fetchUpstreamHLS(sourceUrl, label);
             if (next.info.isMaster || !next.info.isLive) { best = next; break; }
+
             const grew = next.info.segmentCount > best.info.segmentCount;
+            // The window is SLIDING (capped) if media-sequence advances. Only then is
+            // it "as deep as it gets" — bail. If it's NOT sliding and just hasn't grown
+            // yet, the encoder simply hasn't produced the next segment: keep waiting.
+            const sliding = Number(next.info.mediaSequence || 0) > Number(best.info.mediaSequence || 0);
+            console.log(`[HLS WARM] channel="${label}" segs=${next.info.segmentCount}/${MIN_START_SEGMENTS} seq=${next.info.mediaSequence} waited=${Date.now() - started}ms`);
             best = next;
-            if (!grew) break;   // window isn't accumulating — as deep as it gets, stop waiting
+            if (!grew && sliding) {
+                console.log(`[HLS WARM CAPPED] channel="${label}" window won't deepen (sliding at ${best.info.segmentCount} segs) — serving what we have`);
+                break;
+            }
         }
-        lastWarmServe.set(sourceUrl, Date.now());
-        if (best.info.segmentCount > startSegs) {
-            console.log(`[HLS WARM] channel="${label}" window ${startSegs}→${best.info.segmentCount} segs (~${windowSeconds(best.info)}s) waited=${Date.now() - started}ms`);
-        }
+        noteWarmServe(sourceUrl);
+        console.log(`[HLS WARM DONE] channel="${label}" segs=${startSegs}→${best.info.segmentCount} waited=${Date.now() - started}ms`);
         return best;
     })();
 
@@ -850,20 +867,28 @@ function fetchWithWarmWindow(sourceUrl, label) {
     return p;
 }
 
-async function servePlaylist(res, sourceUrl, host, configKey, label) {
-    const warmed = await fetchWithWarmWindow(sourceUrl, label);
-    const { data, finalUrl, info } = warmed;
+async function servePlaylist(res, sourceUrl, host, configKey, label, doWarm = true) {
+    const { data, finalUrl, info } = doWarm
+        ? await fetchWithWarmWindow(sourceUrl, label)
+        : await fetchUpstreamHLS(sourceUrl, label);
     const { rewritten, segIds } = rewriteHLSUrls(data, finalUrl, host, configKey);
 
-    if (!info.isMaster && segIds.length) {
-        queuePrefetch(segIds.slice(-SEGMENT_PREFETCH_AHEAD));
+    // Single-connection provider: keep the prefetcher focused ONLY on the current
+    // channel. Drop pending prefetch from a previously-watched channel so a switch
+    // never holds two upstream connections at once. Prefetch the WHOLE served window
+    // in playlist order (oldest first) so the player gets cache HITs no matter where
+    // it attaches — with concurrency 1 this is the single upstream connection while
+    // the player reads from RAM.
+    if (!info.isMaster && info.isLive && segIds.length) {
+        prefetchQueue.length = 0;
+        queuePrefetch(segIds);
     }
 
     res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, no-transform");
     res.setHeader("Pragma", "no-cache");
     console.log(
-        `[HLS] channel="${label}" type=${info.isMaster ? "master" : "media"} live=${info.isLive}` +
+        `[HLS SERVE] channel="${label}" type=${info.isMaster ? "master" : "media"} live=${info.isLive}` +
         ` segs=${info.segmentCount}${info.targetDuration ? ` target=${info.targetDuration}s` : ""}` +
         `${info.mediaSequence != null ? ` seq=${info.mediaSequence}` : ""}` +
         ` cache=${segCache.size}/${formatBytes(segCacheBytes)} prefetch=${prefetchActive}+${prefetchQueue.length}`
@@ -872,12 +897,14 @@ async function servePlaylist(res, sourceUrl, host, configKey, label) {
 }
 
 app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
+    const t0 = Date.now();
     try {
         const configKey = req.params.base64Config;
         const config = decodeConfig(configKey);
         const ch = await getChannelById(configKey, config, req.params.id);
         if (!ch) return res.status(404).send("#EXTM3U\n#EXT-X-ENDLIST\n");
-        await servePlaylist(res, ch.url, getPublicHost(req), configKey, ch.name);
+        console.log(`[HLS OPEN] channel="${ch.name}" — request hit Kronos (resolve=${Date.now() - t0}ms)`);
+        await servePlaylist(res, ch.url, getPublicHost(req), configKey, ch.name, true);
     } catch (err) {
         console.error(`[HLS ERROR] ${err.message}`);
         if (!res.headersSent) res.status(502).send("#EXTM3U\n#EXT-X-ENDLIST\n");
@@ -889,7 +916,8 @@ app.get("/:base64Config/proxy/pl", async (req, res) => {
         const configKey = req.params.base64Config;
         decodeConfig(configKey);
         if (!req.query.u) return res.status(400).send("#EXTM3U\n");
-        await servePlaylist(res, decodeProxyUrl(req.query.u), getPublicHost(req), configKey, "nested-playlist");
+        // Nested/variant playlist: no warm-up (it's polled repeatedly, not a fresh open).
+        await servePlaylist(res, decodeProxyUrl(req.query.u), getPublicHost(req), configKey, "nested-playlist", false);
     } catch (err) {
         console.error(`[PL ERROR] ${err.message}`);
         if (!res.headersSent) res.status(502).send("#EXTM3U\n#EXT-X-ENDLIST\n");
@@ -921,15 +949,19 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
             return res.status(400).end();
         }
 
-        // Cache path: only for known segIds and non-Range requests (full segment).
-        // Range requests bypass the cache to avoid serving a partial as a whole.
-        if (segId && !req.headers.range) {
+        // Cache path for known segIds. A cached entry is ALWAYS a full 200, so we can
+        // safely satisfy Range requests by slicing it (no extra upstream connection —
+        // important with max_connections=1).
+        if (segId) {
             const cached = getSegFromCache(segId);
-            if (cached) return sendCachedSeg(res, cached, segId, "HIT");
+            if (cached) return sendCachedSeg(req, res, cached, segId, "HIT");
 
+            // A prefetch for this exact segment is already in flight: WAIT for it
+            // (long enough to cover a slow segment) instead of opening a second
+            // upstream connection — essential with max_connections=1.
             if (segInflight.has(segId)) {
-                const e = await Promise.race([segInflight.get(segId), sleep(4000).then(() => null)]);
-                if (e) return sendCachedSeg(res, e, segId, "HIT-WAIT");
+                const e = await Promise.race([segInflight.get(segId), sleep(SEG_REQUEST_TIMEOUT).then(() => null)]);
+                if (e) return sendCachedSeg(req, res, e, segId, "HIT-WAIT");
             }
         }
 
@@ -941,14 +973,41 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
     }
 });
 
-function sendCachedSeg(res, entry, segId, label) {
+function sendCachedSeg(req, res, entry, segId, label) {
+    const buf = entry.buffer;
+    const total = buf.length;
     Object.entries(entry.headers).forEach(([k, v]) => res.setHeader(k, v));
     res.setHeader("Content-Type", entry.headers["content-type"] || "video/mp2t");
-    res.setHeader("Content-Length", entry.size);
+    res.setHeader("Accept-Ranges", "bytes");
     res.setHeader("X-Kronos-Relay", "1");
     res.setHeader("X-Kronos-Cache", label);
-    console.log(`[SEG ${label}] ${getSegmentLabel(segRegistry.get(segId) || segId)} bytes=${formatBytes(entry.size)}`);
-    return res.end(entry.buffer);
+    const name = getSegmentLabel(segRegistry.get(segId) || segId);
+
+    const range = req.headers.range;
+    if (range) {
+        const m = String(range).match(/bytes=(\d*)-(\d*)/);
+        if (m) {
+            let start = m[1] === "" ? 0 : Number(m[1]);
+            let end = m[2] === "" ? total - 1 : Number(m[2]);
+            if (!Number.isFinite(start)) start = 0;
+            if (!Number.isFinite(end) || end >= total) end = total - 1;
+            if (start > end || start >= total) {
+                res.status(416);
+                res.setHeader("Content-Range", `bytes */${total}`);
+                return res.end();
+            }
+            const chunk = buf.subarray(start, end + 1);
+            res.status(206);
+            res.setHeader("Content-Range", `bytes ${start}-${end}/${total}`);
+            res.setHeader("Content-Length", chunk.length);
+            console.log(`[SEG ${label}] ${name} range=${start}-${end}/${total}`);
+            return res.end(chunk);
+        }
+    }
+
+    res.setHeader("Content-Length", total);
+    console.log(`[SEG ${label}] ${name} bytes=${formatBytes(total)}`);
+    return res.end(buf);
 }
 
 // Stream a segment straight through, caching it (by segId) on the way if full 200.
@@ -1080,6 +1139,6 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`📦 Node ${process.version}`);
     console.log(`🔁 manifest retry=${MANIFEST_RETRIES} delay=${MANIFEST_RETRY_DELAY}ms`);
     console.log(`⏩ prefetch ahead=${SEGMENT_PREFETCH_AHEAD} concurrency=${SEGMENT_PREFETCH_CONCURRENCY} cacheTTL=${SEGMENT_CACHE_TTL / 1000}s`);
-    console.log(`🪟 window warm-up: min=${MIN_START_SECONDS}s timeout=${WINDOW_WARM_TIMEOUT / 1000}s poll=${WINDOW_WARM_POLL / 1000}s`);
+    console.log(`🪟 window warm-up: target=${MIN_START_SEGMENTS} segs timeout=${WINDOW_WARM_TIMEOUT / 1000}s poll=${WINDOW_WARM_POLL / 1000}s rewarm=${REWARM_AFTER_MS / 1000}s`);
     console.log("=".repeat(60) + "\n");
 });
