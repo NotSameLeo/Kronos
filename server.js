@@ -418,15 +418,37 @@ async function fetchUpstreamHLS(sourceUrl, label = "stream") {
     throw lastErr || new Error("Manifest fetch failed");
 }
 
-// Returns { rewritten, segmentUrls } — segmentUrls are absolute upstream URLs in order.
+// Stable identity for a segment, ignoring rotating query tokens. The upstream
+// (Xtream) rotates the token on every playlist refresh, so the same physical
+// segment arrives under a different URL each time. We key everything on the
+// token-free path so the player sees a STABLE proxied URL (no phantom re-downloads
+// / timeline jumps) and the cache deduplicates correctly.
+const segRegistry = new Map();    // segId -> latest real upstream URL (with current token)
+const SEG_REGISTRY_MAX = Number(process.env.SEG_REGISTRY_MAX || 4000);
+
+function segIdFor(absUrl) {
+    try { const u = new URL(absUrl); return hashKey(u.origin + u.pathname); }
+    catch { return hashKey(String(absUrl).split("?")[0]); }
+}
+
+function registerSeg(id, absUrl) {
+    segRegistry.set(id, absUrl);
+    if (segRegistry.size > SEG_REGISTRY_MAX) {
+        const oldest = segRegistry.keys().next().value;   // oldest insertion = slid-out segment
+        if (oldest !== undefined && oldest !== id) segRegistry.delete(oldest);
+    }
+}
+
+// Returns { rewritten, segIds } — segIds are stable segment ids in playlist order.
 function rewriteHLSUrls(playlist, baseUrl, hostBase, configKey) {
-    const segUrl = abs => `${hostBase}/${configKey}/proxy/seg?u=${encodeProxyUrl(abs)}`;
     const plUrl = abs => `${hostBase}/${configKey}/proxy/pl?u=${encodeProxyUrl(abs)}`;
-    const segmentUrls = [];
+    const segIds = [];
     const pick = abs => {
         if (isHlsUrl(abs)) return plUrl(abs);
-        segmentUrls.push(abs);
-        return segUrl(abs);
+        const id = segIdFor(abs);
+        registerSeg(id, abs);              // remember the freshest token-bearing URL
+        segIds.push(id);
+        return `${hostBase}/${configKey}/proxy/seg?s=${id}`;   // STABLE across refreshes
     };
 
     const rewritten = String(playlist || "").split(/\r?\n/).map(line => {
@@ -442,35 +464,35 @@ function rewriteHLSUrls(playlist, baseUrl, hostBase, configKey) {
         return pick(toAbsoluteUrl(t, baseUrl));
     }).join("\n");
 
-    return { rewritten, segmentUrls };
+    return { rewritten, segIds };
 }
 
-// ── Segment cache (full 200 responses only — Range requests bypass it) ──────────
-const segCache = new Map();       // url -> { buffer, headers, status, size, fetchedAt }
-const segInflight = new Map();    // url -> Promise<entry|null>
+// ── Segment cache, keyed by stable segId (full 200 only; Range bypasses) ────────
+const segCache = new Map();       // segId -> { buffer, headers, status, size, fetchedAt }
+const segInflight = new Map();    // segId -> Promise<entry|null>
 let segCacheBytes = 0;
 let prefetchActive = 0;
 const prefetchQueue = [];
 
-function getSegFromCache(url) {
-    const e = segCache.get(url);
+function getSegFromCache(id) {
+    const e = segCache.get(id);
     if (!e) return null;
     if (Date.now() - e.fetchedAt > SEGMENT_CACHE_TTL) {
-        segCache.delete(url);
+        segCache.delete(id);
         segCacheBytes -= e.size;
         return null;
     }
     return e;
 }
 
-function storeSeg(url, buffer, headers, status) {
+function storeSeg(id, buffer, headers, status) {
     if (status !== 200) return;                       // never cache 206/partial
     if (!Buffer.isBuffer(buffer) || buffer.length <= 0 || buffer.length > SEGMENT_CACHE_MAX_ITEM_BYTES) return;
-    const existing = segCache.get(url);
+    const existing = segCache.get(id);
     if (existing) segCacheBytes -= existing.size;
     const keep = {};
     ["content-type", "cache-control", "last-modified", "etag"].forEach(h => { if (headers[h]) keep[h] = headers[h]; });
-    segCache.set(url, { buffer, headers: keep, status, size: buffer.length, fetchedAt: Date.now() });
+    segCache.set(id, { buffer, headers: keep, status, size: buffer.length, fetchedAt: Date.now() });
     segCacheBytes += buffer.length;
     evictSegCache();
 }
@@ -485,10 +507,11 @@ function evictSegCache() {
     }
 }
 
-async function fetchSegToCache(url) {
-    const hit = getSegFromCache(url);
+async function fetchSegToCache(id, url) {
+    const hit = getSegFromCache(id);
     if (hit) return hit;
-    if (segInflight.has(url)) return segInflight.get(url);
+    if (segInflight.has(id)) return segInflight.get(id);
+    if (!url) return null;
 
     const p = (async () => {
         const started = Date.now();
@@ -503,31 +526,33 @@ async function fetchSegToCache(url) {
             validateStatus: s => s === 200
         });
         const buf = Buffer.from(r.data);
-        storeSeg(url, buf, r.headers, 200);
+        storeSeg(id, buf, r.headers, 200);
         const ms = Date.now() - started;
         console.log(`[PREFETCH OK] ${getSegmentLabel(url)} bytes=${formatBytes(buf.length)} time=${ms}ms speed=${formatSpeed(buf.length, ms)}`);
-        return getSegFromCache(url);
+        return getSegFromCache(id);
     })();
 
-    segInflight.set(url, p);
+    segInflight.set(id, p);
     try { return await p; }
-    finally { segInflight.delete(url); }
+    finally { segInflight.delete(id); }
 }
 
-function queuePrefetch(urls) {
-    urls.forEach(u => {
-        if (getSegFromCache(u) || segInflight.has(u) || prefetchQueue.includes(u)) return;
-        prefetchQueue.push(u);
+function queuePrefetch(ids) {
+    ids.forEach(id => {
+        if (getSegFromCache(id) || segInflight.has(id) || prefetchQueue.includes(id)) return;
+        prefetchQueue.push(id);
     });
     pumpPrefetch();
 }
 
 function pumpPrefetch() {
     while (prefetchActive < SEGMENT_PREFETCH_CONCURRENCY && prefetchQueue.length > 0) {
-        const url = prefetchQueue.shift();
-        if (getSegFromCache(url) || segInflight.has(url)) continue;
+        const id = prefetchQueue.shift();
+        if (getSegFromCache(id) || segInflight.has(id)) continue;
+        const url = segRegistry.get(id);
+        if (!url) continue;
         prefetchActive++;
-        fetchSegToCache(url)
+        fetchSegToCache(id, url)
             .catch(err => console.warn(`[PREFETCH ERR] ${getSegmentLabel(url)} ${err.message}`))
             .finally(() => { prefetchActive--; pumpPrefetch(); });
     }
@@ -786,41 +811,52 @@ function windowSeconds(info) {
 // Fetch the manifest; if it's a live media playlist with a too-shallow window,
 // keep re-polling (up to a deadline) until it accumulates >= MIN_START_SECONDS,
 // so the player starts with a cushion. Bails out if the window stops growing.
-const lastWarmServe = new Map();   // sourceUrl -> last served timestamp
+const lastWarmServe = new Map();   // sourceUrl -> last served timestamp (set only AFTER serving)
+const warmInflight = new Map();    // sourceUrl -> in-progress fetchWithWarmWindow promise
 
-async function fetchWithWarmWindow(sourceUrl, label) {
-    const last = lastWarmServe.get(sourceUrl) || 0;
-    const skipWarm = Date.now() - last < REWARM_AFTER_MS;   // continuous playback → don't wait
-    lastWarmServe.set(sourceUrl, Date.now());
+function fetchWithWarmWindow(sourceUrl, label) {
+    // Dedup: concurrent player polls during a warm share the SAME warm — they all
+    // receive the deep window instead of one of them slipping through with segs=1.
+    if (warmInflight.has(sourceUrl)) return warmInflight.get(sourceUrl);
+    const p = (async () => {
+        const last = lastWarmServe.get(sourceUrl) || 0;
+        const skipWarm = Date.now() - last < REWARM_AFTER_MS;   // continuous playback → don't wait
 
-    let best = await fetchUpstreamHLS(sourceUrl, label);
-    if (skipWarm || best.info.isMaster || !best.info.isLive) return best;
-    if (windowSeconds(best.info) >= MIN_START_SECONDS) return best;
+        let best = await fetchUpstreamHLS(sourceUrl, label);
+        if (skipWarm || best.info.isMaster || !best.info.isLive || windowSeconds(best.info) >= MIN_START_SECONDS) {
+            lastWarmServe.set(sourceUrl, Date.now());
+            return best;
+        }
 
-    const startSegs = best.info.segmentCount;
-    const started = Date.now();
-    while (windowSeconds(best.info) < MIN_START_SECONDS && Date.now() - started < WINDOW_WARM_TIMEOUT) {
-        await sleep(WINDOW_WARM_POLL);
-        const next = await fetchUpstreamHLS(sourceUrl, label);
-        if (next.info.isMaster || !next.info.isLive) return next;
-        const grew = next.info.segmentCount > best.info.segmentCount;
-        best = next;
-        if (!grew) break;   // window isn't accumulating — as deep as it gets, stop waiting
-    }
-    lastWarmServe.set(sourceUrl, Date.now());   // refresh after the wait
-    if (best.info.segmentCount > startSegs) {
-        console.log(`[HLS WARM] channel="${label}" window ${startSegs}→${best.info.segmentCount} segs (~${windowSeconds(best.info)}s) waited=${Date.now() - started}ms`);
-    }
-    return best;
+        const startSegs = best.info.segmentCount;
+        const started = Date.now();
+        while (windowSeconds(best.info) < MIN_START_SECONDS && Date.now() - started < WINDOW_WARM_TIMEOUT) {
+            await sleep(WINDOW_WARM_POLL);
+            const next = await fetchUpstreamHLS(sourceUrl, label);
+            if (next.info.isMaster || !next.info.isLive) { best = next; break; }
+            const grew = next.info.segmentCount > best.info.segmentCount;
+            best = next;
+            if (!grew) break;   // window isn't accumulating — as deep as it gets, stop waiting
+        }
+        lastWarmServe.set(sourceUrl, Date.now());
+        if (best.info.segmentCount > startSegs) {
+            console.log(`[HLS WARM] channel="${label}" window ${startSegs}→${best.info.segmentCount} segs (~${windowSeconds(best.info)}s) waited=${Date.now() - started}ms`);
+        }
+        return best;
+    })();
+
+    warmInflight.set(sourceUrl, p);
+    p.finally(() => { if (warmInflight.get(sourceUrl) === p) warmInflight.delete(sourceUrl); });
+    return p;
 }
 
 async function servePlaylist(res, sourceUrl, host, configKey, label) {
-    const { data, finalUrl, info } = await fetchWithWarmWindow(sourceUrl, label);
-    const { rewritten, segmentUrls } = rewriteHLSUrls(data, finalUrl, host, configKey);
+    const warmed = await fetchWithWarmWindow(sourceUrl, label);
+    const { data, finalUrl, info } = warmed;
+    const { rewritten, segIds } = rewriteHLSUrls(data, finalUrl, host, configKey);
 
-    if (!info.isMaster && segmentUrls.length) {
-        const ahead = segmentUrls.slice(-SEGMENT_PREFETCH_AHEAD);
-        queuePrefetch(ahead);
+    if (!info.isMaster && segIds.length) {
+        queuePrefetch(segIds.slice(-SEGMENT_PREFETCH_AHEAD));
     }
 
     res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
@@ -863,41 +899,41 @@ app.get("/:base64Config/proxy/pl", async (req, res) => {
 app.get("/:base64Config/proxy/seg", async (req, res) => {
     const started = Date.now();
     let sourceUrl = null;
+    let segId = null;
 
     try {
         decodeConfig(req.params.base64Config);
-        if (!req.query.u) return res.status(400).end();
-        sourceUrl = decodeProxyUrl(req.query.u);
 
-        // Cache path: only for non-Range requests (full segment). Range bypasses
-        // the cache entirely to avoid serving a partial body as a whole segment.
-        if (!req.headers.range) {
-            const cached = getSegFromCache(sourceUrl);
-            if (cached) {
-                Object.entries(cached.headers).forEach(([k, v]) => res.setHeader(k, v));
-                res.setHeader("Content-Type", cached.headers["content-type"] || "video/mp2t");
-                res.setHeader("Content-Length", cached.size);
-                res.setHeader("X-Kronos-Relay", "1");
-                res.setHeader("X-Kronos-Cache", "HIT");
-                console.log(`[SEG HIT] ${getSegmentLabel(sourceUrl)} bytes=${formatBytes(cached.size)}`);
-                return res.end(cached.buffer);
+        if (req.query.s) {
+            // HLS segment: stable id → resolve freshest token-bearing URL.
+            segId = String(req.query.s);
+            sourceUrl = segRegistry.get(segId);
+            if (!sourceUrl) {
+                // Unknown id (server restarted / aged out). Tell the player to refresh
+                // the playlist rather than serve garbage.
+                console.warn(`[SEG MISS-ID] ${segId} not in registry`);
+                return res.status(404).end();
             }
-            // Wait briefly if a prefetch for this exact segment is in flight.
-            if (segInflight.has(sourceUrl)) {
-                const e = await Promise.race([segInflight.get(sourceUrl), sleep(3000).then(() => null)]);
-                if (e) {
-                    Object.entries(e.headers).forEach(([k, v]) => res.setHeader(k, v));
-                    res.setHeader("Content-Type", e.headers["content-type"] || "video/mp2t");
-                    res.setHeader("Content-Length", e.size);
-                    res.setHeader("X-Kronos-Relay", "1");
-                    res.setHeader("X-Kronos-Cache", "HIT-WAIT");
-                    console.log(`[SEG HIT-WAIT] ${getSegmentLabel(sourceUrl)} bytes=${formatBytes(e.size)}`);
-                    return res.end(e.buffer);
-                }
+        } else if (req.query.u) {
+            // Direct (non-HLS) stream URL — continuous, never cached.
+            sourceUrl = decodeProxyUrl(req.query.u);
+        } else {
+            return res.status(400).end();
+        }
+
+        // Cache path: only for known segIds and non-Range requests (full segment).
+        // Range requests bypass the cache to avoid serving a partial as a whole.
+        if (segId && !req.headers.range) {
+            const cached = getSegFromCache(segId);
+            if (cached) return sendCachedSeg(res, cached, segId, "HIT");
+
+            if (segInflight.has(segId)) {
+                const e = await Promise.race([segInflight.get(segId), sleep(4000).then(() => null)]);
+                if (e) return sendCachedSeg(res, e, segId, "HIT-WAIT");
             }
         }
 
-        await streamSegment(req, res, sourceUrl, started);
+        await streamSegment(req, res, sourceUrl, segId, started);
     } catch (err) {
         console.error(`[SEG ERROR] ${getSegmentLabel(sourceUrl)} ${err.message}`);
         if (!res.headersSent) res.status(502).end();
@@ -905,8 +941,18 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
     }
 });
 
-// Stream a segment straight through, caching it on the way if it's a full 200.
-async function streamSegment(req, res, sourceUrl, started) {
+function sendCachedSeg(res, entry, segId, label) {
+    Object.entries(entry.headers).forEach(([k, v]) => res.setHeader(k, v));
+    res.setHeader("Content-Type", entry.headers["content-type"] || "video/mp2t");
+    res.setHeader("Content-Length", entry.size);
+    res.setHeader("X-Kronos-Relay", "1");
+    res.setHeader("X-Kronos-Cache", label);
+    console.log(`[SEG ${label}] ${getSegmentLabel(segRegistry.get(segId) || segId)} bytes=${formatBytes(entry.size)}`);
+    return res.end(entry.buffer);
+}
+
+// Stream a segment straight through, caching it (by segId) on the way if full 200.
+async function streamSegment(req, res, sourceUrl, segId, started) {
     const headers = { "User-Agent": UPSTREAM_UA, "Accept": "*/*", "Accept-Encoding": "identity", "Connection": "keep-alive" };
     if (req.headers.range) headers.Range = req.headers.range;
 
@@ -930,7 +976,8 @@ async function streamSegment(req, res, sourceUrl, started) {
     res.setHeader("X-Kronos-Cache", "MISS");
     res.status(response.status);
 
-    const collect = (response.status === 200 && !req.headers.range);
+    // Only cache full 200 HLS segments (segId present, no Range).
+    const collect = (segId && response.status === 200 && !req.headers.range);
     const chunks = collect ? [] : null;
     let bytes = 0;
     let overflow = false;
@@ -945,7 +992,7 @@ async function streamSegment(req, res, sourceUrl, started) {
 
     res.on("finish", () => {
         const ms = Date.now() - started;
-        if (chunks && !overflow && chunks.length) storeSeg(sourceUrl, Buffer.concat(chunks), response.headers, 200);
+        if (chunks && !overflow && chunks.length) storeSeg(segId, Buffer.concat(chunks), response.headers, 200);
         const slow = ms >= SLOW_SEGMENT_MS ? " SLOW" : "";
         console.log(`[SEG] ${getSegmentLabel(sourceUrl)} status=${response.status} bytes=${formatBytes(bytes)} time=${ms}ms speed=${formatSpeed(bytes, ms)}${slow}`);
     });
@@ -987,6 +1034,7 @@ app.get("/:base64Config/stats", (req, res) => {
             segments: segCache.size,
             segmentBytes: segCacheBytes,
             segmentBytesHuman: formatBytes(segCacheBytes),
+            segRegistry: segRegistry.size,
             prefetchActive,
             prefetchQueue: prefetchQueue.length
         }
