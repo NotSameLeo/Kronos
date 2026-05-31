@@ -46,6 +46,18 @@ const SEGMENT_CACHE_MAX_ITEMS = Number(process.env.SEGMENT_CACHE_MAX_ITEMS || 48
 const SEGMENT_CACHE_MAX_ITEM_BYTES = Number(process.env.SEGMENT_CACHE_MAX_ITEM_BYTES || 24 * 1024 * 1024);
 const SLOW_SEGMENT_MS = Number(process.env.SLOW_SEGMENT_MS || 4000);
 
+// Window warm-up — for channels whose upstream exposes a too-shallow live window
+// (e.g. starts fresh at seq=0 with 1 segment). We wait for the window to accumulate
+// a minimum amount of content before handing it to the player, so it starts with a
+// real cushion instead of starving at the live edge. Self-gating: does nothing when
+// the window is already deep, and bails if the window isn't growing.
+const MIN_START_SECONDS = Number(process.env.MIN_START_SECONDS || 30);
+const WINDOW_WARM_TIMEOUT = Number(process.env.WINDOW_WARM_TIMEOUT || 40000);
+const WINDOW_WARM_POLL = Number(process.env.WINDOW_WARM_POLL || 3000);
+// Only warm a channel when it's a fresh (re)open. If the same channel was served
+// within this window, it's continuous playback → skip the wait, just refresh.
+const REWARM_AFTER_MS = Number(process.env.REWARM_AFTER_MS || 45000);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // In-memory caches (catalog/EPG/logos only — no playback buffering anymore)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -765,8 +777,45 @@ app.get("/:base64Config/poster/:id.svg", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // Serve a playlist (channel entry or nested) + kick prefetch of the segments
 // nearest the live edge so they're ready when the player asks for them.
+// How many seconds of content a media playlist currently exposes.
+function windowSeconds(info) {
+    const dur = info.targetDuration || 6;
+    return (info.segmentCount || 0) * dur;
+}
+
+// Fetch the manifest; if it's a live media playlist with a too-shallow window,
+// keep re-polling (up to a deadline) until it accumulates >= MIN_START_SECONDS,
+// so the player starts with a cushion. Bails out if the window stops growing.
+const lastWarmServe = new Map();   // sourceUrl -> last served timestamp
+
+async function fetchWithWarmWindow(sourceUrl, label) {
+    const last = lastWarmServe.get(sourceUrl) || 0;
+    const skipWarm = Date.now() - last < REWARM_AFTER_MS;   // continuous playback → don't wait
+    lastWarmServe.set(sourceUrl, Date.now());
+
+    let best = await fetchUpstreamHLS(sourceUrl, label);
+    if (skipWarm || best.info.isMaster || !best.info.isLive) return best;
+    if (windowSeconds(best.info) >= MIN_START_SECONDS) return best;
+
+    const startSegs = best.info.segmentCount;
+    const started = Date.now();
+    while (windowSeconds(best.info) < MIN_START_SECONDS && Date.now() - started < WINDOW_WARM_TIMEOUT) {
+        await sleep(WINDOW_WARM_POLL);
+        const next = await fetchUpstreamHLS(sourceUrl, label);
+        if (next.info.isMaster || !next.info.isLive) return next;
+        const grew = next.info.segmentCount > best.info.segmentCount;
+        best = next;
+        if (!grew) break;   // window isn't accumulating — as deep as it gets, stop waiting
+    }
+    lastWarmServe.set(sourceUrl, Date.now());   // refresh after the wait
+    if (best.info.segmentCount > startSegs) {
+        console.log(`[HLS WARM] channel="${label}" window ${startSegs}→${best.info.segmentCount} segs (~${windowSeconds(best.info)}s) waited=${Date.now() - started}ms`);
+    }
+    return best;
+}
+
 async function servePlaylist(res, sourceUrl, host, configKey, label) {
-    const { data, finalUrl, info } = await fetchUpstreamHLS(sourceUrl, label);
+    const { data, finalUrl, info } = await fetchWithWarmWindow(sourceUrl, label);
     const { rewritten, segmentUrls } = rewriteHLSUrls(data, finalUrl, host, configKey);
 
     if (!info.isMaster && segmentUrls.length) {
@@ -983,5 +1032,6 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`📦 Node ${process.version}`);
     console.log(`🔁 manifest retry=${MANIFEST_RETRIES} delay=${MANIFEST_RETRY_DELAY}ms`);
     console.log(`⏩ prefetch ahead=${SEGMENT_PREFETCH_AHEAD} concurrency=${SEGMENT_PREFETCH_CONCURRENCY} cacheTTL=${SEGMENT_CACHE_TTL / 1000}s`);
+    console.log(`🪟 window warm-up: min=${MIN_START_SECONDS}s timeout=${WINDOW_WARM_TIMEOUT / 1000}s poll=${WINDOW_WARM_POLL / 1000}s`);
     console.log("=".repeat(60) + "\n");
 });
