@@ -27,8 +27,24 @@ const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.3
 const RELEASE_VERSION = "2.0.0";
 const ADDON_TYPE = "tv";
 const CATALOG_TTL = 30 * 60 * 1000;
-const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 15000);
-const SEG_REQUEST_TIMEOUT = Number(process.env.SEG_REQUEST_TIMEOUT || 30000);
+const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 20000);
+const SEG_REQUEST_TIMEOUT = Number(process.env.SEG_REQUEST_TIMEOUT || 45000);
+
+// Manifest retry — fixes Xtream "invalid manifest on first hit" (stream spins up
+// server-side on first request, returns garbage, is valid on retry).
+const MANIFEST_RETRIES = Number(process.env.MANIFEST_RETRIES || 3);
+const MANIFEST_RETRY_DELAY = Number(process.env.MANIFEST_RETRY_DELAY || 700);
+const MANIFEST_RETRY_DEADLINE = Number(process.env.MANIFEST_RETRY_DEADLINE || 28000);
+
+// Light read-ahead segment cache — absorbs upstream jitter, does NOT create
+// bandwidth. Kept small and simple on purpose (no Range caching = no corruption).
+const SEGMENT_PREFETCH_AHEAD = Number(process.env.SEGMENT_PREFETCH_AHEAD || 3);
+const SEGMENT_PREFETCH_CONCURRENCY = Number(process.env.SEGMENT_PREFETCH_CONCURRENCY || 2);
+const SEGMENT_CACHE_TTL = Number(process.env.SEGMENT_CACHE_TTL || 90 * 1000);
+const SEGMENT_CACHE_MAX_BYTES = Number(process.env.SEGMENT_CACHE_MAX_BYTES || 256 * 1024 * 1024);
+const SEGMENT_CACHE_MAX_ITEMS = Number(process.env.SEGMENT_CACHE_MAX_ITEMS || 48);
+const SEGMENT_CACHE_MAX_ITEM_BYTES = Number(process.env.SEGMENT_CACHE_MAX_ITEM_BYTES || 24 * 1024 * 1024);
+const SLOW_SEGMENT_MS = Number(process.env.SLOW_SEGMENT_MS || 4000);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // In-memory caches (catalog/EPG/logos only — no playback buffering anymore)
@@ -59,6 +75,20 @@ function decodeConfig(configKey) {
 function encodeProxyUrl(url) { return Buffer.from(String(url), "utf8").toString("base64url"); }
 function decodeProxyUrl(enc) { return Buffer.from(String(enc), "base64url").toString("utf8"); }
 function hashKey(value) { return crypto.createHash("sha1").update(String(value)).digest("hex").slice(0, 20); }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function analyzeHLS(text) {
+    const lines = String(text || "").split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    const td = lines.find(l => l.startsWith("#EXT-X-TARGETDURATION:"));
+    const seq = lines.find(l => l.startsWith("#EXT-X-MEDIA-SEQUENCE:"));
+    return {
+        isMaster: lines.some(l => l.startsWith("#EXT-X-STREAM-INF")),
+        isLive: !lines.some(l => l.startsWith("#EXT-X-ENDLIST")),
+        segmentCount: lines.filter(l => l && !l.startsWith("#")).length,
+        targetDuration: td ? Number(td.split(":")[1]) : null,
+        mediaSequence: seq ? Number(seq.split(":")[1]) : null
+    };
+}
 
 function toAbsoluteUrl(value, baseUrl) {
     try { return new URL(value, baseUrl).toString(); } catch { return value; }
@@ -335,30 +365,59 @@ async function getChannelById(configKey, config, id) {
 // HLS proxy — transparent: fetch, rewrite URLs, return as-is.
 // No buffering, no startup phases, no playlist rebuild, no session machinery.
 // ─────────────────────────────────────────────────────────────────────────────
-async function fetchUpstreamHLS(sourceUrl) {
-    const r = await axios.get(sourceUrl, {
-        timeout: HLS_REQUEST_TIMEOUT,
-        maxRedirects: 5,
-        headers: {
-            "User-Agent": UPSTREAM_UA,
-            "Accept": "application/x-mpegURL, application/vnd.apple.mpegurl, audio/mpegurl, text/plain, */*",
-            "Accept-Encoding": "gzip, deflate",
-            "Connection": "keep-alive"
-        },
-        validateStatus: s => s >= 200 && s < 300
-    });
-    const finalUrl = r.request?.res?.responseUrl || sourceUrl;
-    const text = String(r.data || "").trim();
-    if (!text.startsWith("#EXTM3U")) throw new Error("Invalid HLS manifest from upstream");
-    return { data: r.data, finalUrl };
+// Fetch a manifest with bounded retries. Retries on invalid body (Xtream stream
+// spin-up) and on network/timeout errors, until MANIFEST_RETRIES or the deadline.
+async function fetchUpstreamHLS(sourceUrl, label = "stream") {
+    const deadline = Date.now() + MANIFEST_RETRY_DEADLINE;
+    let lastErr = null;
+
+    for (let attempt = 0; attempt <= MANIFEST_RETRIES; attempt++) {
+        if (attempt > 0) {
+            if (Date.now() >= deadline) break;
+            await sleep(MANIFEST_RETRY_DELAY);
+        }
+        try {
+            const r = await axios.get(sourceUrl, {
+                timeout: HLS_REQUEST_TIMEOUT,
+                maxRedirects: 5,
+                headers: {
+                    "User-Agent": UPSTREAM_UA,
+                    "Accept": "application/x-mpegURL, application/vnd.apple.mpegurl, audio/mpegurl, text/plain, */*",
+                    "Accept-Encoding": "gzip, deflate",
+                    "Connection": "keep-alive"
+                },
+                validateStatus: s => s >= 200 && s < 300
+            });
+            const finalUrl = r.request?.res?.responseUrl || sourceUrl;
+            const text = String(r.data || "").trim();
+            if (!text.startsWith("#EXTM3U")) {
+                lastErr = new Error("Invalid HLS manifest from upstream");
+                console.warn(`[HLS RETRY] channel="${label}" attempt=${attempt + 1}/${MANIFEST_RETRIES + 1} reason=invalid-body`);
+                continue;
+            }
+            const info = analyzeHLS(text);
+            if (attempt > 0) console.log(`[HLS RECOVERED] channel="${label}" after=${attempt + 1} attempts`);
+            return { data: r.data, finalUrl, info };
+        } catch (err) {
+            lastErr = err;
+            console.warn(`[HLS RETRY] channel="${label}" attempt=${attempt + 1}/${MANIFEST_RETRIES + 1} reason=${err.message}`);
+        }
+    }
+    throw lastErr || new Error("Manifest fetch failed");
 }
 
+// Returns { rewritten, segmentUrls } — segmentUrls are absolute upstream URLs in order.
 function rewriteHLSUrls(playlist, baseUrl, hostBase, configKey) {
     const segUrl = abs => `${hostBase}/${configKey}/proxy/seg?u=${encodeProxyUrl(abs)}`;
     const plUrl = abs => `${hostBase}/${configKey}/proxy/pl?u=${encodeProxyUrl(abs)}`;
-    const pick = abs => isHlsUrl(abs) ? plUrl(abs) : segUrl(abs);
+    const segmentUrls = [];
+    const pick = abs => {
+        if (isHlsUrl(abs)) return plUrl(abs);
+        segmentUrls.push(abs);
+        return segUrl(abs);
+    };
 
-    return String(playlist || "").split(/\r?\n/).map(line => {
+    const rewritten = String(playlist || "").split(/\r?\n/).map(line => {
         const t = line.trim();
         if (!t) return line;
         if (t.startsWith("#")) {
@@ -370,6 +429,102 @@ function rewriteHLSUrls(playlist, baseUrl, hostBase, configKey) {
         }
         return pick(toAbsoluteUrl(t, baseUrl));
     }).join("\n");
+
+    return { rewritten, segmentUrls };
+}
+
+// ── Segment cache (full 200 responses only — Range requests bypass it) ──────────
+const segCache = new Map();       // url -> { buffer, headers, status, size, fetchedAt }
+const segInflight = new Map();    // url -> Promise<entry|null>
+let segCacheBytes = 0;
+let prefetchActive = 0;
+const prefetchQueue = [];
+
+function getSegFromCache(url) {
+    const e = segCache.get(url);
+    if (!e) return null;
+    if (Date.now() - e.fetchedAt > SEGMENT_CACHE_TTL) {
+        segCache.delete(url);
+        segCacheBytes -= e.size;
+        return null;
+    }
+    return e;
+}
+
+function storeSeg(url, buffer, headers, status) {
+    if (status !== 200) return;                       // never cache 206/partial
+    if (!Buffer.isBuffer(buffer) || buffer.length <= 0 || buffer.length > SEGMENT_CACHE_MAX_ITEM_BYTES) return;
+    const existing = segCache.get(url);
+    if (existing) segCacheBytes -= existing.size;
+    const keep = {};
+    ["content-type", "cache-control", "last-modified", "etag"].forEach(h => { if (headers[h]) keep[h] = headers[h]; });
+    segCache.set(url, { buffer, headers: keep, status, size: buffer.length, fetchedAt: Date.now() });
+    segCacheBytes += buffer.length;
+    evictSegCache();
+}
+
+function evictSegCache() {
+    while (segCacheBytes > SEGMENT_CACHE_MAX_BYTES || segCache.size > SEGMENT_CACHE_MAX_ITEMS) {
+        const oldestKey = segCache.keys().next().value;   // Map preserves insertion order
+        if (oldestKey === undefined) break;
+        const e = segCache.get(oldestKey);
+        segCache.delete(oldestKey);
+        if (e) segCacheBytes -= e.size;
+    }
+}
+
+async function fetchSegToCache(url) {
+    const hit = getSegFromCache(url);
+    if (hit) return hit;
+    if (segInflight.has(url)) return segInflight.get(url);
+
+    const p = (async () => {
+        const started = Date.now();
+        const r = await axios.get(url, {
+            responseType: "arraybuffer",
+            timeout: SEG_REQUEST_TIMEOUT,
+            maxRedirects: 5,
+            headers: { "User-Agent": UPSTREAM_UA, "Accept": "*/*", "Accept-Encoding": "identity", "Connection": "keep-alive" },
+            decompress: false,
+            maxContentLength: SEGMENT_CACHE_MAX_ITEM_BYTES,
+            maxBodyLength: SEGMENT_CACHE_MAX_ITEM_BYTES,
+            validateStatus: s => s === 200
+        });
+        const buf = Buffer.from(r.data);
+        storeSeg(url, buf, r.headers, 200);
+        const ms = Date.now() - started;
+        console.log(`[PREFETCH OK] ${getSegmentLabel(url)} bytes=${formatBytes(buf.length)} time=${ms}ms speed=${formatSpeed(buf.length, ms)}`);
+        return getSegFromCache(url);
+    })();
+
+    segInflight.set(url, p);
+    try { return await p; }
+    finally { segInflight.delete(url); }
+}
+
+function queuePrefetch(urls) {
+    urls.forEach(u => {
+        if (getSegFromCache(u) || segInflight.has(u) || prefetchQueue.includes(u)) return;
+        prefetchQueue.push(u);
+    });
+    pumpPrefetch();
+}
+
+function pumpPrefetch() {
+    while (prefetchActive < SEGMENT_PREFETCH_CONCURRENCY && prefetchQueue.length > 0) {
+        const url = prefetchQueue.shift();
+        if (getSegFromCache(url) || segInflight.has(url)) continue;
+        prefetchActive++;
+        fetchSegToCache(url)
+            .catch(err => console.warn(`[PREFETCH ERR] ${getSegmentLabel(url)} ${err.message}`))
+            .finally(() => { prefetchActive--; pumpPrefetch(); });
+    }
+}
+
+function formatSpeed(bytes, ms) {
+    if (!ms) return "n/a";
+    const mbps = (bytes * 8 / 1e6) / (ms / 1000);
+    return `${mbps.toFixed(1)}Mbps`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -608,24 +763,38 @@ app.get("/:base64Config/poster/:id.svg", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // Playback — pass-through HLS
 // ─────────────────────────────────────────────────────────────────────────────
+// Serve a playlist (channel entry or nested) + kick prefetch of the segments
+// nearest the live edge so they're ready when the player asks for them.
+async function servePlaylist(res, sourceUrl, host, configKey, label) {
+    const { data, finalUrl, info } = await fetchUpstreamHLS(sourceUrl, label);
+    const { rewritten, segmentUrls } = rewriteHLSUrls(data, finalUrl, host, configKey);
+
+    if (!info.isMaster && segmentUrls.length) {
+        const ahead = segmentUrls.slice(-SEGMENT_PREFETCH_AHEAD);
+        queuePrefetch(ahead);
+    }
+
+    res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, no-transform");
+    res.setHeader("Pragma", "no-cache");
+    console.log(
+        `[HLS] channel="${label}" type=${info.isMaster ? "master" : "media"} live=${info.isLive}` +
+        ` segs=${info.segmentCount}${info.targetDuration ? ` target=${info.targetDuration}s` : ""}` +
+        `${info.mediaSequence != null ? ` seq=${info.mediaSequence}` : ""}` +
+        ` cache=${segCache.size}/${formatBytes(segCacheBytes)} prefetch=${prefetchActive}+${prefetchQueue.length}`
+    );
+    res.send(rewritten);
+}
+
 app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
     try {
         const configKey = req.params.base64Config;
         const config = decodeConfig(configKey);
         const ch = await getChannelById(configKey, config, req.params.id);
         if (!ch) return res.status(404).send("#EXTM3U\n#EXT-X-ENDLIST\n");
-
-        const host = getPublicHost(req);
-        const { data, finalUrl } = await fetchUpstreamHLS(ch.url);
-        const rewritten = rewriteHLSUrls(data, finalUrl, host, configKey);
-
-        res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-        res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, no-transform");
-        res.setHeader("Pragma", "no-cache");
-        console.log(`[HLS] channel="${ch.name}" bytes=${formatBytes(Buffer.byteLength(rewritten))}`);
-        res.send(rewritten);
+        await servePlaylist(res, ch.url, getPublicHost(req), configKey, ch.name);
     } catch (err) {
-        console.error("[HLS ERROR]", err.message);
+        console.error(`[HLS ERROR] ${err.message}`);
         if (!res.headersSent) res.status(502).send("#EXTM3U\n#EXT-X-ENDLIST\n");
     }
 });
@@ -635,81 +804,111 @@ app.get("/:base64Config/proxy/pl", async (req, res) => {
         const configKey = req.params.base64Config;
         decodeConfig(configKey);
         if (!req.query.u) return res.status(400).send("#EXTM3U\n");
-        const sourceUrl = decodeProxyUrl(req.query.u);
-        const host = getPublicHost(req);
-        const { data, finalUrl } = await fetchUpstreamHLS(sourceUrl);
-        const rewritten = rewriteHLSUrls(data, finalUrl, host, configKey);
-        res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-        res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, no-transform");
-        res.send(rewritten);
+        await servePlaylist(res, decodeProxyUrl(req.query.u), getPublicHost(req), configKey, "nested-playlist");
     } catch (err) {
-        console.error("[PL ERROR]", err.message);
+        console.error(`[PL ERROR] ${err.message}`);
         if (!res.headersSent) res.status(502).send("#EXTM3U\n#EXT-X-ENDLIST\n");
     }
 });
 
 app.get("/:base64Config/proxy/seg", async (req, res) => {
-    let upstream = null;
     const started = Date.now();
     let sourceUrl = null;
-    let bytes = 0;
 
     try {
         decodeConfig(req.params.base64Config);
         if (!req.query.u) return res.status(400).end();
         sourceUrl = decodeProxyUrl(req.query.u);
 
-        const headers = {
-            "User-Agent": UPSTREAM_UA,
-            "Accept": "*/*",
-            "Accept-Encoding": "identity",
-            "Connection": "keep-alive"
-        };
-        if (req.headers.range) headers.Range = req.headers.range;
+        // Cache path: only for non-Range requests (full segment). Range bypasses
+        // the cache entirely to avoid serving a partial body as a whole segment.
+        if (!req.headers.range) {
+            const cached = getSegFromCache(sourceUrl);
+            if (cached) {
+                Object.entries(cached.headers).forEach(([k, v]) => res.setHeader(k, v));
+                res.setHeader("Content-Type", cached.headers["content-type"] || "video/mp2t");
+                res.setHeader("Content-Length", cached.size);
+                res.setHeader("X-Kronos-Relay", "1");
+                res.setHeader("X-Kronos-Cache", "HIT");
+                console.log(`[SEG HIT] ${getSegmentLabel(sourceUrl)} bytes=${formatBytes(cached.size)}`);
+                return res.end(cached.buffer);
+            }
+            // Wait briefly if a prefetch for this exact segment is in flight.
+            if (segInflight.has(sourceUrl)) {
+                const e = await Promise.race([segInflight.get(sourceUrl), sleep(3000).then(() => null)]);
+                if (e) {
+                    Object.entries(e.headers).forEach(([k, v]) => res.setHeader(k, v));
+                    res.setHeader("Content-Type", e.headers["content-type"] || "video/mp2t");
+                    res.setHeader("Content-Length", e.size);
+                    res.setHeader("X-Kronos-Relay", "1");
+                    res.setHeader("X-Kronos-Cache", "HIT-WAIT");
+                    console.log(`[SEG HIT-WAIT] ${getSegmentLabel(sourceUrl)} bytes=${formatBytes(e.size)}`);
+                    return res.end(e.buffer);
+                }
+            }
+        }
 
-        const response = await axios.get(sourceUrl, {
-            responseType: "stream",
-            timeout: SEG_REQUEST_TIMEOUT,
-            maxRedirects: 5,
-            headers,
-            decompress: false,
-            maxBodyLength: Infinity,
-            maxContentLength: Infinity,
-            validateStatus: s => s >= 200 && s < 400
-        });
-
-        upstream = response.data;
-        ["content-type", "content-length", "content-range", "accept-ranges",
-         "last-modified", "etag", "cache-control", "expires"].forEach(h => {
-            if (response.headers[h]) res.setHeader(h, response.headers[h]);
-        });
-        res.setHeader("X-Kronos-Relay", "1");
-        res.status(response.status);
-
-        upstream.on("data", chunk => { bytes += chunk.length; });
-
-        res.on("finish", () => {
-            const ms = Date.now() - started;
-            console.log(`[SEG] ${getSegmentLabel(sourceUrl)} status=${response.status} bytes=${formatBytes(bytes)} time=${ms}ms`);
-        });
-
-        res.on("close", () => {
-            if (!res.writableEnded && upstream?.destroy) upstream.destroy();
-        });
-
-        upstream.on("error", err => {
-            if (!res.headersSent) return res.status(502).end();
-            res.destroy(err);
-        });
-
-        upstream.pipe(res);
+        await streamSegment(req, res, sourceUrl, started);
     } catch (err) {
-        if (upstream?.destroy) upstream.destroy();
-        console.error("[SEG ERROR]", getSegmentLabel(sourceUrl), err.message);
+        console.error(`[SEG ERROR] ${getSegmentLabel(sourceUrl)} ${err.message}`);
         if (!res.headersSent) res.status(502).end();
         else if (!res.destroyed) res.destroy(err);
     }
 });
+
+// Stream a segment straight through, caching it on the way if it's a full 200.
+async function streamSegment(req, res, sourceUrl, started) {
+    const headers = { "User-Agent": UPSTREAM_UA, "Accept": "*/*", "Accept-Encoding": "identity", "Connection": "keep-alive" };
+    if (req.headers.range) headers.Range = req.headers.range;
+
+    const response = await axios.get(sourceUrl, {
+        responseType: "stream",
+        timeout: SEG_REQUEST_TIMEOUT,
+        maxRedirects: 5,
+        headers,
+        decompress: false,
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity,
+        validateStatus: s => s >= 200 && s < 400
+    });
+
+    const upstream = response.data;
+    ["content-type", "content-length", "content-range", "accept-ranges",
+     "last-modified", "etag", "cache-control", "expires"].forEach(h => {
+        if (response.headers[h]) res.setHeader(h, response.headers[h]);
+    });
+    res.setHeader("X-Kronos-Relay", "1");
+    res.setHeader("X-Kronos-Cache", "MISS");
+    res.status(response.status);
+
+    const collect = (response.status === 200 && !req.headers.range);
+    const chunks = collect ? [] : null;
+    let bytes = 0;
+    let overflow = false;
+
+    upstream.on("data", chunk => {
+        bytes += chunk.length;
+        if (chunks && !overflow) {
+            if (bytes > SEGMENT_CACHE_MAX_ITEM_BYTES) { overflow = true; chunks.length = 0; }
+            else chunks.push(chunk);
+        }
+    });
+
+    res.on("finish", () => {
+        const ms = Date.now() - started;
+        if (chunks && !overflow && chunks.length) storeSeg(sourceUrl, Buffer.concat(chunks), response.headers, 200);
+        const slow = ms >= SLOW_SEGMENT_MS ? " SLOW" : "";
+        console.log(`[SEG] ${getSegmentLabel(sourceUrl)} status=${response.status} bytes=${formatBytes(bytes)} time=${ms}ms speed=${formatSpeed(bytes, ms)}${slow}`);
+    });
+
+    res.on("close", () => { if (!res.writableEnded && upstream?.destroy) upstream.destroy(); });
+    upstream.on("error", err => {
+        if (!res.headersSent) res.status(502).end();
+        else res.destroy(err);
+    });
+
+    upstream.pipe(res);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Stream + stats + debug
@@ -735,7 +934,12 @@ app.get("/:base64Config/stats", (req, res) => {
         cache: {
             channels: Object.values(memoryCache.channelItems).reduce((s, l) => s + l.length, 0),
             epgMaps: Object.keys(memoryCache.epgData).length,
-            logos: Object.keys(memoryCache.logoData).length
+            logos: Object.keys(memoryCache.logoData).length,
+            segments: segCache.size,
+            segmentBytes: segCacheBytes,
+            segmentBytesHuman: formatBytes(segCacheBytes),
+            prefetchActive,
+            prefetchQueue: prefetchQueue.length
         }
     });
 });
@@ -777,5 +981,7 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log("=".repeat(60));
     console.log(`🌐 http://0.0.0.0:${PORT}`);
     console.log(`📦 Node ${process.version}`);
+    console.log(`🔁 manifest retry=${MANIFEST_RETRIES} delay=${MANIFEST_RETRY_DELAY}ms`);
+    console.log(`⏩ prefetch ahead=${SEGMENT_PREFETCH_AHEAD} concurrency=${SEGMENT_PREFETCH_CONCURRENCY} cacheTTL=${SEGMENT_CACHE_TTL / 1000}s`);
     console.log("=".repeat(60) + "\n");
 });
