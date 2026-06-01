@@ -35,6 +35,9 @@ const EPG_MAX_BYTES = Number(process.env.EPG_MAX_BYTES || 160 * 1024 * 1024);
 const EPG_RETRY_DELAY_MS = Number(process.env.EPG_RETRY_DELAY_MS || 60000);
 const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 20000);
 const SEG_REQUEST_TIMEOUT = Number(process.env.SEG_REQUEST_TIMEOUT || 45000);
+const PLAYLIST_REQUEST_TIMEOUT = Number(process.env.PLAYLIST_REQUEST_TIMEOUT || 20000);
+const PLAYLIST_RETRY_WINDOW_MS = Number(process.env.PLAYLIST_RETRY_WINDOW_MS || 30000);
+const PLAYLIST_RETRY_DELAY_MS = Number(process.env.PLAYLIST_RETRY_DELAY_MS || 2000);
 
 // Manifest retry — fixes Xtream "invalid manifest on first hit" (stream spins up
 // server-side on first request, returns garbage, is valid on retry).
@@ -369,11 +372,11 @@ function formatEpgDescription(programmes) {
     const lines = [];
     if (current) lines.push(formatProgramme("🔴 In Onda", current));
     if (next) lines.push(formatProgramme("🟡 A Seguire", next));
-    return lines.join("\n\n----------\n\n");
+    return lines.join("\n\n||\n\n");
 }
 
 function formatProgramme(label, programme) {
-    return `${label} (${formatTime(programme.start)} - ${formatTime(programme.stop)})\n| ${programme.title}:\n| ${String(programme.desc || "").slice(0, 500)}`;
+    return `${label} (${formatTime(programme.start)} - ${formatTime(programme.stop)}) | Titolo: ${programme.title} | Trama: ${String(programme.desc || "").slice(0, 500)}`;
 }
 
 function getEpgMatchKeys(values) {
@@ -437,19 +440,36 @@ function getConfiguredLists(config) {
 
 async function fetchPlaylist(sourceUrl, options = {}) {
     console.log("[FETCH PLAYLIST]", sourceUrl);
-    const response = await axios.get(sourceUrl, {
-        timeout: options.timeout || 60000,
-        maxRedirects: 5,
-        headers: {
-            "User-Agent": UPSTREAM_UA,
-            "Accept": "*/*",
-            "Accept-Encoding": "gzip, deflate",
-            "Connection": "keep-alive"
-        },
-        validateStatus: s => s >= 200 && s < 300
-    });
-    console.log("[FETCH PLAYLIST OK]", sourceUrl, "size=" + response.data.length);
-    return response.data;
+    const deadline = Date.now() + (options.retryWindow || PLAYLIST_RETRY_WINDOW_MS);
+    let attempt = 0;
+    let lastErr = null;
+    while (Date.now() < deadline) {
+        attempt++;
+        try {
+            const waitMs = Math.max(1, deadline - Date.now());
+            const response = await withUpstream(() => axios.get(sourceUrl, {
+                timeout: Math.max(1, Math.min(options.timeout || PLAYLIST_REQUEST_TIMEOUT, deadline - Date.now())),
+                maxRedirects: 5,
+                headers: {
+                    "User-Agent": UPSTREAM_UA,
+                    "Accept": "*/*",
+                    "Accept-Encoding": "gzip, deflate",
+                    "Connection": "keep-alive"
+                },
+                validateStatus: s => s >= 200 && s < 300
+            }), true, waitMs);
+            const data = String(response.data || "");
+            if (!data.trimStart().startsWith("#EXTM3U")) throw new Error("Invalid M3U playlist from upstream");
+            console.log("[FETCH PLAYLIST OK]", sourceUrl, "size=" + data.length, "attempt=" + attempt);
+            return response.data;
+        } catch (err) {
+            lastErr = err;
+            console.warn(`[FETCH PLAYLIST RETRY] attempt=${attempt} reason=${err.message}`);
+        }
+        const sleepMs = Math.min(PLAYLIST_RETRY_DELAY_MS, deadline - Date.now());
+        if (sleepMs > 0) await sleep(sleepMs);
+    }
+    throw lastErr || new Error("Playlist fetch failed");
 }
 
 function parseM3UChannels(data, source = {}) {
@@ -1669,6 +1689,7 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`🌐 http://0.0.0.0:${PORT}`);
     console.log(`📦 Node ${process.version}`);
     console.log(`🔁 manifest retryWindow=${MANIFEST_RETRY_WINDOW_MS / 1000}s delay=${MANIFEST_RETRY_DELAY_MS / 1000}s`);
+    console.log(`📋 playlist retryWindow=${PLAYLIST_RETRY_WINDOW_MS / 1000}s delay=${PLAYLIST_RETRY_DELAY_MS / 1000}s`);
     console.log(`⏩ prefetch ahead=${SEGMENT_PREFETCH_AHEAD} concurrency=${SEGMENT_PREFETCH_CONCURRENCY} cacheTTL=${SEGMENT_CACHE_TTL / 1000}s`);
     console.log(`🩹 segment playerRetry=${SEGMENT_PLAYER_RETRIES} delay=${SEGMENT_PLAYER_RETRY_DELAY_MS}ms`);
     console.log(`🪟 buffer: retain/serve=${RETAIN_SEGMENTS} liveDelay=${LIVE_DELAY_SEGMENTS}segs prime=${MIN_START_SEGMENTS}segs/${PRIME_TIMEOUT_MS / 1000}s idleStop=${POLLER_IDLE_STOP_MS / 1000}s`);
