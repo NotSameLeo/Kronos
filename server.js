@@ -393,12 +393,13 @@ function formatEpgDescription(programmes) {
     const { current, next } = selectProgrammeWindow(programmes);
     const lines = [];
     if (current) lines.push(formatProgramme("🔴 In Onda", current));
-    if (next) lines.push(formatProgramme("🟡 A Seguire", next));
-    return lines.join("  ||||  ");
+    if (next) lines.push(formatProgramme("🔵 A Seguire", next));
+    return lines.join("\u00a0\u00a0||||\u00a0\u00a0");
 }
 
 function formatProgramme(label, programme) {
-    return `${label}: ${String(programme.title || "").toUpperCase()} (${formatTime(programme.start)} - ${formatTime(programme.stop)}) | Trama: ${String(programme.desc || "").slice(0, 500)}`;
+    const description = String(programme.desc || "").slice(0, 500).trim().replace(/\.+$/, "");
+    return `${label}: ${String(programme.title || "").toUpperCase()}\u00a0(${formatTime(programme.start)} - ${formatTime(programme.stop)}) | Trama: ${description}`;
 }
 
 function getEpgMatchKeys(values) {
@@ -1214,6 +1215,7 @@ function stopPoller(rt, reason) {
     cancelPrefetch(reason);
     rt.segs = []; rt.byId = new Set(); rt.seqBase = 0; rt.lastSeq = -1; rt.servedEdge = null; rt.primedOnce = false;
     rt.discontinuityBase = 0; rt.pendingDiscontinuity = false;
+    rt.lastManifestAt = null; rt.lastSegmentAt = null; rt.segmentRequests = 0;
     rt.generation++;
     console.log(`[POLLER STOP] channel="${rt.label}" reason=${reason}`);
 }
@@ -1233,12 +1235,14 @@ function ensureChannel(url, label) {
             url, label, segs: [], byId: new Set(), seqBase: 0, generation: 0,
             target: 6, lastSeq: -1, isMaster: false, lastPlayerAt: Date.now(),
             running: false, timer: null, pollAbort: null, servedEdge: null, primedOnce: false,
-            discontinuityBase: 0, pendingDiscontinuity: false
+            discontinuityBase: 0, pendingDiscontinuity: false,
+            lastManifestAt: null, lastSegmentAt: null, segmentRequests: 0
         };
         channels.set(url, rt);
     }
     rt.label = label;
     rt.lastPlayerAt = Date.now();
+    rt.lastManifestAt = Date.now();
     if (!rt.running && !rt.isMaster) {
         rt.running = true;
         console.log(`[POLLER START] channel="${label}"`);
@@ -1429,7 +1433,8 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
 
         const { playlist, count, mediaSeq, edge, hi, warmTail: servedWarmTail, readyAhead } = buildServedPlaylist(rt, host, configKey);
         setPlaylistHeaders(res);
-        console.log(`[HLS SERVE] channel="${ch.name}" window=${count} seq=${mediaSeq} edge=${edge}/${hi} held=${hi - edge}/${LIVE_DELAY_SEGMENTS} readyAhead=${readyAhead} warmTail=${servedWarmTail}${warmAfterPrime < MIN_START_SEGMENTS ? " degraded=1" : ""} gen=${rt.generation} cache=${segCache.size}/${formatBytes(segCacheBytes)} prefetch=${prefetchActive}+${prefetchQueue.length} waited=${Date.now() - t0}ms`);
+        const segmentIdle = rt.lastSegmentAt ? `${Date.now() - rt.lastSegmentAt}ms` : "never";
+        console.log(`[HLS SERVE] channel="${ch.name}" window=${count} seq=${mediaSeq} edge=${edge}/${hi} held=${hi - edge}/${LIVE_DELAY_SEGMENTS} readyAhead=${readyAhead} warmTail=${servedWarmTail}${warmAfterPrime < MIN_START_SEGMENTS ? " degraded=1" : ""} gen=${rt.generation} segmentIdle=${segmentIdle} segmentReq=${rt.segmentRequests} cache=${segCache.size}/${formatBytes(segCacheBytes)} prefetch=${prefetchActive}+${prefetchQueue.length} waited=${Date.now() - t0}ms`);
         res.send(playlist);
     } catch (err) {
         console.error(`[HLS ERROR] ${err.message}`);
@@ -1488,7 +1493,11 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
             const activeOwnsSegment = activeRt && (activeRt.isMaster || activeRt.byId.has(segId));
             // Cached segment reads still count as activity for the current player.
             // Late reads from a previously selected channel must not keep the new one alive.
-            if (activeOwnsSegment) activeRt.lastPlayerAt = Date.now();
+            if (activeOwnsSegment) {
+                activeRt.lastPlayerAt = Date.now();
+                activeRt.lastSegmentAt = Date.now();
+                activeRt.segmentRequests++;
+            }
             const cached = getSegFromCache(segId);
             if (cached) return sendCachedSeg(req, res, cached, segId, "HIT");
 
@@ -1659,7 +1668,10 @@ app.get("/:base64Config/stats", (req, res) => {
             label: rt.label, depth: rt.segs.length, seqBase: rt.seqBase, generation: rt.generation,
             running: rt.running, isMaster: rt.isMaster, idleMs: Date.now() - rt.lastPlayerAt,
             servedEdge: rt.servedEdge, knownEdge: rt.seqBase + rt.segs.length - 1,
-            warmTail: getWarmTailCount(rt), primedOnce: rt.primedOnce
+            warmTail: getWarmTailCount(rt), primedOnce: rt.primedOnce,
+            manifestIdleMs: rt.lastManifestAt ? Date.now() - rt.lastManifestAt : null,
+            segmentIdleMs: rt.lastSegmentAt ? Date.now() - rt.lastSegmentAt : null,
+            segmentRequests: rt.segmentRequests
         })),
         activeChannel: activeChannelUrl ? (channels.get(activeChannelUrl)?.label || "?") : null
     });
