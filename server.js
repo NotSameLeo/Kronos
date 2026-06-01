@@ -372,11 +372,11 @@ function formatEpgDescription(programmes) {
     const lines = [];
     if (current) lines.push(formatProgramme("🔴 In Onda", current));
     if (next) lines.push(formatProgramme("🟡 A Seguire", next));
-    return lines.join("\n\n||\n\n");
+    return lines.join("  ||||  ");
 }
 
 function formatProgramme(label, programme) {
-    return `${label} (${formatTime(programme.start)} - ${formatTime(programme.stop)}) | Titolo: ${programme.title} | Trama: ${String(programme.desc || "").slice(0, 500)}`;
+    return `${label}: ${String(programme.title || "").toUpperCase()} (${formatTime(programme.start)} - ${formatTime(programme.stop)}) | Trama: ${String(programme.desc || "").slice(0, 500)}`;
 }
 
 function getEpgMatchKeys(values) {
