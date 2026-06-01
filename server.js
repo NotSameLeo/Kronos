@@ -30,9 +30,9 @@ const RELEASE_VERSION = "3.1.0";
 const ADDON_TYPE = "tv";
 const CATALOG_TTL = 30 * 60 * 1000;
 const EPG_CACHE_TTL = Number(process.env.EPG_CACHE_TTL || 6 * 60 * 60 * 1000);
-const EPG_REQUEST_TIMEOUT = Number(process.env.EPG_REQUEST_TIMEOUT || 180000);
+const EPG_REQUEST_TIMEOUT = Number(process.env.EPG_REQUEST_TIMEOUT || 20000);
 const EPG_MAX_BYTES = Number(process.env.EPG_MAX_BYTES || 160 * 1024 * 1024);
-const EPG_RETRY_DELAY_MS = Number(process.env.EPG_RETRY_DELAY_MS || 60000);
+const EPG_RETRY_DELAY_MS = Number(process.env.EPG_RETRY_DELAY_MS || 15000);
 const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 20000);
 const SEG_REQUEST_TIMEOUT = Number(process.env.SEG_REQUEST_TIMEOUT || 45000);
 const PLAYLIST_REQUEST_TIMEOUT = Number(process.env.PLAYLIST_REQUEST_TIMEOUT || 20000);
@@ -239,6 +239,7 @@ async function ensureEPGRefresh(epgUrl, options = {}) {
         memoryCache.epgStatus[epgUrl] = { state: "fetching", startedAt: Date.now(), retryAt: 0 };
         const response = await axios.get(epgUrl, {
             timeout: EPG_REQUEST_TIMEOUT,
+            signal: AbortSignal.timeout(EPG_REQUEST_TIMEOUT),
             maxContentLength: EPG_MAX_BYTES,
             responseType: "arraybuffer",
             headers: { "User-Agent": `Kronos/${RELEASE_VERSION}`, "Accept": "application/xml, text/xml, application/gzip, */*" }
@@ -600,6 +601,7 @@ async function fetchAndProcessChannels(configKey, config, options = {}) {
             });
         const epgData = getCachedEPG(config.e);
         const { channels, matched: epgMatched } = attachEPGToChannels(rawChannels, epgData);
+        if (config.e && !epgData) console.log("[EPG PENDING] catalog served without guide; background refresh active");
 
         memoryCache.channelItems[configKey] = channels;
         memoryCache.channelIndex[configKey] = buildChannelIndex(channels);
