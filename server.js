@@ -30,8 +30,9 @@ const RELEASE_VERSION = "3.1.0";
 const ADDON_TYPE = "tv";
 const CATALOG_TTL = 30 * 60 * 1000;
 const EPG_CACHE_TTL = Number(process.env.EPG_CACHE_TTL || 6 * 60 * 60 * 1000);
-const EPG_REQUEST_TIMEOUT = Number(process.env.EPG_REQUEST_TIMEOUT || 60000);
+const EPG_REQUEST_TIMEOUT = Number(process.env.EPG_REQUEST_TIMEOUT || 180000);
 const EPG_MAX_BYTES = Number(process.env.EPG_MAX_BYTES || 160 * 1024 * 1024);
+const EPG_RETRY_DELAY_MS = Number(process.env.EPG_RETRY_DELAY_MS || 60000);
 const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 20000);
 const SEG_REQUEST_TIMEOUT = Number(process.env.SEG_REQUEST_TIMEOUT || 45000);
 
@@ -47,7 +48,7 @@ const SEGMENT_PREFETCH_AHEAD = Number(process.env.SEGMENT_PREFETCH_AHEAD || 3);
 // the prefetcher is the ONLY upstream connection and the player reads from cache.
 // (Raising this only helps if your provider tolerates parallel segment fetches.)
 const SEGMENT_PREFETCH_CONCURRENCY = Number(process.env.SEGMENT_PREFETCH_CONCURRENCY || 1);
-const SEGMENT_CACHE_TTL = Number(process.env.SEGMENT_CACHE_TTL || 90 * 1000);
+const SEGMENT_CACHE_TTL = Number(process.env.SEGMENT_CACHE_TTL || 180 * 1000);
 const SEGMENT_CACHE_MAX_BYTES = Number(process.env.SEGMENT_CACHE_MAX_BYTES || 256 * 1024 * 1024);
 const SEGMENT_CACHE_MAX_ITEMS = Number(process.env.SEGMENT_CACHE_MAX_ITEMS || 48);
 const SEGMENT_CACHE_MAX_ITEM_BYTES = Number(process.env.SEGMENT_CACHE_MAX_ITEM_BYTES || 24 * 1024 * 1024);
@@ -61,15 +62,15 @@ const SLOW_SEGMENT_MS = Number(process.env.SLOW_SEGMENT_MS || 4000);
 // from scratch. To make playback seamless we run a background poller per active
 // channel that (a) keeps the upstream stream ALIVE, (b) accumulates a deep retained
 // buffer, and (c) prefetches segments. The player is then served a deep window
-// IMMEDIATELY (non-blocking) from our buffer — no manifest is ever held hostage, so
-// the player can never time out / crash waiting. Only the very first open does a
+// from our buffer. Refreshes stay non-blocking; only the very first open does a
 // short, capped prime wait to build the initial cushion.
 const RETAIN_SEGMENTS = Number(process.env.RETAIN_SEGMENTS || 12);   // ~2min retained & served
-// HARD anti-jump guarantee: the live edge of the playlist we serve advances by at
-// most this many segments per request, even if the upstream buffer jumped ahead.
-// The player therefore never finds its current segment missing → never jumps/seeks.
+const LIVE_DELAY_SEGMENTS = Math.max(0, Number(process.env.LIVE_DELAY_SEGMENTS ?? 2));
+// Anti-jump limit: advance the served live edge by at most this many segments per
+// request while retained history still exists. If upstream history disappears,
+// catching up is unavoidable.
 const MAX_EDGE_ADVANCE = Number(process.env.MAX_EDGE_ADVANCE || 2);
-const MIN_START_SEGMENTS = Number(process.env.MIN_START_SEGMENTS || 3); // initial cushion
+const MIN_START_SEGMENTS = Math.max(LIVE_DELAY_SEGMENTS + 1, Number(process.env.MIN_START_SEGMENTS ?? 3)); // initial cushion
 const PRIME_TIMEOUT_MS = Number(process.env.PRIME_TIMEOUT_MS || 18000);  // max FIRST-open wait
 const POLLER_IDLE_STOP_MS = Number(process.env.POLLER_IDLE_STOP_MS || 90000); // stop if player gone
 const POLL_MIN_MS = Number(process.env.POLL_MIN_MS || 2000);
@@ -86,6 +87,11 @@ const memoryCache = {
     lastUpdate: {},       // configKey -> timestamp
     epgData: {},          // epgUrl -> { byKey, channelCount, programmeCount }
     epgLastUpdate: {},    // epgUrl -> timestamp
+    epgInflight: {},      // epgUrl -> Promise
+    epgRetryTimers: {},   // epgUrl -> timeout
+    epgStatus: {},        // epgUrl -> diagnostics
+    epgSubscribers: {},   // epgUrl -> Set<configKey>
+    configByKey: {},      // configKey -> decoded config
     logoData: {},         // logoUrl -> data: URI
     isUpdating: {}
 };
@@ -158,12 +164,75 @@ function getSegmentLabel(sourceUrl) {
 // ─────────────────────────────────────────────────────────────────────────────
 // EPG
 // ─────────────────────────────────────────────────────────────────────────────
-async function updateEPGCache(epgUrl, options = {}) {
-    if (!epgUrl) return {};
+function getCachedEPG(epgUrl) {
+    return epgUrl ? (memoryCache.epgData[epgUrl] || null) : null;
+}
+
+function subscribeConfigToEPG(configKey, config) {
+    const previousEpgUrl = memoryCache.configByKey[configKey]?.e;
+    if (previousEpgUrl && previousEpgUrl !== config.e) memoryCache.epgSubscribers[previousEpgUrl]?.delete(configKey);
+    memoryCache.configByKey[configKey] = config;
+    if (!config.e) return;
+    const subscribers = memoryCache.epgSubscribers[config.e] || new Set();
+    subscribers.add(configKey);
+    memoryCache.epgSubscribers[config.e] = subscribers;
+}
+
+function clearEPGRetry(epgUrl) {
+    const timer = memoryCache.epgRetryTimers[epgUrl];
+    if (timer) clearTimeout(timer);
+    delete memoryCache.epgRetryTimers[epgUrl];
+}
+
+function scheduleEPGRetry(epgUrl) {
+    if (!epgUrl || memoryCache.epgRetryTimers[epgUrl]) return;
+    const retryAt = Date.now() + EPG_RETRY_DELAY_MS;
+    memoryCache.epgStatus[epgUrl] = { ...(memoryCache.epgStatus[epgUrl] || {}), retryAt };
+    const timer = setTimeout(() => {
+        delete memoryCache.epgRetryTimers[epgUrl];
+        ensureEPGRefresh(epgUrl, { force: true }).catch(() => {});
+    }, EPG_RETRY_DELAY_MS);
+    if (timer.unref) timer.unref();
+    memoryCache.epgRetryTimers[epgUrl] = timer;
+    console.log(`[EPG RETRY SCHEDULED] in=${EPG_RETRY_DELAY_MS / 1000}s`);
+}
+
+function attachEPGToChannels(channels, epgData) {
+    let matched = 0;
+    const updated = channels.map(channel => {
+        const epg = findEpgMatch(epgData, channel);
+        if (epg) matched++;
+        return { ...channel, description: epg?.description || "", epgId: epg?.id || null };
+    });
+    return { channels: updated, matched };
+}
+
+function refreshSubscribedChannels(epgUrl, epgData) {
+    const subscribers = memoryCache.epgSubscribers[epgUrl] || new Set();
+    subscribers.forEach(configKey => {
+        if (memoryCache.configByKey[configKey]?.e !== epgUrl) return;
+        const current = memoryCache.channelItems[configKey];
+        if (!current) return;
+        const { channels, matched } = attachEPGToChannels(current, epgData);
+        memoryCache.channelItems[configKey] = channels;
+        memoryCache.channelIndex[configKey] = buildChannelIndex(channels);
+        memoryCache.epgMatchStats[configKey] = { matched, total: channels.length, feedChannels: epgData.channelCount };
+        console.log(`[EPG APPLY] matched=${matched}/${channels.length} feedChannels=${epgData.channelCount}`);
+    });
+}
+
+async function ensureEPGRefresh(epgUrl, options = {}) {
+    if (!epgUrl) return null;
     const cached = memoryCache.epgData[epgUrl];
     if (cached && !options.force && Date.now() - (memoryCache.epgLastUpdate[epgUrl] || 0) < EPG_CACHE_TTL) return cached;
+    if (memoryCache.epgInflight[epgUrl]) return memoryCache.epgInflight[epgUrl];
+    const retryAt = memoryCache.epgStatus[epgUrl]?.retryAt || 0;
+    if (!options.force && Date.now() < retryAt) return cached || null;
+
+    const promise = (async () => {
     try {
         console.log("[EPG FETCH]", epgUrl);
+        memoryCache.epgStatus[epgUrl] = { state: "fetching", startedAt: Date.now(), retryAt: 0 };
         const response = await axios.get(epgUrl, {
             timeout: EPG_REQUEST_TIMEOUT,
             maxContentLength: EPG_MAX_BYTES,
@@ -188,12 +257,25 @@ async function updateEPGCache(epgUrl, options = {}) {
         const data = { byKey, channelCount: xmlIds.size, programmeCount };
         memoryCache.epgData[epgUrl] = data;
         memoryCache.epgLastUpdate[epgUrl] = Date.now();
+        memoryCache.epgStatus[epgUrl] = { state: "ready", updatedAt: Date.now(), retryAt: 0 };
+        clearEPGRetry(epgUrl);
         console.log(`[EPG OK] channels=${data.channelCount} programmes=${data.programmeCount} keys=${byKey.size}`);
+        refreshSubscribedChannels(epgUrl, data);
         return data;
     } catch (err) {
         console.warn("[EPG ERROR]", err.message);
-        return cached || { byKey: new Map(), channelCount: 0, programmeCount: 0 };
+        memoryCache.epgStatus[epgUrl] = { state: "error", error: err.message, failedAt: Date.now(), retryAt: 0 };
+        scheduleEPGRetry(epgUrl);
+        return cached || null;
     }
+    })();
+    memoryCache.epgInflight[epgUrl] = promise;
+    try { return await promise; }
+    finally { delete memoryCache.epgInflight[epgUrl]; }
+}
+
+async function updateEPGCache(epgUrl, options = {}) {
+    return await ensureEPGRefresh(epgUrl, options);
 }
 
 function parseXMLTVBuffer(buffer) {
@@ -285,13 +367,13 @@ function selectProgrammeWindow(programmes) {
 function formatEpgDescription(programmes) {
     const { current, next } = selectProgrammeWindow(programmes);
     const lines = [];
-    if (current) lines.push(formatProgramme("€🔴 In Onda", current));
+    if (current) lines.push(formatProgramme("🔴 In Onda", current));
     if (next) lines.push(formatProgramme("🟡 A Seguire", next));
-    return lines.join("\n\n");
+    return lines.join("\n\n----------\n\n");
 }
 
 function formatProgramme(label, programme) {
-    return `${label} (${formatTime(programme.start)} - ${formatTime(programme.stop)})\n${programme.title}:\n${String(programme.desc || "").slice(0, 500)}`;
+    return `${label} (${formatTime(programme.start)} - ${formatTime(programme.stop)})\n| ${programme.title}:\n| ${String(programme.desc || "").slice(0, 500)}`;
 }
 
 function getEpgMatchKeys(values) {
@@ -448,7 +530,8 @@ async function fetchAndProcessChannels(configKey, config, options = {}) {
     if (memoryCache.channelInflight[configKey] && !options.force) return memoryCache.channelInflight[configKey];
     const promise = (async () => {
         memoryCache.isUpdating[configKey] = true;
-        const epgData = config.e ? await updateEPGCache(config.e) : null;
+        subscribeConfigToEPG(configKey, config);
+        if (config.e) ensureEPGRefresh(config.e).catch(err => console.error("[EPG REFRESH]", err.message));
         const lists = getConfiguredLists(config);
         const selectedGroups = Array.isArray(config.g) ? config.g : [];
         const selectedSet = new Set(selectedGroups.map(normalizeGroupName));
@@ -459,24 +542,21 @@ async function fetchAndProcessChannels(configKey, config, options = {}) {
             return parseM3UChannels(data, list);
         }));
 
-        let epgMatched = 0;
-        const channels = parsedGroups.flat()
+        const rawChannels = parsedGroups.flat()
             .filter(c => {
                 if (config.gm === "list" || config.gm === "bucket") return true;
                 if (selectedSet.size === 0) return true;
                 return selectedSet.has(normalizeGroupName(c.group));
             })
             .map(c => {
-                const epg = findEpgMatch(epgData, c);
-                if (epg) epgMatched++;
                 return {
                     ...c,
                     name: decorateChannelName(c, lists.length, config.gm),
-                    group: config.gm === "bucket" ? bucketGroup : c.group,
-                    description: epg?.description || "",
-                    epgId: epg?.id || null
+                    group: config.gm === "bucket" ? bucketGroup : c.group
                 };
             });
+        const epgData = getCachedEPG(config.e);
+        const { channels, matched: epgMatched } = attachEPGToChannels(rawChannels, epgData);
 
         memoryCache.channelItems[configKey] = channels;
         memoryCache.channelIndex[configKey] = buildChannelIndex(channels);
@@ -570,12 +650,12 @@ async function withUpstream(fn, prio = false, timeoutMs = 0) {
 
 // Fetch a manifest for at most MANIFEST_RETRY_WINDOW_MS. There is no separate
 // retry count: keep trying every MANIFEST_RETRY_DELAY_MS while time remains.
-async function fetchUpstreamHLS(sourceUrl, label = "stream") {
+async function fetchUpstreamHLS(sourceUrl, label = "stream", signal = null) {
     const deadline = Date.now() + MANIFEST_RETRY_WINDOW_MS;
     let lastErr = null;
     let attempt = 0;
 
-    while (Date.now() < deadline) {
+    while (Date.now() < deadline && !signal?.aborted) {
         attempt++;
         try {
             const waitMs = Math.max(1, deadline - Date.now());
@@ -583,6 +663,7 @@ async function fetchUpstreamHLS(sourceUrl, label = "stream") {
                 const requestMs = Math.max(1, Math.min(HLS_REQUEST_TIMEOUT, deadline - Date.now()));
                 return axios.get(sourceUrl, {
                     timeout: requestMs,
+                    signal,
                     maxRedirects: 5,
                     headers: {
                         "User-Agent": UPSTREAM_UA,
@@ -610,6 +691,7 @@ async function fetchUpstreamHLS(sourceUrl, label = "stream") {
         const sleepMs = Math.min(MANIFEST_RETRY_DELAY_MS, deadline - Date.now());
         if (sleepMs > 0) await sleep(sleepMs);
     }
+    if (signal?.aborted) throw new Error("Manifest fetch aborted");
     throw lastErr || new Error("Manifest fetch failed");
 }
 
@@ -678,6 +760,7 @@ let segCacheBytes = 0;
 let prefetchActive = 0;
 const prefetchQueue = [];
 const playerDemandIds = new Set();
+const prefetchControllers = new Map();
 
 function getSegFromCache(id) {
     const e = segCache.get(id);
@@ -712,7 +795,7 @@ function evictSegCache() {
     }
 }
 
-async function fetchSegToCache(id, url, prio = false) {
+async function fetchSegToCache(id, url, prio = false, signal = null) {
     const hit = getSegFromCache(id);
     if (hit) return hit;
     if (segInflight.has(id)) return segInflight.get(id);   // dedup: never two fetches of same seg
@@ -723,6 +806,7 @@ async function fetchSegToCache(id, url, prio = false) {
         const r = await withUpstream(() => axios.get(url, {
             responseType: "arraybuffer",
             timeout: SEG_REQUEST_TIMEOUT,
+            signal,
             maxRedirects: 5,
             headers: { "User-Agent": UPSTREAM_UA, "Accept": "*/*", "Accept-Encoding": "identity", "Connection": "keep-alive" },
             decompress: false,
@@ -744,6 +828,13 @@ async function fetchSegToCache(id, url, prio = false) {
 
 async function fetchSegForPlayer(id) {
     playerDemandIds.add(id);
+    let preempted = 0;
+    prefetchControllers.forEach((controller, prefetchId) => {
+        if (prefetchId === id || controller.signal.aborted) return;
+        controller.abort();
+        preempted++;
+    });
+    if (preempted > 0) console.log(`[PREFETCH PREEMPT] demand=${getSegmentLabel(segRegistry.get(id) || id)} aborted=${preempted}`);
     try {
         let lastErr = null;
         for (let attempt = 0; attempt <= SEGMENT_PLAYER_RETRIES; attempt++) {
@@ -764,8 +855,9 @@ async function fetchSegForPlayer(id) {
     }
 }
 
-function queuePrefetch(ids) {
-    const candidates = SEGMENT_PREFETCH_AHEAD > 0 ? ids.slice(-SEGMENT_PREFETCH_AHEAD) : [];
+function queuePrefetch(ids, minAhead = 0) {
+    const ahead = Math.max(SEGMENT_PREFETCH_AHEAD, minAhead);
+    const candidates = ahead > 0 ? ids.slice(-ahead) : [];
     prefetchQueue.splice(0, prefetchQueue.length, ...prefetchQueue.filter(id => candidates.includes(id)));
     candidates.forEach(id => {
         if (getSegFromCache(id) || segInflight.has(id) || prefetchQueue.includes(id)) return;
@@ -781,11 +873,25 @@ function pumpPrefetch() {
         if (getSegFromCache(id) || segInflight.has(id)) continue;
         const url = segRegistry.get(id);
         if (!url) continue;
+        const controller = new AbortController();
+        prefetchControllers.set(id, controller);
         prefetchActive++;
-        fetchSegToCache(id, url)
+        fetchSegToCache(id, url, false, controller.signal)
             .catch(err => console.warn(`[PREFETCH ERR] ${getSegmentLabel(url)} ${err.message}`))
-            .finally(() => { prefetchActive--; pumpPrefetch(); });
+            .finally(() => {
+                prefetchControllers.delete(id);
+                prefetchActive--;
+                pumpPrefetch();
+            });
     }
+}
+
+function cancelPrefetch(reason) {
+    prefetchQueue.length = 0;
+    if (!prefetchControllers.size) return;
+    prefetchControllers.forEach(controller => controller.abort());
+    prefetchControllers.clear();
+    console.log(`[PREFETCH CANCEL] reason=${reason}`);
 }
 
 function formatSpeed(bytes, ms) {
@@ -1036,9 +1142,14 @@ let activeChannelUrl = null;     // only ONE channel polls upstream (max_connect
 function parseSegments(playlist, baseUrl, scope = baseUrl) {
     const out = [];
     let dur = 0;
+    let discontinuity = false;
     for (const raw of String(playlist || "").split(/\r?\n/)) {
         const t = raw.trim();
         if (!t || t.startsWith("#EXT-X-ENDLIST")) continue;
+        if (t === "#EXT-X-DISCONTINUITY") {
+            discontinuity = true;
+            continue;
+        }
         if (t.startsWith("#EXTINF")) {
             const m = t.match(/#EXTINF:([0-9.]+)/);
             dur = m ? Number(m[1]) : 0;
@@ -1047,8 +1158,9 @@ function parseSegments(playlist, baseUrl, scope = baseUrl) {
         if (t.startsWith("#")) continue;
         if (isHlsUrl(t)) continue;   // nested playlist (handled elsewhere)
         const abs = toAbsoluteUrl(t, baseUrl);
-        out.push({ segId: segIdFor(abs, scope), realUrl: abs, duration: dur || 6 });
+        out.push({ segId: segIdFor(abs, scope), realUrl: abs, duration: dur || 6, discontinuity });
         dur = 0;
+        discontinuity = false;
     }
     return out;
 }
@@ -1056,8 +1168,10 @@ function parseSegments(playlist, baseUrl, scope = baseUrl) {
 function stopPoller(rt, reason) {
     rt.running = false;
     if (rt.timer) { clearTimeout(rt.timer); rt.timer = null; }
-    prefetchQueue.length = 0;
-    rt.segs = []; rt.byId = new Set(); rt.seqBase = 0; rt.lastSeq = -1; rt.servedEdge = null;
+    if (rt.pollAbort) { rt.pollAbort.abort(); rt.pollAbort = null; }
+    cancelPrefetch(reason);
+    rt.segs = []; rt.byId = new Set(); rt.seqBase = 0; rt.lastSeq = -1; rt.servedEdge = null; rt.primedOnce = false;
+    rt.discontinuityBase = 0; rt.pendingDiscontinuity = false;
     rt.generation++;
     console.log(`[POLLER STOP] channel="${rt.label}" reason=${reason}`);
 }
@@ -1076,13 +1190,14 @@ function ensureChannel(url, label) {
         rt = {
             url, label, segs: [], byId: new Set(), seqBase: 0, generation: 0,
             target: 6, lastSeq: -1, isMaster: false, lastPlayerAt: Date.now(),
-            running: false, timer: null, servedEdge: null
+            running: false, timer: null, pollAbort: null, servedEdge: null, primedOnce: false,
+            discontinuityBase: 0, pendingDiscontinuity: false
         };
         channels.set(url, rt);
     }
     rt.label = label;
     rt.lastPlayerAt = Date.now();
-    if (!rt.running) {
+    if (!rt.running && !rt.isMaster) {
         rt.running = true;
         console.log(`[POLLER START] channel="${label}"`);
         pollChannelLoop(rt);
@@ -1098,7 +1213,10 @@ async function pollChannelLoop(rt) {
         return;
     }
     try {
-        const { data, finalUrl, info } = await fetchUpstreamHLS(rt.url, rt.label);
+        const controller = new AbortController();
+        rt.pollAbort = controller;
+        const { data, finalUrl, info } = await fetchUpstreamHLS(rt.url, rt.label, controller.signal);
+        if (rt.pollAbort === controller) rt.pollAbort = null;
         if (info.isMaster) {
             rt.isMaster = true;
             stopPoller(rt, "master-playlist");   // master is served passthrough, no buffer
@@ -1106,7 +1224,8 @@ async function pollChannelLoop(rt) {
         }
         if (info.isLive) ingestPlaylist(rt, data, finalUrl, info);
     } catch (e) {
-        console.warn(`[POLLER ERR] channel="${rt.label}" ${e.message}`);
+        rt.pollAbort = null;
+        if (rt.running) console.warn(`[POLLER ERR] channel="${rt.label}" ${e.message}`);
     }
     if (!rt.running) return;
     const delay = Math.max(POLL_MIN_MS, Math.min(POLL_MAX_MS, (rt.target || 6) * 500));
@@ -1122,11 +1241,12 @@ function ingestPlaylist(rt, playlist, baseUrl, info) {
     // generation (mixed into the id) to avoid serving stale cached segments.
     if (rt.lastSeq >= 0 && seq < rt.lastSeq) {
         rt.generation++;
+        cancelPrefetch("channel-restart");
         // Continue the absolute sequence forward (don't reset to 0) so the player's
         // MEDIA-SEQUENCE never goes backward → it rejoins live moving forward instead
         // of "jumping to the beginning". New generation keeps stale cache out.
         rt.seqBase = rt.seqBase + rt.segs.length;
-        rt.segs = []; rt.byId = new Set();
+        rt.segs = []; rt.byId = new Set(); rt.primedOnce = false; rt.pendingDiscontinuity = true;
         console.log(`[CHANNEL RESTART] channel="${rt.label}" seq ${rt.lastSeq}->${seq} gen=${rt.generation} continuing seqBase=${rt.seqBase}`);
     }
     rt.lastSeq = seq;
@@ -1137,17 +1257,19 @@ function ingestPlaylist(rt, playlist, baseUrl, info) {
         registerSeg(id, s.realUrl);          // always refresh the token-bearing URL
         if (!rt.byId.has(id)) {
             rt.byId.add(id);
-            rt.segs.push({ id, duration: s.duration });
+            rt.segs.push({ id, duration: s.duration, discontinuity: s.discontinuity || rt.pendingDiscontinuity });
+            rt.pendingDiscontinuity = false;
             added++;
         }
     }
     while (rt.segs.length > RETAIN_SEGMENTS) {
         const dropped = rt.segs.shift();
         rt.byId.delete(dropped.id);
+        if (dropped.discontinuity) rt.discontinuityBase++;
         rt.seqBase++;
     }
     if (added > 0) {
-        queuePrefetch(rt.segs.map(s => s.id));   // warm the newest segments near the served live edge
+        queuePrefetch(rt.segs.map(s => s.id), rt.primedOnce ? LIVE_DELAY_SEGMENTS + 1 : MIN_START_SEGMENTS);
         console.log(`[BUFFER] channel="${rt.label}" +${added} depth=${rt.segs.length}/${RETAIN_SEGMENTS} seqBase=${rt.seqBase} cache=${segCache.size}/${formatBytes(segCacheBytes)} prefetch=${prefetchActive}+${prefetchQueue.length}`);
     }
 }
@@ -1155,13 +1277,19 @@ function ingestPlaylist(rt, playlist, baseUrl, info) {
 function buildServedPlaylist(rt, hostBase, configKey) {
     const lo = rt.seqBase;
     const hi = rt.seqBase + rt.segs.length - 1;
+    const warmTail = getWarmTailCount(rt);
+    const warmRun = getLatestWarmRun(rt);
+    const desiredIdx = warmRun.count >= LIVE_DELAY_SEGMENTS + 1
+        ? warmRun.end - LIVE_DELAY_SEGMENTS
+        : warmRun.end;
+    const delayedHi = rt.seqBase + Math.max(0, desiredIdx);
 
     // ANTI-JUMP: advance the served live edge by at most MAX_EDGE_ADVANCE per request,
-    // so the player's timeline NEVER jumps even if the upstream buffer leapt ahead.
-    // Newer segments are simply held back (still prefetched) until the edge catches up.
-    if (rt.servedEdge == null || rt.servedEdge > hi) rt.servedEdge = hi;       // (re)attach at edge
-    else rt.servedEdge = Math.min(hi, rt.servedEdge + MAX_EDGE_ADVANCE);
-    if (rt.servedEdge < lo) rt.servedEdge = lo;                                // never before buffer
+    // capped at a deliberately delayed warm edge. If the cushion shrinks, hold the
+    // current edge instead of moving backward; the poller can rebuild it over time.
+    if (rt.servedEdge == null || rt.servedEdge > hi) rt.servedEdge = delayedHi;
+    else if (rt.servedEdge < lo) rt.servedEdge = lo;
+    else if (delayedHi > rt.servedEdge) rt.servedEdge = Math.min(delayedHi, rt.servedEdge + MAX_EDGE_ADVANCE);
 
     const endIdx = rt.servedEdge - rt.seqBase;
     const startIdx = Math.max(0, endIdx - RETAIN_SEGMENTS + 1);   // full retained depth behind edge
@@ -1172,13 +1300,19 @@ function buildServedPlaylist(rt, hostBase, configKey) {
         "#EXTM3U",
         "#EXT-X-VERSION:3",
         `#EXT-X-TARGETDURATION:${target}`,
-        `#EXT-X-MEDIA-SEQUENCE:${mediaSeq}`
+        `#EXT-X-MEDIA-SEQUENCE:${mediaSeq}`,
+        `#EXT-X-DISCONTINUITY-SEQUENCE:${rt.discontinuityBase}`
     ];
     for (const s of win) {
+        if (s.discontinuity) lines.push("#EXT-X-DISCONTINUITY");
         lines.push(`#EXTINF:${Number(s.duration || rt.target || 6).toFixed(3)},`);
         lines.push(`${hostBase}/${configKey}/proxy/seg?s=${encodeURIComponent(s.id)}`);
     }
-    return { playlist: lines.join("\n") + "\n", count: win.length, mediaSeq, edge: rt.servedEdge, hi };
+    return {
+        playlist: lines.join("\n") + "\n",
+        count: win.length, mediaSeq, edge: rt.servedEdge, hi, warmTail,
+        readyAhead: Math.max(0, warmRun.end - endIdx)
+    };
 }
 
 function setPlaylistHeaders(res) {
@@ -1187,8 +1321,28 @@ function setPlaylistHeaders(res) {
     res.setHeader("Pragma", "no-cache");
 }
 
-function getWarmStartCount(rt) {
-    return rt.segs.slice(-MIN_START_SEGMENTS).filter(s => getSegFromCache(s.id)).length;
+function getWarmTailCount(rt) {
+    let count = 0;
+    for (let i = rt.segs.length - 1; i >= 0; i--) {
+        if (!getSegFromCache(rt.segs[i].id)) break;
+        count++;
+    }
+    return count;
+}
+
+function getLatestWarmIndex(rt) {
+    for (let i = rt.segs.length - 1; i >= 0; i--) {
+        if (getSegFromCache(rt.segs[i].id)) return i;
+    }
+    return -1;
+}
+
+function getLatestWarmRun(rt) {
+    const end = getLatestWarmIndex(rt);
+    if (end < 0) return { start: -1, end: -1, count: 0 };
+    let start = end;
+    while (start > 0 && getSegFromCache(rt.segs[start - 1].id)) start--;
+    return { start, end, count: end - start + 1 };
 }
 
 app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
@@ -1201,18 +1355,18 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         const host = getPublicHost(req);
 
         const rt = ensureChannel(ch.url, ch.name);
-        const warm = getWarmStartCount(rt);
-        const fresh = !rt.isMaster && (rt.segs.length < MIN_START_SEGMENTS || warm < MIN_START_SEGMENTS);
-        console.log(`[HLS OPEN] channel="${ch.name}" resolve=${Date.now() - t0}ms depth=${rt.segs.length} warm=${warm}/${MIN_START_SEGMENTS} ${fresh ? "(priming…)" : "(buffer ready)"}`);
+        const warmTail = getWarmTailCount(rt);
+        const fresh = !rt.primedOnce && !rt.isMaster;
+        console.log(`[HLS OPEN] channel="${ch.name}" resolve=${Date.now() - t0}ms depth=${rt.segs.length} warmTail=${warmTail}/${MIN_START_SEGMENTS} ${fresh ? "(priming…)" : "(buffer ready)"}`);
 
         // FIRST open only: short, capped wait for the initial cushion. Re-opens and
         // continuous polls never block here — the buffer is already deep — so the
         // player's manifest request is always answered fast (no timeout/crash).
         if (fresh) {
             const deadline = Date.now() + PRIME_TIMEOUT_MS;
-            while (rt.running && !rt.isMaster && (rt.segs.length < MIN_START_SEGMENTS || getWarmStartCount(rt) < MIN_START_SEGMENTS) && Date.now() < deadline) {
+            while (rt.running && !rt.isMaster && getWarmTailCount(rt) < MIN_START_SEGMENTS && Date.now() < deadline) {
                 rt.lastPlayerAt = Date.now();
-                await sleep(700);
+                await sleep(250);
             }
         }
 
@@ -1224,14 +1378,16 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
             return res.send(rewritten);
         }
 
-        if (!rt.segs.length) {
-            console.warn(`[HLS EMPTY] channel="${ch.name}" no segments after ${Date.now() - t0}ms`);
+        const warmAfterPrime = getWarmTailCount(rt);
+        if (!rt.segs.length || getLatestWarmIndex(rt) < 0) {
+            console.warn(`[HLS EMPTY] channel="${ch.name}" no warm segments after ${Date.now() - t0}ms`);
             return res.status(502).send("#EXTM3U\n#EXT-X-ENDLIST\n");
         }
+        rt.primedOnce = true;
 
-        const { playlist, count, mediaSeq, edge, hi } = buildServedPlaylist(rt, host, configKey);
+        const { playlist, count, mediaSeq, edge, hi, warmTail: servedWarmTail, readyAhead } = buildServedPlaylist(rt, host, configKey);
         setPlaylistHeaders(res);
-        console.log(`[HLS SERVE] channel="${ch.name}" window=${count} seq=${mediaSeq} edge=${edge}/${hi}${edge < hi ? ` (held ${hi - edge})` : ""} gen=${rt.generation} cache=${segCache.size}/${formatBytes(segCacheBytes)} prefetch=${prefetchActive}+${prefetchQueue.length} waited=${Date.now() - t0}ms`);
+        console.log(`[HLS SERVE] channel="${ch.name}" window=${count} seq=${mediaSeq} edge=${edge}/${hi} held=${hi - edge}/${LIVE_DELAY_SEGMENTS} readyAhead=${readyAhead} warmTail=${servedWarmTail}${warmAfterPrime < MIN_START_SEGMENTS ? " degraded=1" : ""} gen=${rt.generation} cache=${segCache.size}/${formatBytes(segCacheBytes)} prefetch=${prefetchActive}+${prefetchQueue.length} waited=${Date.now() - t0}ms`);
         res.send(playlist);
     } catch (err) {
         console.error(`[HLS ERROR] ${err.message}`);
@@ -1264,13 +1420,6 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
     try {
         decodeConfig(req.params.base64Config);
 
-        // Any segment activity counts as the player being alive → keep the poller
-        // running even if the player paused polling the playlist (e.g. during a 2x stall).
-        if (activeChannelUrl) {
-            const rt = channels.get(activeChannelUrl);
-            if (rt) rt.lastPlayerAt = Date.now();
-        }
-
         if (req.query.s) {
             // HLS segment: stable id → resolve freshest token-bearing URL.
             segId = String(req.query.s);
@@ -1293,9 +1442,22 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
         // competing connection (that's what the provider aborts under max_connections=1).
         // fetchSegToCache dedups with any in-flight prefetch, so we just await it.
         if (segId) {
+            const activeRt = activeChannelUrl ? channels.get(activeChannelUrl) : null;
+            const activeOwnsSegment = activeRt && (activeRt.isMaster || activeRt.byId.has(segId));
+            // Cached segment reads still count as activity for the current player.
+            // Late reads from a previously selected channel must not keep the new one alive.
+            if (activeOwnsSegment) activeRt.lastPlayerAt = Date.now();
             const cached = getSegFromCache(segId);
             if (cached) return sendCachedSeg(req, res, cached, segId, "HIT");
 
+            if (!activeOwnsSegment) {
+                // A late request from the previous channel may still arrive after
+                // zapping. A cached response is harmless; reopening that old upstream
+                // segment is not, because the provider only permits one connection.
+                console.warn(`[SEG STALE] ${getSegmentLabel(sourceUrl)} refresh playlist`);
+                return res.status(410).end();
+            }
+            activeRt.lastPlayerAt = Date.now();
             const wasInflight = segInflight.has(segId);
             const entry = await fetchSegForPlayer(segId);
             if (entry) return sendCachedSeg(req, res, entry, segId, wasInflight ? "WAIT" : "MISS");
@@ -1401,12 +1563,22 @@ async function streamSegment(req, res, sourceUrl, segId, started) {
     });
 
     res.on("close", () => { if (!res.writableEnded && upstream?.destroy) upstream.destroy(); });
-    upstream.on("error", err => {
-        if (!res.headersSent) res.status(502).end();
-        else res.destroy(err);
+    await new Promise(resolve => {
+        let settled = false;
+        const done = () => {
+            if (settled) return;
+            settled = true;
+            resolve();
+        };
+        res.once("finish", done);
+        res.once("close", done);
+        upstream.on("error", err => {
+            if (!res.headersSent) res.status(502).end();
+            else res.destroy(err);
+            done();
+        });
+        upstream.pipe(res);
     });
-
-    upstream.pipe(res);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1443,7 +1615,9 @@ app.get("/:base64Config/stats", (req, res) => {
         },
         channels: [...channels.values()].map(rt => ({
             label: rt.label, depth: rt.segs.length, seqBase: rt.seqBase, generation: rt.generation,
-            running: rt.running, isMaster: rt.isMaster, idleMs: Date.now() - rt.lastPlayerAt
+            running: rt.running, isMaster: rt.isMaster, idleMs: Date.now() - rt.lastPlayerAt,
+            servedEdge: rt.servedEdge, knownEdge: rt.seqBase + rt.segs.length - 1,
+            warmTail: getWarmTailCount(rt), primedOnce: rt.primedOnce
         })),
         activeChannel: activeChannelUrl ? (channels.get(activeChannelUrl)?.label || "?") : null
     });
@@ -1468,14 +1642,21 @@ app.get("/:base64Config/debug", async (req, res) => {
                 channelCount: channels.length,
                 lastUpdate: memoryCache.lastUpdate[configKey],
                 isUpdating: memoryCache.isUpdating[configKey],
-                epg: memoryCache.epgMatchStats[configKey] || null
+                epg: memoryCache.epgMatchStats[configKey] || null,
+                epgFetch: config.e ? {
+                    ...(memoryCache.epgStatus[config.e] || { state: "idle" }),
+                    inflight: !!memoryCache.epgInflight[config.e]
+                } : null
             },
             sampleChannels: channels.slice(0, 5).map(c => ({
                 id: c.id, name: c.name, group: c.group, sourceName: c.sourceName,
                 hasUrl: !!c.url, hasLogo: !!c.logo, hasEpg: !!c.description, epgId: c.epgId
             })),
             groups: [...new Set(channels.map(c => c.group))].slice(0, 50),
-            constants: { ADDON_TYPE, RELEASE_VERSION, HLS_REQUEST_TIMEOUT, SEG_REQUEST_TIMEOUT }
+            constants: {
+                ADDON_TYPE, RELEASE_VERSION, HLS_REQUEST_TIMEOUT, SEG_REQUEST_TIMEOUT,
+                LIVE_DELAY_SEGMENTS, MIN_START_SEGMENTS, PRIME_TIMEOUT_MS, RETAIN_SEGMENTS
+            }
         });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -1490,6 +1671,7 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`🔁 manifest retryWindow=${MANIFEST_RETRY_WINDOW_MS / 1000}s delay=${MANIFEST_RETRY_DELAY_MS / 1000}s`);
     console.log(`⏩ prefetch ahead=${SEGMENT_PREFETCH_AHEAD} concurrency=${SEGMENT_PREFETCH_CONCURRENCY} cacheTTL=${SEGMENT_CACHE_TTL / 1000}s`);
     console.log(`🩹 segment playerRetry=${SEGMENT_PLAYER_RETRIES} delay=${SEGMENT_PLAYER_RETRY_DELAY_MS}ms`);
-    console.log(`🪟 buffer: retain/serve=${RETAIN_SEGMENTS} prime=${MIN_START_SEGMENTS}segs/${PRIME_TIMEOUT_MS / 1000}s idleStop=${POLLER_IDLE_STOP_MS / 1000}s`);
+    console.log(`🪟 buffer: retain/serve=${RETAIN_SEGMENTS} liveDelay=${LIVE_DELAY_SEGMENTS}segs prime=${MIN_START_SEGMENTS}segs/${PRIME_TIMEOUT_MS / 1000}s idleStop=${POLLER_IDLE_STOP_MS / 1000}s`);
+    console.log(`📺 epg timeout=${EPG_REQUEST_TIMEOUT / 1000}s retryDelay=${EPG_RETRY_DELAY_MS / 1000}s cacheTTL=${EPG_CACHE_TTL / 1000}s`);
     console.log("=".repeat(60) + "\n");
 });
