@@ -38,6 +38,7 @@ const SEG_REQUEST_TIMEOUT = Number(process.env.SEG_REQUEST_TIMEOUT || 45000);
 const PLAYLIST_REQUEST_TIMEOUT = Number(process.env.PLAYLIST_REQUEST_TIMEOUT || 20000);
 const PLAYLIST_RETRY_WINDOW_MS = Number(process.env.PLAYLIST_RETRY_WINDOW_MS || 30000);
 const PLAYLIST_RETRY_DELAY_MS = Number(process.env.PLAYLIST_RETRY_DELAY_MS || 2000);
+const EPG_TIME_ZONE = process.env.EPG_TIME_ZONE || "Europe/Rome";
 
 // Manifest retry — fixes Xtream "invalid manifest on first hit" (stream spins up
 // server-side on first request, returns garbage, is valid on retry).
@@ -353,11 +354,32 @@ function parseXMLTVBuffer(buffer) {
 function parseXMLTVDate(str) {
     const m = String(str || "").match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(?:\s*([+-]\d{4}))?/);
     if (!m) return new Date(str);
-    const [, Y, Mo, D, H, Mi, S, off] = m;
-    const tz = off ? `${off.slice(0, 3)}:${off.slice(3)}` : "Z";
-    return new Date(`${Y}-${Mo}-${D}T${H}:${Mi}:${S}${tz}`);
+    const [, Y, Mo, D, H, Mi, S] = m;
+    return zonedWallClockToDate(Number(Y), Number(Mo), Number(D), Number(H), Number(Mi), Number(S), EPG_TIME_ZONE);
 }
-function formatTime(d) { return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`; }
+
+function zonedWallClockToDate(year, month, day, hour, minute, second, timeZone) {
+    const wallClockUtc = Date.UTC(year, month - 1, day, hour, minute, second);
+    let instant = wallClockUtc;
+    // Two passes cover CET/CEST changes: the first estimate selects the seasonal
+    // offset, the second applies it to the intended Italian wall-clock time.
+    for (let i = 0; i < 2; i++) instant = wallClockUtc - getTimeZoneOffsetMs(new Date(instant), timeZone);
+    return new Date(instant);
+}
+
+function getTimeZoneOffsetMs(date, timeZone) {
+    const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
+        timeZone, year: "numeric", month: "2-digit", day: "2-digit",
+        hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23"
+    }).formatToParts(date).filter(part => part.type !== "literal").map(part => [part.type, Number(part.value)]));
+    return Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second) - date.getTime();
+}
+
+function formatTime(d) {
+    return new Intl.DateTimeFormat("it-IT", {
+        timeZone: EPG_TIME_ZONE, hour: "2-digit", minute: "2-digit", hourCycle: "h23"
+    }).format(d);
+}
 function selectProgrammeWindow(programmes) {
     const now = new Date();
     const sorted = programmes.slice().sort((a, b) => a.start - b.start);
@@ -1693,6 +1715,6 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`⏩ prefetch ahead=${SEGMENT_PREFETCH_AHEAD} concurrency=${SEGMENT_PREFETCH_CONCURRENCY} cacheTTL=${SEGMENT_CACHE_TTL / 1000}s`);
     console.log(`🩹 segment playerRetry=${SEGMENT_PLAYER_RETRIES} delay=${SEGMENT_PLAYER_RETRY_DELAY_MS}ms`);
     console.log(`🪟 buffer: retain/serve=${RETAIN_SEGMENTS} liveDelay=${LIVE_DELAY_SEGMENTS}segs prime=${MIN_START_SEGMENTS}segs/${PRIME_TIMEOUT_MS / 1000}s idleStop=${POLLER_IDLE_STOP_MS / 1000}s`);
-    console.log(`📺 epg timeout=${EPG_REQUEST_TIMEOUT / 1000}s retryDelay=${EPG_RETRY_DELAY_MS / 1000}s cacheTTL=${EPG_CACHE_TTL / 1000}s`);
+    console.log(`📺 epg timezone=${EPG_TIME_ZONE} timeout=${EPG_REQUEST_TIMEOUT / 1000}s retryDelay=${EPG_RETRY_DELAY_MS / 1000}s cacheTTL=${EPG_CACHE_TTL / 1000}s`);
     console.log("=".repeat(60) + "\n");
 });
