@@ -9,6 +9,25 @@ const crypto = require("crypto");
 const app = express();
 const PORT = process.env.PORT || 7000;
 
+const LOG_TIME_ZONE = process.env.LOG_TIME_ZONE || process.env.EPG_TIME_ZONE || "Europe/Rome";
+const logTimeFormatter = new Intl.DateTimeFormat("it-IT", {
+    timeZone: LOG_TIME_ZONE,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23"
+});
+
+function installTimestampedConsole() {
+    const prefixArgs = args => [`[${logTimeFormatter.format(new Date())}]`, ...args];
+    for (const method of ["log", "warn", "error"]) {
+        const original = console[method].bind(console);
+        console[method] = (...args) => original(...prefixArgs(args));
+    }
+}
+
+installTimestampedConsole();
+
 app.set("trust proxy", true);
 
 app.use((req, res, next) => {
