@@ -465,7 +465,7 @@ function formatEpgDescription(programmes) {
 
 function formatProgramme(label, programme) {
     const description = String(programme.desc || "").slice(0, 500).trim().replace(/\.+$/, "");
-    return nbsp(`${label}: ${String(programme.title || "").toUpperCase()}  (${formatTime(programme.start)} - ${formatTime(programme.stop)}) ❘ Trama: ${description}`);
+    return nbsp(`${label}: ${String(programme.title || "").toUpperCase()} (${formatTime(programme.start)} - ${formatTime(programme.stop)}) | Trama: ${description}`);
 }
 
 function nbsp(text) {
