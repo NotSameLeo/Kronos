@@ -69,13 +69,14 @@ const SLOW_SEGMENT_MS = Number(process.env.SLOW_SEGMENT_MS || 4000);
 // from our buffer. Refreshes stay non-blocking; only the very first open does a
 // short, capped prime wait to build the initial cushion.
 const RETAIN_SEGMENTS = Number(process.env.RETAIN_SEGMENTS || 12);   // ~2min retained & served
-const LIVE_DELAY_SEGMENTS = Math.max(0, Number(process.env.LIVE_DELAY_SEGMENTS ?? 2));
+const LIVE_DELAY_SEGMENTS = Math.max(0, Number(process.env.LIVE_DELAY_SEGMENTS ?? 3));
 // Anti-jump limit: advance the served live edge by at most this many segments per
 // request while retained history still exists. If upstream history disappears,
 // catching up is unavoidable.
 const MAX_EDGE_ADVANCE = Number(process.env.MAX_EDGE_ADVANCE || 2);
-const MIN_START_SEGMENTS = Math.max(LIVE_DELAY_SEGMENTS + 1, Number(process.env.MIN_START_SEGMENTS ?? 3)); // initial cushion
-const PRIME_TIMEOUT_MS = Number(process.env.PRIME_TIMEOUT_MS || 18000);  // max FIRST-open wait
+const DEFAULT_MIN_START_SEGMENTS = LIVE_DELAY_SEGMENTS + 1;
+const MIN_START_SEGMENTS = Math.max(DEFAULT_MIN_START_SEGMENTS, Number(process.env.MIN_START_SEGMENTS ?? DEFAULT_MIN_START_SEGMENTS)); // initial cushion
+const PRIME_TIMEOUT_MS = Number(process.env.PRIME_TIMEOUT_MS || 45000);  // max FIRST-open wait
 const POLLER_IDLE_STOP_MS = Number(process.env.POLLER_IDLE_STOP_MS || 90000); // stop if player gone
 const POLL_MIN_MS = Number(process.env.POLL_MIN_MS || 2000);
 const POLL_MAX_MS = Number(process.env.POLL_MAX_MS || 5000);
@@ -395,12 +396,12 @@ function formatEpgDescription(programmes) {
     const lines = [];
     if (current) lines.push(formatProgramme("🔴 In Onda", current));
     if (next) lines.push(formatProgramme("🔵 A Seguire", next));
-    return lines.join("\u00a0\u00a0||||\u00a0\u00a0");
+    return lines.join("\u00a0\u00a0▌▋▍█ ▋∎⦾⣿■▰║‖▒▓\u00a0\u00a0");
 }
 
 function formatProgramme(label, programme) {
     const description = String(programme.desc || "").slice(0, 500).trim().replace(/\.+$/, "");
-    return `${label}: ${String(programme.title || "").toUpperCase()}\u00a0(${formatTime(programme.start)} - ${formatTime(programme.stop)}) | Trama: ${description}`;
+    return `${label}: ${String(programme.title || "").toUpperCase()}\u00a0\u00a0(${formatTime(programme.start)} - ${formatTime(programme.stop)}) | Trama: ${description}`;
 }
 
 function getEpgMatchKeys(values) {
