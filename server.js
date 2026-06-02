@@ -52,7 +52,9 @@ const EPG_CACHE_TTL = Number(process.env.EPG_CACHE_TTL || 6 * 60 * 60 * 1000);
 const EPG_REQUEST_TIMEOUT = Number(process.env.EPG_REQUEST_TIMEOUT || 20000);
 const EPG_MAX_BYTES = Number(process.env.EPG_MAX_BYTES || 160 * 1024 * 1024);
 const EPG_RETRY_DELAY_MS = Number(process.env.EPG_RETRY_DELAY_MS || 15000);
-const EPG_FIRST_CATALOG_WAIT_MS = Number(process.env.EPG_FIRST_CATALOG_WAIT_MS || EPG_REQUEST_TIMEOUT);
+const EPG_FIRST_CATALOG_WAIT_MS = Number(process.env.EPG_FIRST_CATALOG_WAIT_MS || 0);
+const EPG_REFRESH_INTERVAL_MS = Number(process.env.EPG_REFRESH_INTERVAL_MS || EPG_CACHE_TTL);
+const EPG_PRELOAD_URL = String(process.env.EPG_PRELOAD_URL || "").trim();
 const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 20000);
 const SEG_REQUEST_TIMEOUT = Number(process.env.SEG_REQUEST_TIMEOUT || 45000);
 const PLAYLIST_REQUEST_TIMEOUT = Number(process.env.PLAYLIST_REQUEST_TIMEOUT || 20000);
@@ -114,6 +116,7 @@ const memoryCache = {
     epgLastUpdate: {},    // epgUrl -> timestamp
     epgInflight: {},      // epgUrl -> Promise
     epgRetryTimers: {},   // epgUrl -> timeout
+    epgRefreshTimers: {}, // epgUrl -> timeout
     epgStatus: {},        // epgUrl -> diagnostics
     epgSubscribers: {},   // epgUrl -> Set<configKey>
     configByKey: {},      // configKey -> decoded config
@@ -201,6 +204,7 @@ function subscribeConfigToEPG(configKey, config) {
     const subscribers = memoryCache.epgSubscribers[config.e] || new Set();
     subscribers.add(configKey);
     memoryCache.epgSubscribers[config.e] = subscribers;
+    startEPGBackgroundRefresh(config.e, "config");
 }
 
 function clearEPGRetry(epgUrl) {
@@ -220,6 +224,26 @@ function scheduleEPGRetry(epgUrl) {
     if (timer.unref) timer.unref();
     memoryCache.epgRetryTimers[epgUrl] = timer;
     console.log(`[EPG RETRY SCHEDULED] in=${EPG_RETRY_DELAY_MS / 1000}s`);
+}
+
+function startEPGBackgroundRefresh(epgUrl, reason = "background") {
+    if (!epgUrl) return;
+    if (!getCachedEPG(epgUrl) && !memoryCache.epgInflight[epgUrl]) {
+        console.log(`[EPG BACKGROUND] reason=${reason}`);
+        ensureEPGRefresh(epgUrl).catch(err => console.error("[EPG BACKGROUND]", err.message));
+    }
+    scheduleEPGPeriodicRefresh(epgUrl);
+}
+
+function scheduleEPGPeriodicRefresh(epgUrl) {
+    if (!epgUrl || EPG_REFRESH_INTERVAL_MS <= 0 || memoryCache.epgRefreshTimers[epgUrl]) return;
+    const timer = setTimeout(() => {
+        delete memoryCache.epgRefreshTimers[epgUrl];
+        console.log(`[EPG REFRESH SCHEDULED] interval=${EPG_REFRESH_INTERVAL_MS / 1000}s`);
+        ensureEPGRefresh(epgUrl, { force: true }).catch(err => console.error("[EPG REFRESH]", err.message));
+    }, EPG_REFRESH_INTERVAL_MS);
+    if (timer.unref) timer.unref();
+    memoryCache.epgRefreshTimers[epgUrl] = timer;
 }
 
 function attachEPGToChannels(channels, epgData) {
@@ -286,6 +310,7 @@ async function ensureEPGRefresh(epgUrl, options = {}) {
         memoryCache.epgStatus[epgUrl] = { state: "ready", updatedAt: Date.now(), retryAt: 0 };
         clearEPGRetry(epgUrl);
         console.log(`[EPG OK] channels=${data.channelCount} programmes=${data.programmeCount} keys=${byKey.size}`);
+        scheduleEPGPeriodicRefresh(epgUrl);
         refreshSubscribedChannels(epgUrl, data);
         return data;
     } catch (err) {
@@ -416,7 +441,7 @@ function formatEpgDescription(programmes) {
     const lines = [];
     if (current) lines.push(formatProgramme("🔴 In Onda", current));
     if (next) lines.push(formatProgramme("🔵 A Seguire", next));
-    return lines.join(nbsp("  ║  "));
+    return lines.join(nbsp("  ∣❘❘  "));
 }
 
 function formatProgramme(label, programme) {
@@ -1771,6 +1796,7 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`⏩ prefetch ahead=${SEGMENT_PREFETCH_AHEAD} concurrency=${SEGMENT_PREFETCH_CONCURRENCY} cacheTTL=${SEGMENT_CACHE_TTL / 1000}s`);
     console.log(`🩹 segment playerRetry=${SEGMENT_PLAYER_RETRIES} delay=${SEGMENT_PLAYER_RETRY_DELAY_MS}ms`);
     console.log(`🪟 buffer: retain/serve=${RETAIN_SEGMENTS} liveDelay=${LIVE_DELAY_SEGMENTS}segs prime=${MIN_START_SEGMENTS}segs/${PRIME_TIMEOUT_MS / 1000}s idleStop=${POLLER_IDLE_STOP_MS / 1000}s`);
-    console.log(`📺 epg timezone=${EPG_TIME_ZONE} timeout=${EPG_REQUEST_TIMEOUT / 1000}s firstWait=${EPG_FIRST_CATALOG_WAIT_MS / 1000}s retryDelay=${EPG_RETRY_DELAY_MS / 1000}s cacheTTL=${EPG_CACHE_TTL / 1000}s`);
+    console.log(`📺 epg timezone=${EPG_TIME_ZONE} timeout=${EPG_REQUEST_TIMEOUT / 1000}s firstWait=${EPG_FIRST_CATALOG_WAIT_MS / 1000}s retryDelay=${EPG_RETRY_DELAY_MS / 1000}s cacheTTL=${EPG_CACHE_TTL / 1000}s refresh=${EPG_REFRESH_INTERVAL_MS / 1000}s preload=${EPG_PRELOAD_URL ? "on" : "off"}`);
     console.log("=".repeat(60) + "\n");
+    if (EPG_PRELOAD_URL) startEPGBackgroundRefresh(EPG_PRELOAD_URL, "startup");
 });
