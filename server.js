@@ -52,6 +52,7 @@ const EPG_CACHE_TTL = Number(process.env.EPG_CACHE_TTL || 6 * 60 * 60 * 1000);
 const EPG_REQUEST_TIMEOUT = Number(process.env.EPG_REQUEST_TIMEOUT || 20000);
 const EPG_MAX_BYTES = Number(process.env.EPG_MAX_BYTES || 160 * 1024 * 1024);
 const EPG_RETRY_DELAY_MS = Number(process.env.EPG_RETRY_DELAY_MS || 15000);
+const EPG_FIRST_CATALOG_WAIT_MS = Number(process.env.EPG_FIRST_CATALOG_WAIT_MS || EPG_REQUEST_TIMEOUT);
 const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 20000);
 const SEG_REQUEST_TIMEOUT = Number(process.env.SEG_REQUEST_TIMEOUT || 45000);
 const PLAYLIST_REQUEST_TIMEOUT = Number(process.env.PLAYLIST_REQUEST_TIMEOUT || 20000);
@@ -95,7 +96,7 @@ const LIVE_DELAY_SEGMENTS = Math.max(0, Number(process.env.LIVE_DELAY_SEGMENTS ?
 const MAX_EDGE_ADVANCE = Number(process.env.MAX_EDGE_ADVANCE || 2);
 const DEFAULT_MIN_START_SEGMENTS = LIVE_DELAY_SEGMENTS + 1;
 const MIN_START_SEGMENTS = Math.max(DEFAULT_MIN_START_SEGMENTS, Number(process.env.MIN_START_SEGMENTS ?? DEFAULT_MIN_START_SEGMENTS)); // initial cushion
-const PRIME_TIMEOUT_MS = Number(process.env.PRIME_TIMEOUT_MS || 45000);  // max FIRST-open wait
+const PRIME_TIMEOUT_MS = Number(process.env.PRIME_TIMEOUT_MS || 60000);  // max FIRST-open wait
 const POLLER_IDLE_STOP_MS = Number(process.env.POLLER_IDLE_STOP_MS || 90000); // stop if player gone
 const POLL_MIN_MS = Number(process.env.POLL_MIN_MS || 2000);
 const POLL_MAX_MS = Number(process.env.POLL_MAX_MS || 5000);
@@ -415,12 +416,16 @@ function formatEpgDescription(programmes) {
     const lines = [];
     if (current) lines.push(formatProgramme("🔴 In Onda", current));
     if (next) lines.push(formatProgramme("🔵 A Seguire", next));
-    return lines.join("\u00a0\u00a0▌▋▍█ ▋∎⦾⣿■▰║‖▒▓\u00a0\u00a0");
+    return lines.join(nbsp("  ║  "));
 }
 
 function formatProgramme(label, programme) {
     const description = String(programme.desc || "").slice(0, 500).trim().replace(/\.+$/, "");
-    return `${label}: ${String(programme.title || "").toUpperCase()}\u00a0\u00a0(${formatTime(programme.start)} - ${formatTime(programme.stop)}) | Trama: ${description}`;
+    return nbsp(`${label}: ${String(programme.title || "").toUpperCase()}  (${formatTime(programme.start)} - ${formatTime(programme.stop)}) | Trama: ${description}`);
+}
+
+function nbsp(text) {
+    return String(text || "").replace(/ /g, "\u00a0");
 }
 
 function getEpgMatchKeys(values) {
@@ -595,7 +600,12 @@ async function fetchAndProcessChannels(configKey, config, options = {}) {
     const promise = (async () => {
         memoryCache.isUpdating[configKey] = true;
         subscribeConfigToEPG(configKey, config);
-        if (config.e) ensureEPGRefresh(config.e).catch(err => console.error("[EPG REFRESH]", err.message));
+        const epgPromise = config.e
+            ? ensureEPGRefresh(config.e).catch(err => {
+                console.error("[EPG REFRESH]", err.message);
+                return null;
+            })
+            : null;
         const lists = getConfiguredLists(config);
         const selectedGroups = Array.isArray(config.g) ? config.g : [];
         const selectedSet = new Set(selectedGroups.map(normalizeGroupName));
@@ -619,7 +629,15 @@ async function fetchAndProcessChannels(configKey, config, options = {}) {
                     group: config.gm === "bucket" ? bucketGroup : c.group
                 };
             });
-        const epgData = getCachedEPG(config.e);
+        let epgData = getCachedEPG(config.e);
+        if (config.e && !epgData && epgPromise && EPG_FIRST_CATALOG_WAIT_MS > 0) {
+            console.log(`[EPG WAIT] upTo=${EPG_FIRST_CATALOG_WAIT_MS / 1000}s`);
+            epgData = await Promise.race([
+                epgPromise,
+                sleep(EPG_FIRST_CATALOG_WAIT_MS).then(() => null)
+            ]);
+            if (!epgData) epgData = getCachedEPG(config.e);
+        }
         const { channels, matched: epgMatched } = attachEPGToChannels(rawChannels, epgData);
         if (config.e && !epgData) console.log("[EPG PENDING] catalog served without guide; background refresh active");
 
@@ -1436,6 +1454,10 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
                 rt.lastPlayerAt = Date.now();
                 await sleep(250);
             }
+            const warmAfterWait = getWarmTailCount(rt);
+            if (warmAfterWait < MIN_START_SEGMENTS) {
+                console.warn(`[HLS PRIME TIMEOUT] channel="${ch.name}" warmTail=${warmAfterWait}/${MIN_START_SEGMENTS} waited=${Date.now() - t0}ms`);
+            }
         }
 
         if (rt.isMaster) {
@@ -1446,7 +1468,6 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
             return res.send(rewritten);
         }
 
-        const warmAfterPrime = getWarmTailCount(rt);
         if (!rt.segs.length || getLatestWarmIndex(rt) < 0) {
             console.warn(`[HLS EMPTY] channel="${ch.name}" no warm segments after ${Date.now() - t0}ms`);
             return res.status(502).send("#EXTM3U\n#EXT-X-ENDLIST\n");
@@ -1456,7 +1477,8 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         const { playlist, count, mediaSeq, edge, hi, warmTail: servedWarmTail, readyAhead } = buildServedPlaylist(rt, host, configKey);
         setPlaylistHeaders(res);
         const segmentIdle = rt.lastSegmentAt ? `${Date.now() - rt.lastSegmentAt}ms` : "never";
-        console.log(`[HLS SERVE] channel="${ch.name}" window=${count} seq=${mediaSeq} edge=${edge}/${hi} held=${hi - edge}/${LIVE_DELAY_SEGMENTS} readyAhead=${readyAhead} warmTail=${servedWarmTail}${warmAfterPrime < MIN_START_SEGMENTS ? " degraded=1" : ""} gen=${rt.generation} segmentIdle=${segmentIdle} segmentReq=${rt.segmentRequests} cache=${segCache.size}/${formatBytes(segCacheBytes)} prefetch=${prefetchActive}+${prefetchQueue.length} waited=${Date.now() - t0}ms`);
+        const degraded = readyAhead < LIVE_DELAY_SEGMENTS;
+        console.log(`[HLS SERVE] channel="${ch.name}" window=${count} seq=${mediaSeq} edge=${edge}/${hi} held=${hi - edge}/${LIVE_DELAY_SEGMENTS} readyAhead=${readyAhead} warmTail=${servedWarmTail}${degraded ? " degraded=1" : ""} gen=${rt.generation} segmentIdle=${segmentIdle} segmentReq=${rt.segmentRequests} cache=${segCache.size}/${formatBytes(segCacheBytes)} prefetch=${prefetchActive}+${prefetchQueue.length} waited=${Date.now() - t0}ms`);
         res.send(playlist);
     } catch (err) {
         console.error(`[HLS ERROR] ${err.message}`);
@@ -1749,6 +1771,6 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`⏩ prefetch ahead=${SEGMENT_PREFETCH_AHEAD} concurrency=${SEGMENT_PREFETCH_CONCURRENCY} cacheTTL=${SEGMENT_CACHE_TTL / 1000}s`);
     console.log(`🩹 segment playerRetry=${SEGMENT_PLAYER_RETRIES} delay=${SEGMENT_PLAYER_RETRY_DELAY_MS}ms`);
     console.log(`🪟 buffer: retain/serve=${RETAIN_SEGMENTS} liveDelay=${LIVE_DELAY_SEGMENTS}segs prime=${MIN_START_SEGMENTS}segs/${PRIME_TIMEOUT_MS / 1000}s idleStop=${POLLER_IDLE_STOP_MS / 1000}s`);
-    console.log(`📺 epg timezone=${EPG_TIME_ZONE} timeout=${EPG_REQUEST_TIMEOUT / 1000}s retryDelay=${EPG_RETRY_DELAY_MS / 1000}s cacheTTL=${EPG_CACHE_TTL / 1000}s`);
+    console.log(`📺 epg timezone=${EPG_TIME_ZONE} timeout=${EPG_REQUEST_TIMEOUT / 1000}s firstWait=${EPG_FIRST_CATALOG_WAIT_MS / 1000}s retryDelay=${EPG_RETRY_DELAY_MS / 1000}s cacheTTL=${EPG_CACHE_TTL / 1000}s`);
     console.log("=".repeat(60) + "\n");
 });
