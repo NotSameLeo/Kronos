@@ -231,7 +231,8 @@ function scheduleEPGRetry(epgUrl) {
 
 function startEPGBackgroundRefresh(epgUrl, reason = "background") {
     if (!epgUrl) return;
-    if (!getCachedEPG(epgUrl) && !memoryCache.epgInflight[epgUrl]) {
+    const retryAt = memoryCache.epgStatus[epgUrl]?.retryAt || 0;
+    if (!getCachedEPG(epgUrl) && !memoryCache.epgInflight[epgUrl] && Date.now() >= retryAt) {
         console.log(`[EPG BACKGROUND] reason=${reason}`);
         ensureEPGRefresh(epgUrl).catch(err => console.error("[EPG BACKGROUND]", err.message));
     }
@@ -1454,6 +1455,22 @@ function buildServedPlaylist(rt, hostBase, configKey) {
     };
 }
 
+function getServeReadiness(rt) {
+    const warmRun = getLatestWarmRun(rt);
+    if (warmRun.count <= 0) return { ready: false, window: 0, readyAhead: 0 };
+    let edgeIdx = warmRun.count >= LIVE_DELAY_SEGMENTS + 1
+        ? warmRun.end - LIVE_DELAY_SEGMENTS
+        : warmRun.end;
+    if (edgeIdx + 1 < MIN_VISIBLE_SEGMENTS) edgeIdx = Math.min(warmRun.end, MIN_VISIBLE_SEGMENTS - 1);
+    const window = edgeIdx + 1;
+    const readyAhead = Math.max(0, warmRun.end - edgeIdx);
+    return {
+        ready: window >= MIN_VISIBLE_SEGMENTS && warmRun.count >= MIN_START_SEGMENTS,
+        window,
+        readyAhead
+    };
+}
+
 function setPlaylistHeaders(res) {
     res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, no-transform");
@@ -1496,20 +1513,21 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         const rt = ensureChannel(ch.url, ch.name);
         const warmTail = getWarmTailCount(rt);
         const fresh = !rt.primedOnce && !rt.isMaster;
-        console.log(`[HLS OPEN] channel="${ch.name}" resolve=${Date.now() - t0}ms depth=${rt.segs.length} warmTail=${warmTail}/${MIN_START_SEGMENTS} ${fresh ? "(priming…)" : "(buffer ready)"}`);
+        const readiness = getServeReadiness(rt);
+        console.log(`[HLS OPEN] channel="${ch.name}" resolve=${Date.now() - t0}ms depth=${rt.segs.length} warmTail=${warmTail}/${MIN_START_SEGMENTS} serveWindow=${readiness.window}/${MIN_VISIBLE_SEGMENTS} readyAhead=${readiness.readyAhead}/${LIVE_DELAY_SEGMENTS} ${fresh ? "(priming…)" : "(buffer ready)"}`);
 
         // FIRST open only: short, capped wait for the initial cushion. Re-opens and
         // continuous polls never block here — the buffer is already deep — so the
         // player's manifest request is always answered fast (no timeout/crash).
         if (fresh) {
             const deadline = Date.now() + PRIME_TIMEOUT_MS;
-            while (rt.running && !rt.isMaster && getWarmTailCount(rt) < MIN_START_SEGMENTS && Date.now() < deadline) {
+            while (rt.running && !rt.isMaster && !getServeReadiness(rt).ready && Date.now() < deadline) {
                 rt.lastPlayerAt = Date.now();
                 await sleep(250);
             }
-            const warmAfterWait = getWarmTailCount(rt);
-            if (warmAfterWait < MIN_START_SEGMENTS) {
-                console.warn(`[HLS PRIME TIMEOUT] channel="${ch.name}" warmTail=${warmAfterWait}/${MIN_START_SEGMENTS} waited=${Date.now() - t0}ms`);
+            const readyAfterWait = getServeReadiness(rt);
+            if (!readyAfterWait.ready) {
+                console.warn(`[HLS PRIME TIMEOUT] channel="${ch.name}" serveWindow=${readyAfterWait.window}/${MIN_VISIBLE_SEGMENTS} readyAhead=${readyAfterWait.readyAhead}/${LIVE_DELAY_SEGMENTS} waited=${Date.now() - t0}ms`);
             }
         }
 
