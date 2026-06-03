@@ -301,6 +301,7 @@ async function ensureEPGRefresh(epgUrl, options = {}) {
 
     const promise = (async () => {
     try {
+        const startedAt = Date.now();
         console.log("[EPG FETCH]", epgUrl);
         memoryCache.epgStatus[epgUrl] = { state: "fetching", startedAt: Date.now(), retryAt: 0 };
         const response = await axios.get(epgUrl, {
@@ -310,8 +311,11 @@ async function ensureEPGRefresh(epgUrl, options = {}) {
             responseType: "arraybuffer",
             headers: { "User-Agent": `Kronos/${RELEASE_VERSION}`, "Accept": "application/xml, text/xml, application/gzip, */*" }
         });
+        const downloadMs = Date.now() - startedAt;
         const { channelDefs, programmesById, programmeCount } = await parseXMLTVBuffer(Buffer.from(response.data));
+        const parseMs = Date.now() - startedAt - downloadMs;
 
+        const indexStartedAt = Date.now();
         const byKey = new Map();
         const xmlIds = new Set([...channelDefs.keys(), ...programmesById.keys()]);
         xmlIds.forEach(id => {
@@ -330,7 +334,7 @@ async function ensureEPGRefresh(epgUrl, options = {}) {
         memoryCache.epgLastUpdate[epgUrl] = Date.now();
         memoryCache.epgStatus[epgUrl] = { state: "ready", updatedAt: Date.now(), retryAt: 0 };
         clearEPGRetry(epgUrl);
-        console.log(`[EPG OK] channels=${data.channelCount} programmes=${data.programmeCount} keys=${byKey.size}`);
+        console.log(`[EPG OK] channels=${data.channelCount} programmes=${data.programmeCount} keys=${byKey.size} download=${downloadMs}ms parse=${parseMs}ms index=${Date.now() - indexStartedAt}ms`);
         scheduleEPGPeriodicRefresh(epgUrl);
         refreshSubscribedChannels(epgUrl, data);
         return data;
@@ -377,15 +381,18 @@ function parseXMLTVBuffer(buffer) {
             } else if (node.name === "display-name" && channel) {
                 capture = "display-name"; text = "";
             } else if (node.name === "programme") {
+                const stop = parseXMLTVDate(readAttr(node, "stop"));
+                const keep = !Number.isNaN(stop.getTime()) && stop.getTime() >= keepAfter;
                 programme = {
                     channel: readAttr(node, "channel"),
-                    start: parseXMLTVDate(readAttr(node, "start")),
-                    stop: parseXMLTVDate(readAttr(node, "stop")),
+                    start: keep ? parseXMLTVDate(readAttr(node, "start")) : new Date(NaN),
+                    stop,
+                    keep,
                     title: "",
                     desc: ""
                 };
                 programmeCount++;
-            } else if ((node.name === "title" || node.name === "desc") && programme) {
+            } else if ((node.name === "title" || node.name === "desc") && programme?.keep) {
                 capture = node.name; text = "";
             }
         });
@@ -404,7 +411,7 @@ function parseXMLTVBuffer(buffer) {
                 channel = null;
             }
             if (name === "programme" && programme) {
-                if (programme.channel && !Number.isNaN(programme.start.getTime()) && !Number.isNaN(programme.stop.getTime()) && programme.stop.getTime() >= keepAfter) {
+                if (programme.keep && programme.channel && !Number.isNaN(programme.start.getTime())) {
                     const list = programmesById.get(programme.channel) || [];
                     list.push({ start: programme.start, stop: programme.stop, title: programme.title || "Programma senza titolo", desc: programme.desc });
                     programmesById.set(programme.channel, list);
@@ -420,9 +427,13 @@ function parseXMLTVBuffer(buffer) {
 }
 
 function parseXMLTVDate(str) {
-    const m = String(str || "").match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(?:\s*([+-]\d{4}))?/);
+    const m = String(str || "").match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(?:\s*([+-])(\d{2})(\d{2}))?/);
     if (!m) return new Date(str);
-    const [, Y, Mo, D, H, Mi, S] = m;
+    const [, Y, Mo, D, H, Mi, S, sign, offH, offM] = m;
+    if (sign) {
+        const offsetMs = ((Number(offH) * 60) + Number(offM)) * 60 * 1000 * (sign === "+" ? 1 : -1);
+        return new Date(Date.UTC(Number(Y), Number(Mo) - 1, Number(D), Number(H), Number(Mi), Number(S)) - offsetMs);
+    }
     return zonedWallClockToDate(Number(Y), Number(Mo), Number(D), Number(H), Number(Mi), Number(S), EPG_TIME_ZONE);
 }
 
@@ -436,11 +447,24 @@ function zonedWallClockToDate(year, month, day, hour, minute, second, timeZone) 
 }
 
 function getTimeZoneOffsetMs(date, timeZone) {
-    const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
-        timeZone, year: "numeric", month: "2-digit", day: "2-digit",
-        hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23"
-    }).formatToParts(date).filter(part => part.type !== "literal").map(part => [part.type, Number(part.value)]));
+    const parts = Object.fromEntries(getTimeZoneOffsetFormatter(timeZone)
+        .formatToParts(date)
+        .filter(part => part.type !== "literal")
+        .map(part => [part.type, Number(part.value)]));
     return Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second) - date.getTime();
+}
+
+const timeZoneOffsetFormatters = new Map();
+function getTimeZoneOffsetFormatter(timeZone) {
+    let formatter = timeZoneOffsetFormatters.get(timeZone);
+    if (!formatter) {
+        formatter = new Intl.DateTimeFormat("en-CA", {
+            timeZone, year: "numeric", month: "2-digit", day: "2-digit",
+            hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23"
+        });
+        timeZoneOffsetFormatters.set(timeZone, formatter);
+    }
+    return formatter;
 }
 
 function formatTime(d) {
@@ -1589,8 +1613,8 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
             if (!sourceUrl) {
                 // Unknown id (server restarted / aged out). Tell the player to refresh
                 // the playlist rather than serve garbage.
-                console.warn(`[SEG MISS-ID] ${segId} not in registry`);
-                return res.status(404).end();
+                console.warn(`[SEG STALE-ID] ${segId} not in registry; player must refresh playlist`);
+                return res.status(410).end();
             }
         } else if (req.query.u) {
             // Direct (non-HLS) stream URL — continuous, never cached.
