@@ -57,6 +57,7 @@ const EPG_REFRESH_INTERVAL_MS = Number(process.env.EPG_REFRESH_INTERVAL_MS || EP
 const DEFAULT_EPG_PRELOAD_URL = "http://172.30.0.10:8080/guide.gzip";
 const EPG_PRELOAD_URL = String(process.env.EPG_PRELOAD_URL || DEFAULT_EPG_PRELOAD_URL).trim();
 const EPG_STARTUP_WATCH_MS = Number(process.env.EPG_STARTUP_WATCH_MS || 30000);
+const CATALOG_PRELOAD_CONFIGS = parseCatalogPreloadConfigs(process.env.CATALOG_PRELOAD_CONFIGS || process.env.KRONOS_PRELOAD_CONFIGS || "");
 const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 20000);
 const SEG_REQUEST_TIMEOUT = Number(process.env.SEG_REQUEST_TIMEOUT || 45000);
 const PLAYLIST_REQUEST_TIMEOUT = Number(process.env.PLAYLIST_REQUEST_TIMEOUT || 20000);
@@ -138,6 +139,29 @@ function decodeConfig(configKey) {
     } catch (err) {
         throw new Error("Invalid configuration token");
     }
+}
+
+function parseCatalogPreloadConfigs(raw) {
+    return String(raw || "")
+        .split(/[,\s]+/)
+        .map(extractConfigKey)
+        .filter(Boolean);
+}
+
+function extractConfigKey(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return "";
+    const manifestMatch = raw.match(/(?:^|\/)([A-Za-z0-9_-]+)\/manifest\.json(?:$|[?#])/i)
+        || raw.match(/(?:^|\/)([A-Za-z0-9_-]+)\/manifest\.json$/i);
+    if (manifestMatch) return manifestMatch[1];
+    try {
+        const parsed = new URL(raw);
+        const config = parsed.searchParams.get("config");
+        if (config) return config;
+        const parts = parsed.pathname.split("/").filter(Boolean);
+        if (parts[0]) return parts[0];
+    } catch {}
+    return raw.replace(/^\/+|\/+$/g, "");
 }
 
 function encodeProxyUrl(url) { return Buffer.from(String(url), "utf8").toString("base64url"); }
@@ -265,6 +289,21 @@ function startEPGStartupPreload() {
         startEPGBackgroundRefresh(EPG_PRELOAD_URL, "startup-watch");
     }, 3000);
     if (timer.unref) timer.unref();
+}
+
+function startCatalogStartupPreload() {
+    if (!CATALOG_PRELOAD_CONFIGS.length) return;
+    console.log(`[CATALOG PRELOAD] configs=${CATALOG_PRELOAD_CONFIGS.length}`);
+    CATALOG_PRELOAD_CONFIGS.forEach(configKey => {
+        try {
+            const config = decodeConfig(configKey);
+            fetchAndProcessChannels(configKey, config)
+                .then(channels => console.log(`[CATALOG PRELOAD OK] channels=${channels.length}`))
+                .catch(err => console.error(`[CATALOG PRELOAD ERROR] ${err.message}`));
+        } catch (err) {
+            console.error(`[CATALOG PRELOAD ERROR] invalid config: ${err.message}`);
+        }
+    });
 }
 
 function attachEPGToChannels(channels, epgData) {
@@ -1867,6 +1906,8 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`🩹 segment playerRetry=${SEGMENT_PLAYER_RETRIES} delay=${SEGMENT_PLAYER_RETRY_DELAY_MS}ms`);
     console.log(`🪟 buffer: retain/serve=${RETAIN_SEGMENTS} liveDelay=${LIVE_DELAY_SEGMENTS}segs prime=${MIN_START_SEGMENTS}segs/${PRIME_TIMEOUT_MS / 1000}s minVisible=${MIN_VISIBLE_SEGMENTS} idleStop=${POLLER_IDLE_STOP_MS / 1000}s`);
     console.log(`📺 epg timezone=${EPG_TIME_ZONE} timeout=${EPG_REQUEST_TIMEOUT / 1000}s firstWait=${EPG_FIRST_CATALOG_WAIT_MS / 1000}s retryDelay=${EPG_RETRY_DELAY_MS / 1000}s cacheTTL=${EPG_CACHE_TTL / 1000}s refresh=${EPG_REFRESH_INTERVAL_MS / 1000}s preload=${EPG_PRELOAD_URL ? "on" : "off"} startupWatch=${EPG_STARTUP_WATCH_MS / 1000}s`);
+    console.log(`📚 catalog preload=${CATALOG_PRELOAD_CONFIGS.length}`);
     console.log("=".repeat(60) + "\n");
     startEPGStartupPreload();
+    startCatalogStartupPreload();
 });
