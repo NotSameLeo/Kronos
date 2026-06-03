@@ -100,6 +100,7 @@ const LIVE_DELAY_SEGMENTS = Math.max(0, Number(process.env.LIVE_DELAY_SEGMENTS ?
 const MAX_EDGE_ADVANCE = Number(process.env.MAX_EDGE_ADVANCE || 2);
 const DEFAULT_MIN_START_SEGMENTS = LIVE_DELAY_SEGMENTS + 1;
 const MIN_START_SEGMENTS = Math.max(DEFAULT_MIN_START_SEGMENTS, Number(process.env.MIN_START_SEGMENTS ?? DEFAULT_MIN_START_SEGMENTS)); // initial cushion
+const MIN_VISIBLE_SEGMENTS = Math.max(1, Number(process.env.MIN_VISIBLE_SEGMENTS || 3));
 const PRIME_TIMEOUT_MS = Number(process.env.PRIME_TIMEOUT_MS || 60000);  // max FIRST-open wait
 const POLLER_IDLE_STOP_MS = Number(process.env.POLLER_IDLE_STOP_MS || 90000); // stop if player gone
 const POLL_MIN_MS = Number(process.env.POLL_MIN_MS || 2000);
@@ -1409,9 +1410,17 @@ function buildServedPlaylist(rt, hostBase, configKey) {
     const hi = rt.seqBase + rt.segs.length - 1;
     const warmTail = getWarmTailCount(rt);
     const warmRun = getLatestWarmRun(rt);
-    const desiredIdx = warmRun.count >= LIVE_DELAY_SEGMENTS + 1
+    let desiredIdx = warmRun.count >= LIVE_DELAY_SEGMENTS + 1
         ? warmRun.end - LIVE_DELAY_SEGMENTS
         : warmRun.end;
+    if (warmRun.count > 0 && desiredIdx + 1 < MIN_VISIBLE_SEGMENTS) {
+        // After an upstream encoder restart we intentionally keep MEDIA-SEQUENCE
+        // moving forward, so retained history is empty. A strict live delay would
+        // expose a 1-segment playlist even though several warm segments exist ahead,
+        // which makes some players stall. Temporarily reduce the delay until the
+        // retained window grows again.
+        desiredIdx = Math.min(warmRun.end, MIN_VISIBLE_SEGMENTS - 1);
+    }
     const delayedHi = rt.seqBase + Math.max(0, desiredIdx);
 
     // ANTI-JUMP: advance the served live edge by at most MAX_EDGE_ADVANCE per request,
@@ -1797,7 +1806,7 @@ app.get("/:base64Config/debug", async (req, res) => {
             groups: [...new Set(channels.map(c => c.group))].slice(0, 50),
             constants: {
                 ADDON_TYPE, RELEASE_VERSION, HLS_REQUEST_TIMEOUT, SEG_REQUEST_TIMEOUT,
-                LIVE_DELAY_SEGMENTS, MIN_START_SEGMENTS, PRIME_TIMEOUT_MS, RETAIN_SEGMENTS
+                LIVE_DELAY_SEGMENTS, MIN_START_SEGMENTS, MIN_VISIBLE_SEGMENTS, PRIME_TIMEOUT_MS, RETAIN_SEGMENTS
             }
         });
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -1814,7 +1823,7 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`📋 playlist retryWindow=${PLAYLIST_RETRY_WINDOW_MS / 1000}s delay=${PLAYLIST_RETRY_DELAY_MS / 1000}s`);
     console.log(`⏩ prefetch ahead=${SEGMENT_PREFETCH_AHEAD} concurrency=${SEGMENT_PREFETCH_CONCURRENCY} cacheTTL=${SEGMENT_CACHE_TTL / 1000}s`);
     console.log(`🩹 segment playerRetry=${SEGMENT_PLAYER_RETRIES} delay=${SEGMENT_PLAYER_RETRY_DELAY_MS}ms`);
-    console.log(`🪟 buffer: retain/serve=${RETAIN_SEGMENTS} liveDelay=${LIVE_DELAY_SEGMENTS}segs prime=${MIN_START_SEGMENTS}segs/${PRIME_TIMEOUT_MS / 1000}s idleStop=${POLLER_IDLE_STOP_MS / 1000}s`);
+    console.log(`🪟 buffer: retain/serve=${RETAIN_SEGMENTS} liveDelay=${LIVE_DELAY_SEGMENTS}segs prime=${MIN_START_SEGMENTS}segs/${PRIME_TIMEOUT_MS / 1000}s minVisible=${MIN_VISIBLE_SEGMENTS} idleStop=${POLLER_IDLE_STOP_MS / 1000}s`);
     console.log(`📺 epg timezone=${EPG_TIME_ZONE} timeout=${EPG_REQUEST_TIMEOUT / 1000}s firstWait=${EPG_FIRST_CATALOG_WAIT_MS / 1000}s retryDelay=${EPG_RETRY_DELAY_MS / 1000}s cacheTTL=${EPG_CACHE_TTL / 1000}s refresh=${EPG_REFRESH_INTERVAL_MS / 1000}s preload=${EPG_PRELOAD_URL ? "on" : "off"} startupWatch=${EPG_STARTUP_WATCH_MS / 1000}s`);
     console.log("=".repeat(60) + "\n");
     startEPGStartupPreload();
