@@ -45,7 +45,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "3.1.1";
+const RELEASE_VERSION = "3.2.0";
 const ADDON_TYPE = "tv";
 const CATALOG_TTL = 30 * 60 * 1000;
 const EPG_CACHE_TTL = Number(process.env.EPG_CACHE_TTL || 6 * 60 * 60 * 1000);
@@ -67,22 +67,24 @@ const EPG_TIME_ZONE = process.env.EPG_TIME_ZONE || "Europe/Rome";
 
 // Manifest retry — fixes Xtream "invalid manifest on first hit" (stream spins up
 // server-side on first request, returns garbage, is valid on retry).
-const MANIFEST_RETRY_WINDOW_MS = Number(process.env.MANIFEST_RETRY_WINDOW_MS || 30000);
+const MANIFEST_RETRY_WINDOW_MS = Number(process.env.MANIFEST_RETRY_WINDOW_MS || 15000);
 const MANIFEST_RETRY_DELAY_MS = Number(process.env.MANIFEST_RETRY_DELAY_MS || 2000);
+const MANIFEST_FORBIDDEN_BACKOFF_MS = Number(process.env.MANIFEST_FORBIDDEN_BACKOFF_MS || 10000);
+const POLL_ERROR_BACKOFF_MS = Number(process.env.POLL_ERROR_BACKOFF_MS || 5000);
 
 // Light read-ahead segment cache — absorbs upstream jitter, does NOT create
 // bandwidth. Kept small and simple on purpose (no Range caching = no corruption).
-const SEGMENT_PREFETCH_AHEAD = Number(process.env.SEGMENT_PREFETCH_AHEAD || 3);
 // Provider exposes max_connections=1, so concurrency 1 by default: in steady state
 // the prefetcher is the ONLY upstream connection and the player reads from cache.
 // (Raising this only helps if your provider tolerates parallel segment fetches.)
 const SEGMENT_PREFETCH_CONCURRENCY = Number(process.env.SEGMENT_PREFETCH_CONCURRENCY || 1);
-const SEGMENT_CACHE_TTL = Number(process.env.SEGMENT_CACHE_TTL || 180 * 1000);
+const SEGMENT_CACHE_TTL = Number(process.env.SEGMENT_CACHE_TTL || 10 * 60 * 1000);
 const SEGMENT_CACHE_MAX_BYTES = Number(process.env.SEGMENT_CACHE_MAX_BYTES || 256 * 1024 * 1024);
 const SEGMENT_CACHE_MAX_ITEMS = Number(process.env.SEGMENT_CACHE_MAX_ITEMS || 48);
 const SEGMENT_CACHE_MAX_ITEM_BYTES = Number(process.env.SEGMENT_CACHE_MAX_ITEM_BYTES || 24 * 1024 * 1024);
 const SEGMENT_PLAYER_RETRIES = Number(process.env.SEGMENT_PLAYER_RETRIES || 2);
 const SEGMENT_PLAYER_RETRY_DELAY_MS = Number(process.env.SEGMENT_PLAYER_RETRY_DELAY_MS || 350);
+const PREFETCH_RETRY_DELAY_MS = Number(process.env.PREFETCH_RETRY_DELAY_MS || 1000);
 const SLOW_SEGMENT_MS = Number(process.env.SLOW_SEGMENT_MS || 4000);
 
 // ── Background poller + retained buffer ─────────────────────────────────────────
@@ -93,19 +95,18 @@ const SLOW_SEGMENT_MS = Number(process.env.SLOW_SEGMENT_MS || 4000);
 // buffer, and (c) prefetches segments. The player is then served a deep window
 // from our buffer. Refreshes stay non-blocking; only the very first open does a
 // short, capped prime wait to build the initial cushion.
-const RETAIN_SEGMENTS = Number(process.env.RETAIN_SEGMENTS || 12);   // ~2min retained & served
-const LIVE_DELAY_SEGMENTS = Math.max(0, Number(process.env.LIVE_DELAY_SEGMENTS ?? 3));
+const RETAIN_SEGMENTS = Number(process.env.RETAIN_SEGMENTS || 18);
+const LIVE_DELAY_SEGMENTS = Math.max(0, Number(process.env.LIVE_DELAY_SEGMENTS ?? 1));
 // Anti-jump limit: advance the served live edge by at most this many segments per
 // request while retained history still exists. If upstream history disappears,
 // catching up is unavoidable.
 const MAX_EDGE_ADVANCE = Number(process.env.MAX_EDGE_ADVANCE || 2);
-const DEFAULT_MIN_START_SEGMENTS = LIVE_DELAY_SEGMENTS + 1;
-const MIN_START_SEGMENTS = Math.max(DEFAULT_MIN_START_SEGMENTS, Number(process.env.MIN_START_SEGMENTS ?? DEFAULT_MIN_START_SEGMENTS)); // initial cushion
-const MIN_VISIBLE_SEGMENTS = Math.max(1, Number(process.env.MIN_VISIBLE_SEGMENTS || 3));
-const PRIME_TIMEOUT_MS = Number(process.env.PRIME_TIMEOUT_MS || 60000);  // max FIRST-open wait
+const MIN_VISIBLE_SEGMENTS = Math.max(1, Number(process.env.MIN_VISIBLE_SEGMENTS || 2));
+const MIN_START_SEGMENTS = Math.max(MIN_VISIBLE_SEGMENTS, Number(process.env.MIN_START_SEGMENTS || 2));
+const PRIME_TIMEOUT_MS = Number(process.env.PRIME_TIMEOUT_MS || 25000);
 const POLLER_IDLE_STOP_MS = Number(process.env.POLLER_IDLE_STOP_MS || 90000); // stop if player gone
-const POLL_MIN_MS = Number(process.env.POLL_MIN_MS || 2000);
-const POLL_MAX_MS = Number(process.env.POLL_MAX_MS || 5000);
+const POLL_MIN_MS = Number(process.env.POLL_MIN_MS || 2500);
+const POLL_MAX_MS = Number(process.env.POLL_MAX_MS || 12000);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // In-memory catalog, EPG and logo caches. Playback state is managed below.
@@ -214,6 +215,11 @@ function getSegmentLabel(sourceUrl) {
     } catch {
         return String(sourceUrl || "").split("?")[0].split("/").filter(Boolean).pop() || "segment";
     }
+}
+
+function getHttpStatus(err) {
+    const status = Number(err?.kronosStatus || err?.response?.status || 0);
+    return Number.isFinite(status) && status > 0 ? status : null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -387,10 +393,6 @@ async function ensureEPGRefresh(epgUrl, options = {}) {
     memoryCache.epgInflight[epgUrl] = promise;
     try { return await promise; }
     finally { delete memoryCache.epgInflight[epgUrl]; }
-}
-
-async function updateEPGCache(epgUrl, options = {}) {
-    return await ensureEPGRefresh(epgUrl, options);
 }
 
 function parseXMLTVBuffer(buffer) {
@@ -775,7 +777,11 @@ async function getChannelsFromCache(configKey, config) {
     if (!cached) return await fetchAndProcessChannels(configKey, config);
     if (!memoryCache.channelIndex[configKey]) memoryCache.channelIndex[configKey] = buildChannelIndex(cached);
     if (Date.now() - (memoryCache.lastUpdate[configKey] || 0) > CATALOG_TTL) {
-        fetchAndProcessChannels(configKey, config).catch(err => console.error("[CATALOG REFRESH]", err.message));
+        // Catalog refreshes are not time-critical. Defer them while a channel is
+        // active so a slow M3U download cannot occupy the provider's single slot.
+        if (!isPlaybackActive()) {
+            fetchAndProcessChannels(configKey, config).catch(err => console.error("[CATALOG REFRESH]", err.message));
+        }
     }
     return cached;
 }
@@ -790,9 +796,13 @@ async function getChannelById(configKey, config, id) {
     return memoryCache.channelIndex[configKey]?.[id] || null;
 }
 
+function isPlaybackActive() {
+    const rt = activeChannelUrl ? channels.get(activeChannelUrl) : null;
+    return !!rt?.running;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// HLS proxy — transparent: fetch, rewrite URLs, return as-is.
-// No buffering, no startup phases, no playlist rebuild, no session machinery.
+// HLS relay
 // ─────────────────────────────────────────────────────────────────────────────
 // ── Upstream connection gate (provider max_connections=1) ───────────────────────
 // EVERY upstream request (playlist polls, segment prefetch, player-demand fetch)
@@ -878,7 +888,13 @@ async function fetchUpstreamHLS(sourceUrl, label = "stream", signal = null) {
             }
         } catch (err) {
             lastErr = err;
+            const status = getHttpStatus(err);
+            if (status) err.kronosStatus = status;
             console.warn(`[HLS RETRY] channel="${label}" attempt=${attempt} reason=${err.message}`);
+            // A 401/403 is normally a provider-side cooldown or session lock.
+            // Retrying it every few seconds only extends the denial window and
+            // steals the single upstream slot from cached segment playback.
+            if (status === 401 || status === 403) throw err;
         }
         const sleepMs = Math.min(MANIFEST_RETRY_DELAY_MS, deadline - Date.now());
         if (sleepMs > 0) await sleep(sleepMs);
@@ -1047,15 +1063,39 @@ async function fetchSegForPlayer(id) {
     }
 }
 
-function queuePrefetch(ids, minAhead = 0) {
-    const ahead = Math.max(SEGMENT_PREFETCH_AHEAD, minAhead);
-    const candidates = ahead > 0 ? ids.slice(-ahead) : [];
+function queuePrefetch(ids) {
+    const candidates = [...new Set(ids)];
     prefetchQueue.splice(0, prefetchQueue.length, ...prefetchQueue.filter(id => candidates.includes(id)));
     candidates.forEach(id => {
         if (getSegFromCache(id) || segInflight.has(id) || prefetchQueue.includes(id)) return;
         prefetchQueue.push(id);
     });
     pumpPrefetch();
+}
+
+function getRuntimePrefetchIds(rt) {
+    const ids = rt.segs.map(s => s.id);
+    if (!ids.length) return [];
+    if (!rt.primedOnce) return ids.slice(-MIN_START_SEGMENTS);
+
+    let startIdx;
+    if (rt.lastRequestedSeq != null) {
+        startIdx = Math.max(0, rt.lastRequestedSeq - rt.seqBase + 1);
+    } else if (rt.servedEdge != null) {
+        startIdx = Math.max(0, rt.servedEdge - rt.seqBase - MIN_VISIBLE_SEGMENTS + 1);
+    } else {
+        startIdx = Math.max(0, ids.length - MIN_START_SEGMENTS);
+    }
+    return ids.slice(Math.min(startIdx, ids.length));
+}
+
+function queueRuntimePrefetch(rt) {
+    queuePrefetch(getRuntimePrefetchIds(rt));
+}
+
+function isActivePrefetchCandidate(id) {
+    const rt = activeChannelUrl ? channels.get(activeChannelUrl) : null;
+    return !!rt?.running && getRuntimePrefetchIds(rt).includes(id);
 }
 
 function pumpPrefetch() {
@@ -1069,7 +1109,17 @@ function pumpPrefetch() {
         prefetchControllers.set(id, controller);
         prefetchActive++;
         fetchSegToCache(id, url, false, controller.signal)
-            .catch(err => console.warn(`[PREFETCH ERR] ${getSegmentLabel(url)} ${err.message}`))
+            .catch(async err => {
+                console.warn(`[PREFETCH ERR] ${getSegmentLabel(url)} ${err.message}`);
+                if (isActivePrefetchCandidate(id) && !prefetchQueue.includes(id)) {
+                    // Keep chronological order after a transient failure. Fetching a
+                    // newer tail first creates cache holes that later stall players.
+                    // Player-demand preemption is also retried unless the segment slid
+                    // out of the active channel while the request was in flight.
+                    prefetchQueue.unshift(id);
+                    await sleep(PREFETCH_RETRY_DELAY_MS);
+                }
+            })
             .finally(() => {
                 prefetchControllers.delete(id);
                 prefetchActive--;
@@ -1331,10 +1381,11 @@ app.get("/:base64Config/poster/:id.svg", async (req, res) => {
 const channels = new Map();      // channelUrl -> runtime
 let activeChannelUrl = null;     // only ONE channel polls upstream (max_connections=1)
 
-function parseSegments(playlist, baseUrl, scope = baseUrl) {
+function parseSegments(playlist, baseUrl, scope = baseUrl, mediaSequence = null) {
     const out = [];
     let dur = 0;
     let discontinuity = false;
+    let segmentOffset = 0;
     for (const raw of String(playlist || "").split(/\r?\n/)) {
         const t = raw.trim();
         if (!t || t.startsWith("#EXT-X-ENDLIST")) continue;
@@ -1350,7 +1401,9 @@ function parseSegments(playlist, baseUrl, scope = baseUrl) {
         if (t.startsWith("#")) continue;
         if (isHlsUrl(t)) continue;   // nested playlist (handled elsewhere)
         const abs = toAbsoluteUrl(t, baseUrl);
-        out.push({ segId: segIdFor(abs, scope), realUrl: abs, duration: dur || 6, discontinuity });
+        const upstreamSeq = Number.isFinite(mediaSequence) ? mediaSequence + segmentOffset : null;
+        out.push({ segId: segIdFor(abs, scope), realUrl: abs, duration: dur || 6, discontinuity, upstreamSeq });
+        segmentOffset++;
         dur = 0;
         discontinuity = false;
     }
@@ -1365,6 +1418,8 @@ function stopPoller(rt, reason) {
     rt.segs = []; rt.byId = new Set(); rt.seqBase = 0; rt.lastSeq = -1; rt.servedEdge = null; rt.primedOnce = false;
     rt.discontinuityBase = 0; rt.pendingDiscontinuity = false;
     rt.lastManifestAt = null; rt.lastSegmentAt = null; rt.segmentRequests = 0;
+    rt.lastRequestedSeq = null; rt.lastUpstreamEndSeq = null;
+    rt.lastPollStatus = null; rt.pollFailures = 0; rt.lastManifestErrorAt = null;
     rt.generation++;
     console.log(`[POLLER STOP] channel="${rt.label}" reason=${reason}`);
 }
@@ -1385,13 +1440,14 @@ function ensureChannel(url, label) {
             target: 6, lastSeq: -1, isMaster: false, lastPlayerAt: Date.now(),
             running: false, timer: null, pollAbort: null, servedEdge: null, primedOnce: false,
             discontinuityBase: 0, pendingDiscontinuity: false,
-            lastManifestAt: null, lastSegmentAt: null, segmentRequests: 0
+            lastManifestAt: null, lastSegmentAt: null, segmentRequests: 0,
+            lastRequestedSeq: null, lastUpstreamEndSeq: null,
+            lastPollStatus: null, pollFailures: 0, lastManifestErrorAt: null
         };
         channels.set(url, rt);
     }
     rt.label = label;
     rt.lastPlayerAt = Date.now();
-    rt.lastManifestAt = Date.now();
     if (!rt.running && !rt.isMaster) {
         rt.running = true;
         console.log(`[POLLER START] channel="${label}"`);
@@ -1407,24 +1463,43 @@ async function pollChannelLoop(rt) {
         if (activeChannelUrl === rt.url) activeChannelUrl = null;
         return;
     }
+    let nextDelay = null;
     try {
         const controller = new AbortController();
         rt.pollAbort = controller;
         const { data, finalUrl, info } = await fetchUpstreamHLS(rt.url, rt.label, controller.signal);
         if (rt.pollAbort === controller) rt.pollAbort = null;
+        rt.lastManifestAt = Date.now();
+        rt.lastPollStatus = 200;
+        rt.pollFailures = 0;
         if (info.isMaster) {
             rt.isMaster = true;
             stopPoller(rt, "master-playlist");   // master is served passthrough, no buffer
             return;
         }
-        if (info.isLive) ingestPlaylist(rt, data, finalUrl, info);
+        // Some on-demand IPTV encoders briefly return a one-segment ENDLIST while
+        // starting. It is still useful media and should not be discarded.
+        if (info.segmentCount > 0) ingestPlaylist(rt, data, finalUrl, info);
     } catch (e) {
         rt.pollAbort = null;
-        if (rt.running) console.warn(`[POLLER ERR] channel="${rt.label}" ${e.message}`);
+        if (rt.running) {
+            const status = getHttpStatus(e);
+            rt.lastPollStatus = status;
+            rt.lastManifestErrorAt = Date.now();
+            rt.pollFailures++;
+            nextDelay = status === 401 || status === 403
+                ? MANIFEST_FORBIDDEN_BACKOFF_MS
+                : POLL_ERROR_BACKOFF_MS;
+            console.warn(`[POLLER ERR] channel="${rt.label}" ${e.message} retryIn=${nextDelay}ms`);
+        }
     }
     if (!rt.running) return;
-    const delay = Math.max(POLL_MIN_MS, Math.min(POLL_MAX_MS, (rt.target || 6) * 500));
-    rt.timer = setTimeout(() => pollChannelLoop(rt), delay);
+    if (nextDelay == null) {
+        const targetMs = Math.max(1, rt.target || 6) * 1000;
+        const factor = rt.primedOnce ? 0.75 : 0.4;
+        nextDelay = Math.max(POLL_MIN_MS, Math.min(POLL_MAX_MS, Math.round(targetMs * factor)));
+    }
+    rt.timer = setTimeout(() => pollChannelLoop(rt), nextDelay);
     if (rt.timer.unref) rt.timer.unref();
 }
 
@@ -1442,12 +1517,22 @@ function ingestPlaylist(rt, playlist, baseUrl, info) {
         // of "jumping to the beginning". New generation keeps stale cache out.
         rt.seqBase = rt.seqBase + rt.segs.length;
         rt.segs = []; rt.byId = new Set(); rt.primedOnce = false; rt.pendingDiscontinuity = true;
+        rt.lastRequestedSeq = null; rt.lastUpstreamEndSeq = null; rt.servedEdge = null;
         console.log(`[CHANNEL RESTART] channel="${rt.label}" seq ${rt.lastSeq}->${seq} gen=${rt.generation} continuing seqBase=${rt.seqBase}`);
     }
     rt.lastSeq = seq;
 
+    const parsed = parseSegments(playlist, baseUrl, rt.url, Number.isFinite(info.mediaSequence) ? info.mediaSequence : null);
+    const firstUpstreamSeq = parsed.find(s => s.upstreamSeq != null)?.upstreamSeq;
+    const lastUpstreamSeq = [...parsed].reverse().find(s => s.upstreamSeq != null)?.upstreamSeq;
+    if (rt.lastUpstreamEndSeq != null && firstUpstreamSeq != null && firstUpstreamSeq > rt.lastUpstreamEndSeq + 1) {
+        const missing = firstUpstreamSeq - rt.lastUpstreamEndSeq - 1;
+        rt.pendingDiscontinuity = true;
+        console.warn(`[CHANNEL GAP] channel="${rt.label}" missing=${missing} upstreamSeq=${rt.lastUpstreamEndSeq}->${firstUpstreamSeq}`);
+    }
+
     let added = 0;
-    for (const s of parseSegments(playlist, baseUrl, rt.url)) {
+    for (const s of parsed) {
         const id = `g${rt.generation}:${s.segId}`;
         registerSeg(id, s.realUrl);          // always refresh the token-bearing URL
         if (!rt.byId.has(id)) {
@@ -1457,6 +1542,9 @@ function ingestPlaylist(rt, playlist, baseUrl, info) {
             added++;
         }
     }
+    if (lastUpstreamSeq != null) {
+        rt.lastUpstreamEndSeq = Math.max(rt.lastUpstreamEndSeq ?? lastUpstreamSeq, lastUpstreamSeq);
+    }
     while (rt.segs.length > RETAIN_SEGMENTS) {
         const dropped = rt.segs.shift();
         rt.byId.delete(dropped.id);
@@ -1464,7 +1552,7 @@ function ingestPlaylist(rt, playlist, baseUrl, info) {
         rt.seqBase++;
     }
     if (added > 0) {
-        queuePrefetch(rt.segs.map(s => s.id), rt.primedOnce ? LIVE_DELAY_SEGMENTS + 1 : MIN_START_SEGMENTS);
+        queueRuntimePrefetch(rt);
         console.log(`[BUFFER] channel="${rt.label}" +${added} depth=${rt.segs.length}/${RETAIN_SEGMENTS} seqBase=${rt.seqBase} cache=${segCache.size}/${formatBytes(segCacheBytes)} prefetch=${prefetchActive}+${prefetchQueue.length}`);
     }
 }
@@ -1472,39 +1560,35 @@ function ingestPlaylist(rt, playlist, baseUrl, info) {
 function buildServedPlaylist(rt, hostBase, configKey) {
     const lo = rt.seqBase;
     const hi = rt.seqBase + rt.segs.length - 1;
-    const warmTail = getWarmTailCount(rt);
-    const warmRun = getLatestWarmRun(rt);
-    let desiredIdx = warmRun.count >= LIVE_DELAY_SEGMENTS + 1
-        ? warmRun.end - LIVE_DELAY_SEGMENTS
-        : warmRun.end;
-    if (warmRun.count > 0 && desiredIdx + 1 < MIN_VISIBLE_SEGMENTS) {
-        // After an upstream encoder restart we intentionally keep MEDIA-SEQUENCE
-        // moving forward, so retained history is empty. A strict live delay would
-        // expose a 1-segment playlist even though several warm segments exist ahead,
-        // which makes some players stall. Temporarily reduce the delay until the
-        // retained window grows again.
-        desiredIdx = Math.min(warmRun.end, MIN_VISIBLE_SEGMENTS - 1);
-    }
+    const warmRun = getPlaybackWarmRun(rt);
+    const desiredIdx = getDelayedWarmEdgeIndex(warmRun);
     const delayedHi = rt.seqBase + Math.max(0, desiredIdx);
 
     // ANTI-JUMP: advance the served live edge by at most MAX_EDGE_ADVANCE per request,
-    // capped at a deliberately delayed warm edge. If the cushion shrinks, hold the
-    // current edge instead of moving backward; the poller can rebuild it over time.
-    if (rt.servedEdge == null || rt.servedEdge > hi) rt.servedEdge = delayedHi;
-    else if (rt.servedEdge < lo) rt.servedEdge = lo;
+    // capped at a deliberately delayed CONTIGUOUS warm edge. If a cache hole exists,
+    // hold the current edge instead of advertising a segment that is not ready.
+    const servedIdx = rt.servedEdge == null ? -1 : rt.servedEdge - rt.seqBase;
+    const servedIsWarm = servedIdx >= warmRun.start && servedIdx <= warmRun.end
+        && !!getSegFromCache(rt.segs[servedIdx]?.id);
+    if (rt.servedEdge == null || rt.servedEdge > hi || rt.servedEdge < lo || !servedIsWarm) {
+        rt.servedEdge = delayedHi;
+    }
     else if (delayedHi > rt.servedEdge) rt.servedEdge = Math.min(delayedHi, rt.servedEdge + MAX_EDGE_ADVANCE);
 
     const endIdx = rt.servedEdge - rt.seqBase;
-    const startIdx = Math.max(0, endIdx - RETAIN_SEGMENTS + 1);   // full retained depth behind edge
+    const activeRun = getWarmRunContainingIndex(rt, endIdx) || warmRun;
+    const startIdx = Math.max(activeRun.start, endIdx - RETAIN_SEGMENTS + 1);
     const win = rt.segs.slice(startIdx, endIdx + 1);
     const mediaSeq = rt.seqBase + startIdx;
+    const discontinuitySequence = rt.discontinuityBase
+        + rt.segs.slice(0, startIdx).filter(s => s.discontinuity).length;
     const target = Math.max(1, Math.ceil(Math.max(rt.target || 6, ...win.map(s => s.duration || 0))));
     const lines = [
         "#EXTM3U",
         "#EXT-X-VERSION:3",
         `#EXT-X-TARGETDURATION:${target}`,
         `#EXT-X-MEDIA-SEQUENCE:${mediaSeq}`,
-        `#EXT-X-DISCONTINUITY-SEQUENCE:${rt.discontinuityBase}`
+        `#EXT-X-DISCONTINUITY-SEQUENCE:${discontinuitySequence}`
     ];
     for (const s of win) {
         if (s.discontinuity) lines.push("#EXT-X-DISCONTINUITY");
@@ -1513,19 +1597,16 @@ function buildServedPlaylist(rt, hostBase, configKey) {
     }
     return {
         playlist: lines.join("\n") + "\n",
-        count: win.length, mediaSeq, edge: rt.servedEdge, hi, warmTail,
-        readyAhead: Math.max(0, warmRun.end - endIdx)
+        count: win.length, mediaSeq, edge: rt.servedEdge, hi, warmRun: warmRun.count,
+        readyAhead: Math.max(0, activeRun.end - endIdx)
     };
 }
 
 function getServeReadiness(rt) {
-    const warmRun = getLatestWarmRun(rt);
+    const warmRun = getPlaybackWarmRun(rt);
     if (warmRun.count <= 0) return { ready: false, window: 0, readyAhead: 0 };
-    let edgeIdx = warmRun.count >= LIVE_DELAY_SEGMENTS + 1
-        ? warmRun.end - LIVE_DELAY_SEGMENTS
-        : warmRun.end;
-    if (edgeIdx + 1 < MIN_VISIBLE_SEGMENTS) edgeIdx = Math.min(warmRun.end, MIN_VISIBLE_SEGMENTS - 1);
-    const window = edgeIdx + 1;
+    const edgeIdx = getDelayedWarmEdgeIndex(warmRun);
+    const window = edgeIdx - warmRun.start + 1;
     const readyAhead = Math.max(0, warmRun.end - edgeIdx);
     return {
         ready: window >= MIN_VISIBLE_SEGMENTS && warmRun.count >= MIN_START_SEGMENTS,
@@ -1538,15 +1619,6 @@ function setPlaylistHeaders(res) {
     res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, no-transform");
     res.setHeader("Pragma", "no-cache");
-}
-
-function getWarmTailCount(rt) {
-    let count = 0;
-    for (let i = rt.segs.length - 1; i >= 0; i--) {
-        if (!getSegFromCache(rt.segs[i].id)) break;
-        count++;
-    }
-    return count;
 }
 
 function getLatestWarmIndex(rt) {
@@ -1564,6 +1636,35 @@ function getLatestWarmRun(rt) {
     return { start, end, count: end - start + 1 };
 }
 
+function getWarmRunContainingIndex(rt, index) {
+    if (index < 0 || index >= rt.segs.length || !getSegFromCache(rt.segs[index]?.id)) {
+        return null;
+    }
+    let start = index;
+    let end = index;
+    while (start > 0 && getSegFromCache(rt.segs[start - 1].id)) start--;
+    while (end + 1 < rt.segs.length && getSegFromCache(rt.segs[end + 1].id)) end++;
+    return { start, end, count: end - start + 1 };
+}
+
+function getPlaybackWarmRun(rt) {
+    const servedIdx = rt.servedEdge == null ? -1 : rt.servedEdge - rt.seqBase;
+    const servedRun = getWarmRunContainingIndex(rt, servedIdx);
+    if (servedRun) return servedRun;
+
+    const requestedIdx = rt.lastRequestedSeq == null ? -1 : rt.lastRequestedSeq - rt.seqBase;
+    const requestedRun = getWarmRunContainingIndex(rt, requestedIdx);
+    return requestedRun || getLatestWarmRun(rt);
+}
+
+function getDelayedWarmEdgeIndex(warmRun) {
+    if (!warmRun || warmRun.count <= 0) return -1;
+    let edge = Math.max(warmRun.start, warmRun.end - LIVE_DELAY_SEGMENTS);
+    const minVisibleEdge = warmRun.start + MIN_VISIBLE_SEGMENTS - 1;
+    if (edge < minVisibleEdge) edge = Math.min(warmRun.end, minVisibleEdge);
+    return edge;
+}
+
 app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
     const t0 = Date.now();
     try {
@@ -1574,10 +1675,10 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         const host = getPublicHost(req);
 
         const rt = ensureChannel(ch.url, ch.name);
-        const warmTail = getWarmTailCount(rt);
+        const warmRun = getPlaybackWarmRun(rt).count;
         const fresh = !rt.primedOnce && !rt.isMaster;
         const readiness = getServeReadiness(rt);
-        console.log(`[HLS OPEN] channel="${ch.name}" resolve=${Date.now() - t0}ms depth=${rt.segs.length} warmTail=${warmTail}/${MIN_START_SEGMENTS} serveWindow=${readiness.window}/${MIN_VISIBLE_SEGMENTS} readyAhead=${readiness.readyAhead}/${LIVE_DELAY_SEGMENTS} ${fresh ? "(priming…)" : "(buffer ready)"}`);
+        console.log(`[HLS OPEN] channel="${ch.name}" resolve=${Date.now() - t0}ms depth=${rt.segs.length} warmRun=${warmRun}/${MIN_START_SEGMENTS} serveWindow=${readiness.window}/${MIN_VISIBLE_SEGMENTS} readyAhead=${readiness.readyAhead}/${LIVE_DELAY_SEGMENTS} ${fresh ? "(priming…)" : "(buffer ready)"}`);
 
         // FIRST open only: short, capped wait for the initial cushion. Re-opens and
         // continuous polls never block here — the buffer is already deep — so the
@@ -1608,11 +1709,11 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         }
         rt.primedOnce = true;
 
-        const { playlist, count, mediaSeq, edge, hi, warmTail: servedWarmTail, readyAhead } = buildServedPlaylist(rt, host, configKey);
+        const { playlist, count, mediaSeq, edge, hi, warmRun: servedWarmRun, readyAhead } = buildServedPlaylist(rt, host, configKey);
         setPlaylistHeaders(res);
         const segmentIdle = rt.lastSegmentAt ? `${Date.now() - rt.lastSegmentAt}ms` : "never";
         const degraded = readyAhead < LIVE_DELAY_SEGMENTS;
-        console.log(`[HLS SERVE] channel="${ch.name}" window=${count} seq=${mediaSeq} edge=${edge}/${hi} held=${hi - edge}/${LIVE_DELAY_SEGMENTS} readyAhead=${readyAhead} warmTail=${servedWarmTail}${degraded ? " degraded=1" : ""} gen=${rt.generation} segmentIdle=${segmentIdle} segmentReq=${rt.segmentRequests} cache=${segCache.size}/${formatBytes(segCacheBytes)} prefetch=${prefetchActive}+${prefetchQueue.length} waited=${Date.now() - t0}ms`);
+        console.log(`[HLS SERVE] channel="${ch.name}" window=${count} seq=${mediaSeq} edge=${edge}/${hi} held=${hi - edge}/${LIVE_DELAY_SEGMENTS} readyAhead=${readyAhead} warmRun=${servedWarmRun}${degraded ? " degraded=1" : ""} gen=${rt.generation} segmentIdle=${segmentIdle} segmentReq=${rt.segmentRequests} cache=${segCache.size}/${formatBytes(segCacheBytes)} prefetch=${prefetchActive}+${prefetchQueue.length} waited=${Date.now() - t0}ms`);
         res.send(playlist);
     } catch (err) {
         console.error(`[HLS ERROR] ${err.message}`);
@@ -1675,6 +1776,12 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
                 activeRt.lastPlayerAt = Date.now();
                 activeRt.lastSegmentAt = Date.now();
                 activeRt.segmentRequests++;
+                const segmentIdx = activeRt.segs.findIndex(segment => segment.id === segId);
+                if (segmentIdx >= 0) {
+                    const requestedSeq = activeRt.seqBase + segmentIdx;
+                    activeRt.lastRequestedSeq = Math.max(activeRt.lastRequestedSeq ?? requestedSeq, requestedSeq);
+                }
+                queueRuntimePrefetch(activeRt);
             }
             const cached = getSegFromCache(segId);
             if (cached) return sendCachedSeg(req, res, cached, segId, "HIT");
@@ -1686,7 +1793,6 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
                 console.warn(`[SEG STALE] ${getSegmentLabel(sourceUrl)} refresh playlist`);
                 return res.status(410).end();
             }
-            activeRt.lastPlayerAt = Date.now();
             const wasInflight = segInflight.has(segId);
             const entry = await fetchSegForPlayer(segId);
             if (entry) return sendCachedSeg(req, res, entry, segId, wasInflight ? "WAIT" : "MISS");
@@ -1846,10 +1952,12 @@ app.get("/:base64Config/stats", (req, res) => {
             label: rt.label, depth: rt.segs.length, seqBase: rt.seqBase, generation: rt.generation,
             running: rt.running, isMaster: rt.isMaster, idleMs: Date.now() - rt.lastPlayerAt,
             servedEdge: rt.servedEdge, knownEdge: rt.seqBase + rt.segs.length - 1,
-            warmTail: getWarmTailCount(rt), primedOnce: rt.primedOnce,
+            warmRun: getPlaybackWarmRun(rt).count, primedOnce: rt.primedOnce,
             manifestIdleMs: rt.lastManifestAt ? Date.now() - rt.lastManifestAt : null,
+            manifestErrorIdleMs: rt.lastManifestErrorAt ? Date.now() - rt.lastManifestErrorAt : null,
+            lastPollStatus: rt.lastPollStatus, pollFailures: rt.pollFailures,
             segmentIdleMs: rt.lastSegmentAt ? Date.now() - rt.lastSegmentAt : null,
-            segmentRequests: rt.segmentRequests
+            segmentRequests: rt.segmentRequests, lastRequestedSeq: rt.lastRequestedSeq
         })),
         activeChannel: activeChannelUrl ? (channels.get(activeChannelUrl)?.label || "?") : null
     });
@@ -1862,7 +1970,7 @@ app.get("/:base64Config/debug", async (req, res) => {
         const channels = await getChannelsFromCache(configKey, config);
         res.json({
             version: RELEASE_VERSION,
-            mode: "transparent-proxy",
+            mode: "buffered-hls-relay",
             config: {
                 hasUrl: !!config.u,
                 hasMultiLists: Array.isArray(config.l),
@@ -1887,7 +1995,8 @@ app.get("/:base64Config/debug", async (req, res) => {
             groups: [...new Set(channels.map(c => c.group))].slice(0, 50),
             constants: {
                 ADDON_TYPE, RELEASE_VERSION, HLS_REQUEST_TIMEOUT, SEG_REQUEST_TIMEOUT,
-                LIVE_DELAY_SEGMENTS, MIN_START_SEGMENTS, MIN_VISIBLE_SEGMENTS, PRIME_TIMEOUT_MS, RETAIN_SEGMENTS
+                LIVE_DELAY_SEGMENTS, MIN_START_SEGMENTS, MIN_VISIBLE_SEGMENTS, PRIME_TIMEOUT_MS, RETAIN_SEGMENTS,
+                MANIFEST_FORBIDDEN_BACKOFF_MS, POLL_ERROR_BACKOFF_MS, POLL_MIN_MS, POLL_MAX_MS
             }
         });
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -1896,13 +2005,14 @@ app.get("/:base64Config/debug", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 app.listen(PORT, "0.0.0.0", () => {
     console.log("\n" + "=".repeat(60));
-    console.log(`K.R.O.N.O.S. ${RELEASE_VERSION} - transparent-proxy mode`);
+    console.log(`K.R.O.N.O.S. ${RELEASE_VERSION} - buffered HLS relay`);
     console.log("=".repeat(60));
     console.log(`🌐 http://0.0.0.0:${PORT}`);
     console.log(`📦 Node ${process.version}`);
     console.log(`🔁 manifest retryWindow=${MANIFEST_RETRY_WINDOW_MS / 1000}s delay=${MANIFEST_RETRY_DELAY_MS / 1000}s`);
+    console.log(`⛔ manifest forbiddenBackoff=${MANIFEST_FORBIDDEN_BACKOFF_MS / 1000}s pollErrorBackoff=${POLL_ERROR_BACKOFF_MS / 1000}s poll=${POLL_MIN_MS}-${POLL_MAX_MS}ms`);
     console.log(`📋 playlist retryWindow=${PLAYLIST_RETRY_WINDOW_MS / 1000}s delay=${PLAYLIST_RETRY_DELAY_MS / 1000}s`);
-    console.log(`⏩ prefetch ahead=${SEGMENT_PREFETCH_AHEAD} concurrency=${SEGMENT_PREFETCH_CONCURRENCY} cacheTTL=${SEGMENT_CACHE_TTL / 1000}s`);
+    console.log(`⏩ prefetch concurrency=${SEGMENT_PREFETCH_CONCURRENCY} cacheTTL=${SEGMENT_CACHE_TTL / 1000}s`);
     console.log(`🩹 segment playerRetry=${SEGMENT_PLAYER_RETRIES} delay=${SEGMENT_PLAYER_RETRY_DELAY_MS}ms`);
     console.log(`🪟 buffer: retain/serve=${RETAIN_SEGMENTS} liveDelay=${LIVE_DELAY_SEGMENTS}segs prime=${MIN_START_SEGMENTS}segs/${PRIME_TIMEOUT_MS / 1000}s minVisible=${MIN_VISIBLE_SEGMENTS} idleStop=${POLLER_IDLE_STOP_MS / 1000}s`);
     console.log(`📺 epg timezone=${EPG_TIME_ZONE} timeout=${EPG_REQUEST_TIMEOUT / 1000}s firstWait=${EPG_FIRST_CATALOG_WAIT_MS / 1000}s retryDelay=${EPG_RETRY_DELAY_MS / 1000}s cacheTTL=${EPG_CACHE_TTL / 1000}s refresh=${EPG_REFRESH_INTERVAL_MS / 1000}s preload=${EPG_PRELOAD_URL ? "on" : "off"} startupWatch=${EPG_STARTUP_WATCH_MS / 1000}s`);
