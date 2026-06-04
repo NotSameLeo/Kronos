@@ -255,11 +255,12 @@ async function main() {
             PREFETCH_RETRY_DELAY_MS: "30",
             MANIFEST_FORBIDDEN_BACKOFF_MS: "220",
             POLL_ERROR_BACKOFF_MS: "80",
-            LIVE_DELAY_SEGMENTS: "1",
-            MIN_START_SEGMENTS: "2",
+            LIVE_DELAY_SEGMENTS: "2",
+            MIN_START_SEGMENTS: "4",
             MIN_VISIBLE_SEGMENTS: "2",
-            PRIME_TIMEOUT_MS: "1600",
+            PRIME_WAIT_MS: "120",
             RETAIN_SEGMENTS: "18",
+            SERVE_SEGMENTS: "5",
             POLL_MIN_MS: "70",
             POLL_MAX_MS: "110",
             POLLER_IDLE_STOP_MS: "900",
@@ -314,6 +315,7 @@ async function main() {
         for (let i = 0; i < rounds; i++) {
             const playlist = await readManifest(id);
             assert(playlist.segments.length > 0, "served playlist is empty");
+            assert(playlist.segments.length <= 5, "served playlist exceeded its visible window");
             assert(playlist.edge >= maxServedEdge || id !== "A", "served timeline moved backward");
             if (id === "A") maxServedEdge = Math.max(maxServedEdge, playlist.edge);
             const newest = playlist.segments.at(-1);
@@ -330,7 +332,7 @@ async function main() {
             await readManifest(id);
             const stats = await (await request(statsUrl)).json();
             const active = stats.channels.find(channel => channel.label === `STRESS ${id} HD`);
-            if (active?.warmRun >= 3 && active.knownEdge - active.servedEdge >= 1) return stats;
+            if (active?.warmRun >= 4 && active.knownEdge - active.servedEdge >= 2) return stats;
             await sleep(40);
         }
         throw new Error(`warm cushion did not recover for ${id}`);
@@ -348,14 +350,24 @@ async function main() {
     try {
         await waitForHealth();
 
+        const placeholder = await readManifest("A");
+        assert.equal(placeholder.segments.length, 3, "startup placeholder has the wrong segment count");
+        assert(placeholder.segments.every(segment => segment.includes("/black.ts")), "startup did not return placeholder media");
+        assert(maxInitialManifestMs < 700, `initial placeholder took too long (${maxInitialManifestMs}ms)`);
+        for (const segment of placeholder.segments) {
+            await fetchSegment(new URL(segment, kronosOrigin).toString());
+        }
+
+        let stats = await waitForCushion("A");
         const initial = await readManifest("A");
         assert(initial.segments.length > 0, "initial delayed playlist is empty");
-        assert(maxInitialManifestMs < 1800, `initial manifest took too long (${maxInitialManifestMs}ms)`);
+        assert(initial.segments.length <= 5, "initial real playlist exceeded its visible window");
+        assert(initial.segments.every(segment => !segment.includes("/black.ts")), "real playlist still contains placeholder media");
+        assert(initial.discontinuities > 0, "placeholder transition was not marked as a discontinuity");
         await assertManifestCached(initial);
-        let stats = await (await request(statsUrl)).json();
         const active = stats.channels.find(channel => channel.label === "STRESS A HD");
         assert(active, "missing active channel stats");
-        assert(active.warmRun >= 2, "startup did not prime two warm segments");
+        assert(active.warmRun >= 4, "startup did not prime a protected warm cushion");
 
         const demandMissUrl = seq => {
             const upstreamSegment = `${upstreamOrigin}/hlsr/test-token/A/0/A_${seq}.ts`;
@@ -397,7 +409,8 @@ async function main() {
         await sleep(250);
         const restarted = await readManifest("A");
         assert(restarted.discontinuities > 0, "encoder restart was not marked as an HLS discontinuity");
-        assert(restarted.segments.length >= 3, "encoder restart exposed too small a visible playlist");
+        assert(restarted.segments.length >= 2, "encoder restart exposed too small a visible playlist");
+        assert(restarted.segments.length <= 5, "encoder restart exceeded the visible playlist limit");
         await consume("A", 12, 70);
 
         await readManifest("B");
@@ -453,6 +466,8 @@ async function main() {
         await fetchSegment(new URL(nested.segments[0], kronosOrigin).toString());
 
         const text = logs.join("");
+        assert(text.includes("[HLS PLACEHOLDER]"), "startup placeholder path was not exercised");
+        assert(text.includes("[HLS TRANSITION]"), "placeholder transition path was not exercised");
         assert(text.includes("[HLS RETRY]"), "manifest retry path was not exercised");
         assert(text.includes("[POLLER ERR]"), "manifest poller recovery path was not exercised");
         assert(text.includes("[SEG RETRY]"), "segment retry path was not exercised");
@@ -471,7 +486,7 @@ async function main() {
             manifestRequestsDuringForbidden: mock.state.manifestRequestsDuringForbidden,
             cache: stats.cache,
             activeChannel: activeAfter,
-            exercised: ["token-rotation", "invalid-manifest", "geo-403", "sustained-403-gap", "slow-segments", "aborted-segment", "x2-consumption", "encoder-restart", "zapping", "idle-reopen", "direct-stream-gate", "master-playlist"]
+            exercised: ["startup-placeholder", "bounded-visible-window", "token-rotation", "invalid-manifest", "geo-403", "sustained-403-gap", "slow-segments", "aborted-segment", "x2-consumption", "encoder-restart", "zapping", "idle-reopen", "direct-stream-gate", "master-playlist"]
         }, null, 2));
     } catch (err) {
         console.error(logs.join(""));
