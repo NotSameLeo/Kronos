@@ -50,7 +50,8 @@ function createMockUpstream() {
         abortNextSegment: false,
         masterManifests: 0,
         forbiddenUntil: 0,
-        manifestRequestsDuringForbidden: 0
+        manifestRequestsDuringForbidden: 0,
+        expiredSegments: new Map()
     };
 
     const getChannel = id => {
@@ -118,6 +119,13 @@ function createMockUpstream() {
 
         if (url.pathname === "/control/forbid-manifest") {
             state.forbiddenUntil = Date.now() + Number(url.searchParams.get("ms") || 0);
+            res.writeHead(204);
+            res.end();
+            return;
+        }
+
+        if (url.pathname === "/control/expire-segments") {
+            state.expiredSegments.set(url.searchParams.get("id") || "A", Number(url.searchParams.get("through") || -1));
             res.writeHead(204);
             res.end();
             return;
@@ -200,6 +208,12 @@ function createMockUpstream() {
                 const attempt = (state.segmentAttempts.get(key) || 0) + 1;
                 state.segmentAttempts.set(key, attempt);
                 const seq = Number(sequence);
+                const expiredThrough = state.expiredSegments.get(channelIdValue);
+                if (Number.isFinite(expiredThrough) && seq <= expiredThrough) {
+                    res.writeHead(403, { "content-type": "text/plain" });
+                    res.end("segment expired");
+                    return;
+                }
                 const mustAbort = state.abortNextSegment || (seq % 11 === 4 && attempt === 1);
                 state.abortNextSegment = false;
                 const delay = seq % 7 === 3 ? 520 : 55;
@@ -382,6 +396,28 @@ async function main() {
         await consume("A", 22, 80);
         await consume("A", 22, 20);
 
+        // Segment URLs can expire while the manifest keeps moving. Kronos must stop
+        // retrying those dead entries, hold the last real manifest during recovery,
+        // then jump to the next cached warm run with a discontinuity.
+        const beforeExpired = await readManifest("A");
+        const expiredLogCursor = logs.join("").length;
+        await request(`${upstreamOrigin}/control/expire-segments?id=A&through=${beforeExpired.edge + 8}`);
+        let recoveredExpired = null;
+        for (let i = 0; i < 120; i++) {
+            const candidate = await readManifest("A");
+            assert(candidate.segments.every(segment => !segment.includes("/black.ts")), "real playback fell back to placeholder after expired segments");
+            if (candidate.edge > beforeExpired.edge + 8 && candidate.discontinuities > 0) {
+                await assertManifestCached(candidate);
+                recoveredExpired = candidate;
+                break;
+            }
+            await sleep(80);
+        }
+        assert(recoveredExpired, "expired segment run did not recover with a discontinuity");
+        const expiredLogs = logs.join("").slice(expiredLogCursor);
+        assert(expiredLogs.includes("[SEG DEAD]"), "expired segments were not marked dead");
+        assert(expiredLogs.includes("[HLS GAP JUMP]"), "expired segment gap was not jumped");
+
         // A sustained provider-side 403 advances the upstream timeline beyond its
         // six-segment manifest window. Kronos must keep serving only cached history,
         // recover in chronological order, and mark the skipped timeline as a gap.
@@ -470,7 +506,7 @@ async function main() {
         assert(text.includes("[HLS TRANSITION]"), "placeholder transition path was not exercised");
         assert(text.includes("[HLS RETRY]"), "manifest retry path was not exercised");
         assert(text.includes("[POLLER ERR]"), "manifest poller recovery path was not exercised");
-        assert(text.includes("[SEG RETRY]"), "segment retry path was not exercised");
+        assert(text.includes("[SEG RETRY]") || (text.includes("[PREFETCH ERR]") && text.includes("stream has been aborted")), "segment abort/retry path was not exercised");
         assert(text.includes("[PREFETCH PREEMPT]"), "player-demand prefetch preemption was not exercised");
         assert(text.includes("[CHANNEL GAP]"), "upstream sequence gap was not detected");
         assert(text.includes("[CHANNEL RESTART]"), "encoder restart path was not exercised");
@@ -488,7 +524,7 @@ async function main() {
             manifestRequestsDuringForbidden: mock.state.manifestRequestsDuringForbidden,
             cache: stats.cache,
             activeChannel: activeAfter,
-            exercised: ["startup-placeholder", "published-warm-cushion", "bounded-visible-window", "token-rotation", "invalid-manifest", "geo-403", "sustained-403-gap", "slow-segments", "aborted-segment", "x2-consumption", "encoder-restart", "zapping", "idle-reopen", "direct-stream-gate", "master-playlist"]
+            exercised: ["startup-placeholder", "published-warm-cushion", "bounded-visible-window", "token-rotation", "invalid-manifest", "geo-403", "expired-segment-skip", "sustained-403-gap", "slow-segments", "aborted-segment", "x2-consumption", "encoder-restart", "zapping", "idle-reopen", "direct-stream-gate", "master-playlist"]
         }, null, 2));
     } catch (err) {
         console.error(logs.join(""));

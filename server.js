@@ -45,7 +45,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "3.2.2";
+const RELEASE_VERSION = "3.2.3";
 const ADDON_TYPE = "tv";
 const CATALOG_TTL = 30 * 60 * 1000;
 const EPG_CACHE_TTL = Number(process.env.EPG_CACHE_TTL || 6 * 60 * 60 * 1000);
@@ -930,10 +930,15 @@ function segIdFor(absUrl, scope = "") {
 }
 
 function registerSeg(id, absUrl) {
+    const previous = segRegistry.get(id);
     segRegistry.set(id, absUrl);
+    if (previous !== absUrl) deadSegIds.delete(id);
     if (segRegistry.size > SEG_REGISTRY_MAX) {
         const oldest = segRegistry.keys().next().value;   // oldest insertion = slid-out segment
-        if (oldest !== undefined && oldest !== id) segRegistry.delete(oldest);
+        if (oldest !== undefined && oldest !== id) {
+            segRegistry.delete(oldest);
+            deadSegIds.delete(oldest);
+        }
     }
 }
 
@@ -968,6 +973,7 @@ function rewriteHLSUrls(playlist, baseUrl, hostBase, configKey, scope = baseUrl)
 // ── Segment cache, keyed by stable segId (full 200 only; Range bypasses) ────────
 const segCache = new Map();       // segId -> { buffer, headers, status, size, fetchedAt }
 const segInflight = new Map();    // segId -> Promise<entry|null>
+const deadSegIds = new Set();     // segIds that upstream already expired (403/404/410)
 let segCacheBytes = 0;
 let prefetchActive = 0;
 const prefetchQueue = [];
@@ -988,6 +994,7 @@ function getSegFromCache(id) {
 function storeSeg(id, buffer, headers, status) {
     if (status !== 200) return;                       // never cache 206/partial
     if (!Buffer.isBuffer(buffer) || buffer.length <= 0 || buffer.length > SEGMENT_CACHE_MAX_ITEM_BYTES) return;
+    deadSegIds.delete(id);
     const existing = segCache.get(id);
     if (existing) segCacheBytes -= existing.size;
     const keep = {};
@@ -995,6 +1002,14 @@ function storeSeg(id, buffer, headers, status) {
     segCache.set(id, { buffer, headers: keep, status, size: buffer.length, fetchedAt: Date.now() });
     segCacheBytes += buffer.length;
     evictSegCache();
+}
+
+function markDeadSeg(id, reason) {
+    if (!id || deadSegIds.has(id)) return;
+    deadSegIds.add(id);
+    const idx = prefetchQueue.indexOf(id);
+    if (idx >= 0) prefetchQueue.splice(idx, 1);
+    console.warn(`[SEG DEAD] ${getSegmentLabel(segRegistry.get(id) || id)} reason=${reason}`);
 }
 
 function evictSegCache() {
@@ -1068,10 +1083,10 @@ async function fetchSegForPlayer(id) {
 }
 
 function queuePrefetch(ids) {
-    const candidates = [...new Set(ids)];
+    const candidates = [...new Set(ids)].filter(id => !deadSegIds.has(id));
     prefetchQueue.splice(0, prefetchQueue.length, ...prefetchQueue.filter(id => candidates.includes(id)));
     candidates.forEach(id => {
-        if (getSegFromCache(id) || segInflight.has(id) || prefetchQueue.includes(id)) return;
+        if (deadSegIds.has(id) || getSegFromCache(id) || segInflight.has(id) || prefetchQueue.includes(id)) return;
         prefetchQueue.push(id);
     });
     pumpPrefetch();
@@ -1080,7 +1095,7 @@ function queuePrefetch(ids) {
 function getRuntimePrefetchIds(rt) {
     const ids = rt.segs.map(s => s.id);
     if (!ids.length) return [];
-    if (!rt.primedOnce) return ids.slice(-MIN_START_SEGMENTS);
+    if (!rt.primedOnce) return ids.slice(-MIN_START_SEGMENTS).filter(id => !deadSegIds.has(id));
 
     let startIdx;
     if (rt.lastRequestedSeq != null) {
@@ -1090,7 +1105,7 @@ function getRuntimePrefetchIds(rt) {
     } else {
         startIdx = Math.max(0, ids.length - MIN_START_SEGMENTS);
     }
-    return ids.slice(Math.min(startIdx, ids.length));
+    return ids.slice(Math.min(startIdx, ids.length)).filter(id => !deadSegIds.has(id));
 }
 
 function queueRuntimePrefetch(rt) {
@@ -1106,7 +1121,7 @@ function pumpPrefetch() {
     if (playerDemandIds.size > 0) return;
     while (prefetchActive < SEGMENT_PREFETCH_CONCURRENCY && prefetchQueue.length > 0) {
         const id = prefetchQueue.shift();
-        if (getSegFromCache(id) || segInflight.has(id)) continue;
+        if (deadSegIds.has(id) || getSegFromCache(id) || segInflight.has(id)) continue;
         const url = segRegistry.get(id);
         if (!url) continue;
         const controller = new AbortController();
@@ -1115,6 +1130,11 @@ function pumpPrefetch() {
         fetchSegToCache(id, url, false, controller.signal)
             .catch(async err => {
                 console.warn(`[PREFETCH ERR] ${getSegmentLabel(url)} ${err.message}`);
+                const status = getHttpStatus(err);
+                if (status === 401 || status === 403 || status === 404 || status === 410) {
+                    markDeadSeg(id, `status-${status}`);
+                    return;
+                }
                 if (isActivePrefetchCandidate(id) && !prefetchQueue.includes(id)) {
                     // Keep chronological order after a transient failure. Fetching a
                     // newer tail first creates cache holes that later stall players.
@@ -1419,7 +1439,7 @@ function stopPoller(rt, reason) {
     if (rt.timer) { clearTimeout(rt.timer); rt.timer = null; }
     if (rt.pollAbort) { rt.pollAbort.abort(); rt.pollAbort = null; }
     cancelPrefetch(reason);
-    rt.segs = []; rt.byId = new Set(); rt.seqBase = 0; rt.lastSeq = -1; rt.servedEdge = null; rt.primedOnce = false;
+    rt.segs = []; rt.byId = new Set(); rt.seqBase = 0; rt.lastSeq = -1; rt.servedEdge = null; rt.primedOnce = false; rt.lastServedPlaylist = null;
     rt.placeholderActive = false; rt.placeholderNextSeq = 0; rt.placeholderLastSeq = null;
     rt.discontinuityBase = 0; rt.pendingDiscontinuity = false;
     rt.lastManifestAt = null; rt.lastSegmentAt = null; rt.segmentRequests = 0;
@@ -1443,7 +1463,7 @@ function ensureChannel(url, label) {
         rt = {
             url, label, segs: [], byId: new Set(), seqBase: 0, generation: 0,
             target: 6, lastSeq: -1, isMaster: false, lastPlayerAt: Date.now(),
-            running: false, timer: null, pollAbort: null, servedEdge: null, primedOnce: false,
+            running: false, timer: null, pollAbort: null, servedEdge: null, primedOnce: false, lastServedPlaylist: null,
             placeholderActive: false, placeholderNextSeq: 0, placeholderLastSeq: null,
             discontinuityBase: 0, pendingDiscontinuity: false,
             lastManifestAt: null, lastSegmentAt: null, segmentRequests: 0,
@@ -1611,7 +1631,13 @@ function buildServedPlaylist(rt, hostBase, configKey) {
     const servedIdx = rt.servedEdge == null ? -1 : rt.servedEdge - rt.seqBase;
     const servedIsWarm = servedIdx >= warmRun.start && servedIdx <= warmRun.end
         && !!getSegFromCache(rt.segs[servedIdx]?.id);
+    let gapJumped = false;
     if (rt.servedEdge == null || rt.servedEdge > hi || rt.servedEdge < lo || !servedIsWarm) {
+        const previousEdge = rt.servedEdge;
+        if (rt.primedOnce && previousEdge != null && delayedHi > previousEdge + 1 && warmRun.start >= 0) {
+            gapJumped = true;
+            console.warn(`[HLS GAP JUMP] channel="${rt.label}" from=${previousEdge} to=${delayedHi}`);
+        }
         rt.servedEdge = delayedHi;
     }
     else if (delayedHi > rt.servedEdge) rt.servedEdge = Math.min(delayedHi, rt.servedEdge + MAX_EDGE_ADVANCE);
@@ -1619,6 +1645,7 @@ function buildServedPlaylist(rt, hostBase, configKey) {
     const endIdx = rt.servedEdge - rt.seqBase;
     const activeRun = getWarmRunContainingIndex(rt, endIdx) || warmRun;
     const startIdx = Math.max(activeRun.start, endIdx - SERVE_SEGMENTS + 1);
+    if (gapJumped && rt.segs[startIdx]) rt.segs[startIdx].discontinuity = true;
     const win = rt.segs.slice(startIdx, endIdx + 1);
     const mediaSeq = rt.seqBase + startIdx;
     const discontinuitySequence = rt.discontinuityBase
@@ -1745,6 +1772,11 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
 
         const readyAfterWait = getServeReadiness(rt);
         if ((!rt.primedOnce && !readyAfterWait.ready) || !rt.segs.length || getLatestWarmIndex(rt) < 0) {
+            if (rt.primedOnce && rt.lastServedPlaylist) {
+                setPlaylistHeaders(res);
+                console.warn(`[HLS HOLD] channel="${ch.name}" seq=${rt.lastServedPlaylist.mediaSeq} edge=${rt.lastServedPlaylist.edge} warmRun=${getPlaybackWarmRun(rt).count}/${MIN_START_SEGMENTS} waited=${Date.now() - t0}ms`);
+                return res.send(rt.lastServedPlaylist.playlist);
+            }
             const placeholder = buildPlaceholderPlaylist(rt, host);
             setPlaylistHeaders(res);
             console.log(`[HLS PLACEHOLDER] channel="${ch.name}" seq=${placeholder.mediaSeq} edge=${placeholder.edge} warmRun=${getPlaybackWarmRun(rt).count}/${MIN_START_SEGMENTS} waited=${Date.now() - t0}ms`);
@@ -1754,6 +1786,7 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         rt.primedOnce = true;
 
         const { playlist, count, mediaSeq, edge, hi, warmRun: servedWarmRun, readyAhead } = buildServedPlaylist(rt, host, configKey);
+        rt.lastServedPlaylist = { playlist, mediaSeq, edge };
         setPlaylistHeaders(res);
         const segmentIdle = rt.lastSegmentAt ? `${Date.now() - rt.lastSegmentAt}ms` : "never";
         const degraded = readyAhead < LIVE_DELAY_SEGMENTS;
