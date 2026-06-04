@@ -45,7 +45,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "3.2.1";
+const RELEASE_VERSION = "3.2.2";
 const ADDON_TYPE = "tv";
 const CATALOG_TTL = 30 * 60 * 1000;
 const EPG_CACHE_TTL = Number(process.env.EPG_CACHE_TTL || 6 * 60 * 60 * 1000);
@@ -95,7 +95,10 @@ const SLOW_SEGMENT_MS = Number(process.env.SLOW_SEGMENT_MS || 4000);
 // buffer, and (c) prefetches segments. The player sees a smaller live window so
 // it cannot wander back into old segments after a temporary stall.
 const RETAIN_SEGMENTS = Number(process.env.RETAIN_SEGMENTS || 18);
-const LIVE_DELAY_SEGMENTS = Math.max(0, Number(process.env.LIVE_DELAY_SEGMENTS ?? 2));
+// Warm segments only help the player if they are advertised in the playlist.
+// Keep the option for providers that require an artificial live delay, but do
+// not hide ready media by default.
+const LIVE_DELAY_SEGMENTS = Math.max(0, Number(process.env.LIVE_DELAY_SEGMENTS ?? 0));
 // Anti-jump limit: advance the served live edge by at most this many segments per
 // request while retained history still exists. If upstream history disappears,
 // catching up is unavoidable.
@@ -863,11 +866,9 @@ async function fetchUpstreamHLS(sourceUrl, label = "stream", signal = null) {
     while (Date.now() < deadline && !signal?.aborted) {
         attempt++;
         try {
-            const waitMs = Math.max(1, deadline - Date.now());
             const r = await withUpstream(() => {
-                const requestMs = Math.max(1, Math.min(HLS_REQUEST_TIMEOUT, deadline - Date.now()));
                 return axios.get(sourceUrl, {
-                    timeout: requestMs,
+                    timeout: HLS_REQUEST_TIMEOUT,
                     signal,
                     maxRedirects: 5,
                     headers: {
@@ -878,7 +879,7 @@ async function fetchUpstreamHLS(sourceUrl, label = "stream", signal = null) {
                     },
                     validateStatus: s => s >= 200 && s < 300
                 });
-            }, true, waitMs);
+            }, true);
             const finalUrl = r.request?.res?.responseUrl || sourceUrl;
             const text = String(r.data || "").trim();
             if (!text.startsWith("#EXTM3U")) {

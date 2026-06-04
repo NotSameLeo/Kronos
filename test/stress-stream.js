@@ -255,7 +255,7 @@ async function main() {
             PREFETCH_RETRY_DELAY_MS: "30",
             MANIFEST_FORBIDDEN_BACKOFF_MS: "220",
             POLL_ERROR_BACKOFF_MS: "80",
-            LIVE_DELAY_SEGMENTS: "2",
+            LIVE_DELAY_SEGMENTS: "0",
             MIN_START_SEGMENTS: "4",
             MIN_VISIBLE_SEGMENTS: "2",
             PRIME_WAIT_MS: "120",
@@ -332,7 +332,7 @@ async function main() {
             await readManifest(id);
             const stats = await (await request(statsUrl)).json();
             const active = stats.channels.find(channel => channel.label === `STRESS ${id} HD`);
-            if (active?.warmRun >= 4 && active.knownEdge - active.servedEdge >= 2) return stats;
+            if (active?.warmRun >= 4 && active.servedEdge >= active.seqBase) return stats;
             await sleep(40);
         }
         throw new Error(`warm cushion did not recover for ${id}`);
@@ -360,7 +360,7 @@ async function main() {
 
         let stats = await waitForCushion("A");
         const initial = await readManifest("A");
-        assert(initial.segments.length > 0, "initial delayed playlist is empty");
+        assert(initial.segments.length >= 4, "initial real playlist did not publish the warm cushion");
         assert(initial.segments.length <= 5, "initial real playlist exceeded its visible window");
         assert(initial.segments.every(segment => !segment.includes("/black.ts")), "real playlist still contains placeholder media");
         assert(initial.discontinuities > 0, "placeholder transition was not marked as a discontinuity");
@@ -409,7 +409,7 @@ async function main() {
         await sleep(250);
         const restarted = await readManifest("A");
         assert(restarted.discontinuities > 0, "encoder restart was not marked as an HLS discontinuity");
-        assert(restarted.segments.length >= 2, "encoder restart exposed too small a visible playlist");
+        assert(restarted.segments.length >= 4, "encoder restart did not publish the warm cushion");
         assert(restarted.segments.length <= 5, "encoder restart exceeded the visible playlist limit");
         await consume("A", 12, 70);
 
@@ -477,6 +477,8 @@ async function main() {
         assert(text.includes("reason=channel-switch"), "zapping cancellation path was not exercised");
         assert(text.includes("reason=player-idle"), "idle cleanup path was not exercised");
         assert(text.includes("reason=direct-stream"), "direct stream cancellation path was not exercised");
+        assert(!text.includes("Upstream gate timeout"), "manifest poll timed out behind a slow segment");
+        assert(!text.includes("timeout of 1ms exceeded"), "manifest request inherited an exhausted gate deadline");
 
         console.log(JSON.stringify({
             ok: true,
@@ -486,7 +488,7 @@ async function main() {
             manifestRequestsDuringForbidden: mock.state.manifestRequestsDuringForbidden,
             cache: stats.cache,
             activeChannel: activeAfter,
-            exercised: ["startup-placeholder", "bounded-visible-window", "token-rotation", "invalid-manifest", "geo-403", "sustained-403-gap", "slow-segments", "aborted-segment", "x2-consumption", "encoder-restart", "zapping", "idle-reopen", "direct-stream-gate", "master-playlist"]
+            exercised: ["startup-placeholder", "published-warm-cushion", "bounded-visible-window", "token-rotation", "invalid-manifest", "geo-403", "sustained-403-gap", "slow-segments", "aborted-segment", "x2-consumption", "encoder-restart", "zapping", "idle-reopen", "direct-stream-gate", "master-playlist"]
         }, null, 2));
     } catch (err) {
         console.error(logs.join(""));
