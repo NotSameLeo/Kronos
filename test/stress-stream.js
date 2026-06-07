@@ -275,6 +275,7 @@ async function main() {
             PRIME_WAIT_MS: "120",
             STARTUP_REAL_SEGMENTS: "3",
             STARTUP_REAL_WAIT_MS: "6000",
+            PREFETCH_WINDOW_SEGMENTS: "8",
             RETAIN_SEGMENTS: "18",
             SERVE_SEGMENTS: "5",
             POLL_MIN_MS: "70",
@@ -504,6 +505,7 @@ async function main() {
         assert(text.includes("[PREFETCH PREEMPT]"), "player-demand prefetch preemption was not exercised");
         assert(text.includes("[CHANNEL GAP]"), "upstream sequence gap was not detected");
         assert(text.includes("[CHANNEL RESTART]"), "encoder restart path was not exercised");
+        assert(!/\[HLS SERVE\].*window=1\b/.test(text), "served a single-segment media playlist");
         assert(text.includes("reason=channel-switch"), "zapping cancellation path was not exercised");
         assert(text.includes("reason=player-idle"), "idle cleanup path was not exercised");
         assert(text.includes("reason=direct-stream"), "direct stream cancellation path was not exercised");
