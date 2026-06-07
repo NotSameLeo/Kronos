@@ -45,7 +45,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "3.2.3";
+const RELEASE_VERSION = "3.2.4";
 const ADDON_TYPE = "tv";
 const CATALOG_TTL = 30 * 60 * 1000;
 const EPG_CACHE_TTL = Number(process.env.EPG_CACHE_TTL || 6 * 60 * 60 * 1000);
@@ -108,8 +108,8 @@ const MIN_START_SEGMENTS = Math.max(MIN_VISIBLE_SEGMENTS + LIVE_DELAY_SEGMENTS, 
 const SERVE_SEGMENTS = Math.max(MIN_VISIBLE_SEGMENTS, Number(process.env.SERVE_SEGMENTS || 6));
 const PRIME_WAIT_MS = Number(process.env.PRIME_WAIT_MS || 1500);
 const MANIFEST_TYPE_WAIT_MS = Number(process.env.MANIFEST_TYPE_WAIT_MS || 1500);
-const PLACEHOLDER_SEGMENTS = Math.max(1, Number(process.env.PLACEHOLDER_SEGMENTS || 3));
-const PLACEHOLDER_SEGMENT_DURATION = Math.max(1, Number(process.env.PLACEHOLDER_SEGMENT_DURATION || 2));
+const STARTUP_REAL_SEGMENTS = Math.max(MIN_VISIBLE_SEGMENTS, Number(process.env.STARTUP_REAL_SEGMENTS || 3));
+const STARTUP_REAL_WAIT_MS = Number(process.env.STARTUP_REAL_WAIT_MS || 70000);
 const POLLER_IDLE_STOP_MS = Number(process.env.POLLER_IDLE_STOP_MS || 5 * 60 * 1000); // stop if player gone
 const POLL_MIN_MS = Number(process.env.POLL_MIN_MS || 2500);
 const POLL_MAX_MS = Number(process.env.POLL_MAX_MS || 12000);
@@ -1439,8 +1439,7 @@ function stopPoller(rt, reason) {
     if (rt.timer) { clearTimeout(rt.timer); rt.timer = null; }
     if (rt.pollAbort) { rt.pollAbort.abort(); rt.pollAbort = null; }
     cancelPrefetch(reason);
-    rt.segs = []; rt.byId = new Set(); rt.seqBase = 0; rt.lastSeq = -1; rt.servedEdge = null; rt.primedOnce = false; rt.lastServedPlaylist = null;
-    rt.placeholderActive = false; rt.placeholderNextSeq = 0; rt.placeholderLastSeq = null;
+    rt.segs = []; rt.byId = new Set(); rt.seqBase = 0; rt.lastSeq = -1; rt.servedEdge = null; rt.primedOnce = false; rt.lastServedPlaylist = null; rt.holdPlaylist = null;
     rt.discontinuityBase = 0; rt.pendingDiscontinuity = false;
     rt.lastManifestAt = null; rt.lastSegmentAt = null; rt.segmentRequests = 0;
     rt.lastRequestedSeq = null; rt.lastUpstreamEndSeq = null;
@@ -1463,8 +1462,7 @@ function ensureChannel(url, label) {
         rt = {
             url, label, segs: [], byId: new Set(), seqBase: 0, generation: 0,
             target: 6, lastSeq: -1, isMaster: false, lastPlayerAt: Date.now(),
-            running: false, timer: null, pollAbort: null, servedEdge: null, primedOnce: false, lastServedPlaylist: null,
-            placeholderActive: false, placeholderNextSeq: 0, placeholderLastSeq: null,
+            running: false, timer: null, pollAbort: null, servedEdge: null, primedOnce: false, lastServedPlaylist: null, holdPlaylist: null,
             discontinuityBase: 0, pendingDiscontinuity: false,
             lastManifestAt: null, lastSegmentAt: null, segmentRequests: 0,
             lastRequestedSeq: null, lastUpstreamEndSeq: null,
@@ -1538,6 +1536,7 @@ function ingestPlaylist(rt, playlist, baseUrl, info) {
     if (rt.lastSeq >= 0 && seq < rt.lastSeq) {
         rt.generation++;
         cancelPrefetch("channel-restart");
+        rt.holdPlaylist = rt.lastServedPlaylist || rt.holdPlaylist;
         // Continue the absolute sequence forward (don't reset to 0) so the player's
         // MEDIA-SEQUENCE never goes backward → it rejoins live moving forward instead
         // of "jumping to the beginning". New generation keeps stale cache out.
@@ -1581,41 +1580,6 @@ function ingestPlaylist(rt, playlist, baseUrl, info) {
         queueRuntimePrefetch(rt);
         console.log(`[BUFFER] channel="${rt.label}" +${added} depth=${rt.segs.length}/${RETAIN_SEGMENTS} seqBase=${rt.seqBase} cache=${segCache.size}/${formatBytes(segCacheBytes)} prefetch=${prefetchActive}+${prefetchQueue.length}`);
     }
-}
-
-function buildPlaceholderPlaylist(rt, hostBase) {
-    const mediaSeq = Math.max(
-        rt.seqBase,
-        (rt.servedEdge ?? -1) + 1,
-        rt.placeholderNextSeq || 0
-    );
-    const lines = [
-        "#EXTM3U",
-        "#EXT-X-VERSION:3",
-        `#EXT-X-TARGETDURATION:${PLACEHOLDER_SEGMENT_DURATION}`,
-        `#EXT-X-MEDIA-SEQUENCE:${mediaSeq}`
-    ];
-    for (let i = 0; i < PLACEHOLDER_SEGMENTS; i++) {
-        const seq = mediaSeq + i;
-        lines.push(`#EXTINF:${PLACEHOLDER_SEGMENT_DURATION.toFixed(3)},`);
-        lines.push(`${hostBase}/black.ts?n=${seq}`);
-    }
-    rt.placeholderActive = true;
-    rt.placeholderNextSeq = mediaSeq + 1;
-    rt.placeholderLastSeq = Math.max(rt.placeholderLastSeq ?? -1, mediaSeq + PLACEHOLDER_SEGMENTS - 1);
-    return { playlist: lines.join("\n") + "\n", mediaSeq, edge: mediaSeq + PLACEHOLDER_SEGMENTS - 1 };
-}
-
-function transitionFromPlaceholder(rt) {
-    if (!rt.placeholderActive || !rt.segs.length) return;
-    const warmRun = getPlaybackWarmRun(rt);
-    const transitionIdx = warmRun.count > 0 ? warmRun.start : 0;
-    const oldSeqBase = rt.seqBase;
-    rt.seqBase = Math.max(rt.seqBase, (rt.placeholderLastSeq ?? -1) + 1 - transitionIdx);
-    rt.segs[transitionIdx].discontinuity = true;
-    rt.servedEdge = null;
-    rt.placeholderActive = false;
-    console.log(`[HLS TRANSITION] channel="${rt.label}" placeholderEdge=${rt.placeholderLastSeq} firstReal=${rt.seqBase + transitionIdx} seqBase=${oldSeqBase}->${rt.seqBase}`);
 }
 
 function buildServedPlaylist(rt, hostBase, configKey) {
@@ -1685,6 +1649,18 @@ function getServeReadiness(rt) {
     };
 }
 
+function getStartupReadiness(rt) {
+    const warmRun = getPlaybackWarmRun(rt);
+    if (warmRun.count <= 0) return { ready: false, window: 0, readyAhead: 0 };
+    const edgeIdx = Math.min(warmRun.end, warmRun.start + STARTUP_REAL_SEGMENTS - 1);
+    const window = edgeIdx - warmRun.start + 1;
+    return {
+        ready: window >= STARTUP_REAL_SEGMENTS,
+        window,
+        readyAhead: Math.max(0, warmRun.end - edgeIdx)
+    };
+}
+
 function setPlaylistHeaders(res) {
     res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, no-transform");
@@ -1745,18 +1721,23 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         const host = getPublicHost(req);
 
         const rt = ensureChannel(ch.url, ch.name);
+        const recoveryPlaylist = rt.lastServedPlaylist || rt.holdPlaylist;
+        const coldStart = !recoveryPlaylist && rt.segmentRequests === 0 && rt.servedEdge == null && !rt.primedOnce;
         const warmRun = getPlaybackWarmRun(rt).count;
-        const fresh = !rt.primedOnce && !rt.isMaster;
-        const readiness = getServeReadiness(rt);
-        console.log(`[HLS OPEN] channel="${ch.name}" resolve=${Date.now() - t0}ms depth=${rt.segs.length} warmRun=${warmRun}/${MIN_START_SEGMENTS} serveWindow=${readiness.window}/${MIN_VISIBLE_SEGMENTS} readyAhead=${readiness.readyAhead}/${LIVE_DELAY_SEGMENTS} ${fresh ? "(priming…)" : "(buffer ready)"}`);
+        const fresh = coldStart && !rt.isMaster;
+        const readiness = fresh ? getStartupReadiness(rt) : getServeReadiness(rt);
+        const warmTarget = fresh ? STARTUP_REAL_SEGMENTS : MIN_START_SEGMENTS;
+        console.log(`[HLS OPEN] channel="${ch.name}" resolve=${Date.now() - t0}ms depth=${rt.segs.length} warmRun=${warmRun}/${warmTarget} serveWindow=${readiness.window}/${MIN_VISIBLE_SEGMENTS} readyAhead=${readiness.readyAhead}/${LIVE_DELAY_SEGMENTS} ${fresh ? "(priming real…)" : "(buffer ready)"}`);
 
-        // Give fast media/master manifests a brief chance to resolve. Slow on-demand
-        // encoders get a valid placeholder playlist instead of a 502/ENDLIST.
+        // Firestick/Stremio can stick forever to synthetic startup media. On the
+        // first open only, wait for real cached media so the player joins the real
+        // timeline on its first successful manifest. During encoder restarts, keep
+        // holding the previous real playlist instead of turning the request into a
+        // new cold start.
         if (fresh && !readiness.ready) {
             const startedWait = Date.now();
-            while (rt.running && !rt.isMaster && !getServeReadiness(rt).ready) {
-                const waitLimit = rt.lastManifestAt ? PRIME_WAIT_MS : MANIFEST_TYPE_WAIT_MS;
-                if (Date.now() - startedWait >= waitLimit) break;
+            while (rt.running && !rt.isMaster && !getStartupReadiness(rt).ready) {
+                if (Date.now() - startedWait >= STARTUP_REAL_WAIT_MS) break;
                 rt.lastPlayerAt = Date.now();
                 await sleep(50);
             }
@@ -1770,23 +1751,28 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
             return res.send(rewritten);
         }
 
-        const readyAfterWait = getServeReadiness(rt);
-        if ((!rt.primedOnce && !readyAfterWait.ready) || !rt.segs.length || getLatestWarmIndex(rt) < 0) {
-            if (rt.primedOnce && rt.lastServedPlaylist) {
+        const readyAfterWait = fresh ? getStartupReadiness(rt) : getServeReadiness(rt);
+        if (!rt.segs.length || getLatestWarmIndex(rt) < 0) {
+            const holdPlaylist = rt.lastServedPlaylist || rt.holdPlaylist;
+            if (holdPlaylist) {
                 setPlaylistHeaders(res);
-                console.warn(`[HLS HOLD] channel="${ch.name}" seq=${rt.lastServedPlaylist.mediaSeq} edge=${rt.lastServedPlaylist.edge} warmRun=${getPlaybackWarmRun(rt).count}/${MIN_START_SEGMENTS} waited=${Date.now() - t0}ms`);
-                return res.send(rt.lastServedPlaylist.playlist);
+                console.warn(`[HLS HOLD] channel="${ch.name}" seq=${holdPlaylist.mediaSeq} edge=${holdPlaylist.edge} warmRun=${getPlaybackWarmRun(rt).count}/${MIN_START_SEGMENTS} waited=${Date.now() - t0}ms`);
+                return res.send(holdPlaylist.playlist);
             }
-            const placeholder = buildPlaceholderPlaylist(rt, host);
+            const retryAfterSeconds = 2;
             setPlaylistHeaders(res);
-            console.log(`[HLS PLACEHOLDER] channel="${ch.name}" seq=${placeholder.mediaSeq} edge=${placeholder.edge} warmRun=${getPlaybackWarmRun(rt).count}/${MIN_START_SEGMENTS} waited=${Date.now() - t0}ms`);
-            return res.send(placeholder.playlist);
+            res.setHeader("Retry-After", String(retryAfterSeconds));
+            console.warn(`[HLS NOT READY] channel="${ch.name}" warmRun=${getPlaybackWarmRun(rt).count}/${warmTarget} waited=${Date.now() - t0}ms`);
+            return res.status(503).send("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n");
         }
-        transitionFromPlaceholder(rt);
+        if (!rt.primedOnce && !readyAfterWait.ready) {
+            console.warn(`[HLS START PARTIAL] channel="${ch.name}" warmRun=${getPlaybackWarmRun(rt).count}/${STARTUP_REAL_SEGMENTS} waited=${Date.now() - t0}ms`);
+        }
         rt.primedOnce = true;
 
         const { playlist, count, mediaSeq, edge, hi, warmRun: servedWarmRun, readyAhead } = buildServedPlaylist(rt, host, configKey);
         rt.lastServedPlaylist = { playlist, mediaSeq, edge };
+        rt.holdPlaylist = rt.lastServedPlaylist;
         setPlaylistHeaders(res);
         const segmentIdle = rt.lastSegmentAt ? `${Date.now() - rt.lastSegmentAt}ms` : "never";
         const degraded = readyAhead < LIVE_DELAY_SEGMENTS;
@@ -2072,7 +2058,8 @@ app.get("/:base64Config/debug", async (req, res) => {
             groups: [...new Set(channels.map(c => c.group))].slice(0, 50),
             constants: {
                 ADDON_TYPE, RELEASE_VERSION, HLS_REQUEST_TIMEOUT, SEG_REQUEST_TIMEOUT,
-                LIVE_DELAY_SEGMENTS, MIN_START_SEGMENTS, MIN_VISIBLE_SEGMENTS, PRIME_WAIT_MS, MANIFEST_TYPE_WAIT_MS, RETAIN_SEGMENTS, SERVE_SEGMENTS,
+                LIVE_DELAY_SEGMENTS, MIN_START_SEGMENTS, MIN_VISIBLE_SEGMENTS, STARTUP_REAL_SEGMENTS, STARTUP_REAL_WAIT_MS,
+                PRIME_WAIT_MS, MANIFEST_TYPE_WAIT_MS, RETAIN_SEGMENTS, SERVE_SEGMENTS,
                 MANIFEST_FORBIDDEN_BACKOFF_MS, POLL_ERROR_BACKOFF_MS, POLL_MIN_MS, POLL_MAX_MS
             }
         });
@@ -2091,7 +2078,7 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`📋 playlist retryWindow=${PLAYLIST_RETRY_WINDOW_MS / 1000}s delay=${PLAYLIST_RETRY_DELAY_MS / 1000}s`);
     console.log(`⏩ prefetch concurrency=${SEGMENT_PREFETCH_CONCURRENCY} cacheTTL=${SEGMENT_CACHE_TTL / 1000}s`);
     console.log(`🩹 segment playerRetry=${SEGMENT_PLAYER_RETRIES} delay=${SEGMENT_PLAYER_RETRY_DELAY_MS}ms`);
-    console.log(`🪟 buffer: retain/serve=${RETAIN_SEGMENTS}/${SERVE_SEGMENTS} liveDelay=${LIVE_DELAY_SEGMENTS}segs prime=${MIN_START_SEGMENTS}segs wait=${PRIME_WAIT_MS / 1000}s typeWait=${MANIFEST_TYPE_WAIT_MS / 1000}s placeholder=${PLACEHOLDER_SEGMENTS}x${PLACEHOLDER_SEGMENT_DURATION}s minVisible=${MIN_VISIBLE_SEGMENTS} idleStop=${POLLER_IDLE_STOP_MS / 1000}s`);
+    console.log(`🪟 buffer: retain/serve=${RETAIN_SEGMENTS}/${SERVE_SEGMENTS} liveDelay=${LIVE_DELAY_SEGMENTS}segs prime=${MIN_START_SEGMENTS}segs startup=${STARTUP_REAL_SEGMENTS}segs/${STARTUP_REAL_WAIT_MS / 1000}s wait=${PRIME_WAIT_MS / 1000}s typeWait=${MANIFEST_TYPE_WAIT_MS / 1000}s minVisible=${MIN_VISIBLE_SEGMENTS} idleStop=${POLLER_IDLE_STOP_MS / 1000}s`);
     console.log(`📺 epg timezone=${EPG_TIME_ZONE} timeout=${EPG_REQUEST_TIMEOUT / 1000}s firstWait=${EPG_FIRST_CATALOG_WAIT_MS / 1000}s retryDelay=${EPG_RETRY_DELAY_MS / 1000}s cacheTTL=${EPG_CACHE_TTL / 1000}s refresh=${EPG_REFRESH_INTERVAL_MS / 1000}s preload=${EPG_PRELOAD_URL ? "on" : "off"} startupWatch=${EPG_STARTUP_WATCH_MS / 1000}s`);
     console.log(`📚 catalog preload=${CATALOG_PRELOAD_CONFIGS.length}`);
     console.log("=".repeat(60) + "\n");

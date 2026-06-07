@@ -273,6 +273,8 @@ async function main() {
             MIN_START_SEGMENTS: "4",
             MIN_VISIBLE_SEGMENTS: "2",
             PRIME_WAIT_MS: "120",
+            STARTUP_REAL_SEGMENTS: "3",
+            STARTUP_REAL_WAIT_MS: "6000",
             RETAIN_SEGMENTS: "18",
             SERVE_SEGMENTS: "5",
             POLL_MIN_MS: "70",
@@ -304,7 +306,7 @@ async function main() {
 
     const readManifest = async id => {
         const started = Date.now();
-        const response = await request(hlsUrl(id), {}, 6000);
+        const response = await request(hlsUrl(id), {}, 9000);
         maxInitialManifestMs = Math.max(maxInitialManifestMs, Date.now() - started);
         assert.equal(response.status, 200, `manifest ${id} returned ${response.status}`);
         return parsePlaylist(await response.text());
@@ -364,21 +366,13 @@ async function main() {
     try {
         await waitForHealth();
 
-        const placeholder = await readManifest("A");
-        assert.equal(placeholder.segments.length, 3, "startup placeholder has the wrong segment count");
-        assert(placeholder.segments.every(segment => segment.includes("/black.ts")), "startup did not return placeholder media");
-        assert(maxInitialManifestMs < 700, `initial placeholder took too long (${maxInitialManifestMs}ms)`);
-        for (const segment of placeholder.segments) {
-            await fetchSegment(new URL(segment, kronosOrigin).toString());
-        }
-
-        let stats = await waitForCushion("A");
         const initial = await readManifest("A");
-        assert(initial.segments.length >= 4, "initial real playlist did not publish the warm cushion");
+        assert(initial.segments.length >= 3, "initial playlist did not wait for a real startup cushion");
         assert(initial.segments.length <= 5, "initial real playlist exceeded its visible window");
-        assert(initial.segments.every(segment => !segment.includes("/black.ts")), "real playlist still contains placeholder media");
-        assert(initial.discontinuities > 0, "placeholder transition was not marked as a discontinuity");
+        assert(initial.segments.every(segment => !segment.includes("/black.ts")), "startup served placeholder media");
+        assert(maxInitialManifestMs < 5000, `initial real manifest took too long (${maxInitialManifestMs}ms)`);
         await assertManifestCached(initial);
+        let stats = await waitForCushion("A");
         const active = stats.channels.find(channel => channel.label === "STRESS A HD");
         assert(active, "missing active channel stats");
         assert(active.warmRun >= 4, "startup did not prime a protected warm cushion");
@@ -502,8 +496,8 @@ async function main() {
         await fetchSegment(new URL(nested.segments[0], kronosOrigin).toString());
 
         const text = logs.join("");
-        assert(text.includes("[HLS PLACEHOLDER]"), "startup placeholder path was not exercised");
-        assert(text.includes("[HLS TRANSITION]"), "placeholder transition path was not exercised");
+        assert(text.includes("(priming real"), "real startup priming path was not exercised");
+        assert(!text.includes("[HLS PLACEHOLDER]"), "startup fell back to placeholder media");
         assert(text.includes("[HLS RETRY]"), "manifest retry path was not exercised");
         assert(text.includes("[POLLER ERR]"), "manifest poller recovery path was not exercised");
         assert(text.includes("[SEG RETRY]") || (text.includes("[PREFETCH ERR]") && text.includes("stream has been aborted")), "segment abort/retry path was not exercised");
@@ -524,7 +518,7 @@ async function main() {
             manifestRequestsDuringForbidden: mock.state.manifestRequestsDuringForbidden,
             cache: stats.cache,
             activeChannel: activeAfter,
-            exercised: ["startup-placeholder", "published-warm-cushion", "bounded-visible-window", "token-rotation", "invalid-manifest", "geo-403", "expired-segment-skip", "sustained-403-gap", "slow-segments", "aborted-segment", "x2-consumption", "encoder-restart", "zapping", "idle-reopen", "direct-stream-gate", "master-playlist"]
+            exercised: ["real-startup-prime", "published-warm-cushion", "bounded-visible-window", "token-rotation", "invalid-manifest", "geo-403", "expired-segment-skip", "sustained-403-gap", "slow-segments", "aborted-segment", "x2-consumption", "encoder-restart", "zapping", "idle-reopen", "direct-stream-gate", "master-playlist"]
         }, null, 2));
     } catch (err) {
         console.error(logs.join(""));
