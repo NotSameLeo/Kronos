@@ -50,6 +50,7 @@ function createMockUpstream() {
         abortNextSegment: false,
         masterManifests: 0,
         forbiddenUntil: 0,
+        segmentForbiddenUntil: 0,
         manifestRequestsDuringForbidden: 0,
         expiredSegments: new Map()
     };
@@ -119,6 +120,13 @@ function createMockUpstream() {
 
         if (url.pathname === "/control/forbid-manifest") {
             state.forbiddenUntil = Date.now() + Number(url.searchParams.get("ms") || 0);
+            res.writeHead(204);
+            res.end();
+            return;
+        }
+
+        if (url.pathname === "/control/forbid-segments") {
+            state.segmentForbiddenUntil = Date.now() + Number(url.searchParams.get("ms") || 0);
             res.writeHead(204);
             res.end();
             return;
@@ -208,6 +216,11 @@ function createMockUpstream() {
                 const attempt = (state.segmentAttempts.get(key) || 0) + 1;
                 state.segmentAttempts.set(key, attempt);
                 const seq = Number(sequence);
+                if (Date.now() < state.segmentForbiddenUntil) {
+                    res.writeHead(403, { "content-type": "text/plain" });
+                    res.end("segment auth expired");
+                    return;
+                }
                 const expiredThrough = state.expiredSegments.get(channelIdValue);
                 if (Number.isFinite(expiredThrough) && seq <= expiredThrough) {
                     res.writeHead(403, { "content-type": "text/plain" });
@@ -276,6 +289,9 @@ async function main() {
             STARTUP_REAL_SEGMENTS: "3",
             STARTUP_REAL_WAIT_MS: "6000",
             PREFETCH_WINDOW_SEGMENTS: "8",
+            SEGMENT_AUTH_FAILURE_LIMIT: "3",
+            SEGMENT_AUTH_FAILURE_MIN_MS: "3000",
+            SEGMENT_AUTH_RECOVERY_COOLDOWN_MS: "800",
             RETAIN_SEGMENTS: "18",
             SERVE_SEGMENTS: "5",
             POLL_MIN_MS: "70",
@@ -436,6 +452,31 @@ async function main() {
         assert(recoveredGap, "sustained 403 gap did not recover with a discontinuity");
         assert(mock.state.manifestRequestsDuringForbidden <= 12, "403 cooldown was hammered too aggressively");
 
+        // Some providers keep returning fresh manifests while every segment URL is
+        // forbidden. Kronos must restart the HLS session instead of holding the last
+        // good playlist forever.
+        await request(`${upstreamOrigin}/control/forbid-segments?ms=5200`);
+        const authRecoveryCursor = logs.join("").length;
+        const authDeadline = Date.now() + 4200;
+        while (Date.now() < authDeadline) {
+            const frozen = await readManifest("A");
+            await assertManifestCached(frozen);
+            await sleep(80);
+        }
+        let recoveredAuth = null;
+        for (let i = 0; i < 80; i++) {
+            const candidate = await readManifest("A");
+            if (candidate.discontinuities > 0 && logs.join("").slice(authRecoveryCursor).includes("[CHANNEL RECOVER]")) {
+                await assertManifestCached(candidate);
+                recoveredAuth = candidate;
+                break;
+            }
+            await sleep(80);
+        }
+        assert(recoveredAuth, "segment auth failure did not recover with a fresh session");
+        const authRecoveryLogs = logs.join("").slice(authRecoveryCursor);
+        assert(authRecoveryLogs.includes("reason=segment-status-403"), "segment auth recovery reason was not logged");
+
         await request(`${upstreamOrigin}/control/restart?id=A`);
         await sleep(250);
         const restarted = await readManifest("A");
@@ -505,6 +546,7 @@ async function main() {
         assert(text.includes("[PREFETCH PREEMPT]"), "player-demand prefetch preemption was not exercised");
         assert(text.includes("[CHANNEL GAP]"), "upstream sequence gap was not detected");
         assert(text.includes("[CHANNEL RESTART]"), "encoder restart path was not exercised");
+        assert(text.includes("[CHANNEL RECOVER]"), "segment auth recovery path was not exercised");
         assert(!/\[HLS SERVE\].*window=1\b/.test(text), "served a single-segment media playlist");
         assert(text.includes("reason=channel-switch"), "zapping cancellation path was not exercised");
         assert(text.includes("reason=player-idle"), "idle cleanup path was not exercised");
@@ -520,7 +562,7 @@ async function main() {
             manifestRequestsDuringForbidden: mock.state.manifestRequestsDuringForbidden,
             cache: stats.cache,
             activeChannel: activeAfter,
-            exercised: ["real-startup-prime", "published-warm-cushion", "bounded-visible-window", "token-rotation", "invalid-manifest", "geo-403", "expired-segment-skip", "sustained-403-gap", "slow-segments", "aborted-segment", "x2-consumption", "encoder-restart", "zapping", "idle-reopen", "direct-stream-gate", "master-playlist"]
+            exercised: ["real-startup-prime", "published-warm-cushion", "bounded-visible-window", "token-rotation", "invalid-manifest", "geo-403", "expired-segment-skip", "sustained-403-gap", "segment-auth-recovery", "slow-segments", "aborted-segment", "x2-consumption", "encoder-restart", "zapping", "idle-reopen", "direct-stream-gate", "master-playlist"]
         }, null, 2));
     } catch (err) {
         console.error(logs.join(""));
