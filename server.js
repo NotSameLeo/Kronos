@@ -45,7 +45,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "3.2.6";
+const RELEASE_VERSION = "3.2.7";
 const ADDON_TYPE = "tv";
 const CATALOG_TTL = 30 * 60 * 1000;
 const EPG_CACHE_TTL = Number(process.env.EPG_CACHE_TTL || 6 * 60 * 60 * 1000);
@@ -89,6 +89,8 @@ const SLOW_SEGMENT_MS = Number(process.env.SLOW_SEGMENT_MS || 4000);
 const SEGMENT_AUTH_FAILURE_LIMIT = Math.max(2, Number(process.env.SEGMENT_AUTH_FAILURE_LIMIT || 6));
 const SEGMENT_AUTH_FAILURE_MIN_MS = Number(process.env.SEGMENT_AUTH_FAILURE_MIN_MS || 45000);
 const SEGMENT_AUTH_RECOVERY_COOLDOWN_MS = Number(process.env.SEGMENT_AUTH_RECOVERY_COOLDOWN_MS || 60000);
+const PLAYLIST_STALL_RECOVERY_MS = Number(process.env.PLAYLIST_STALL_RECOVERY_MS || SEGMENT_AUTH_FAILURE_MIN_MS);
+const PLAYLIST_STALL_RECOVERY_POLLS = Math.max(1, Number(process.env.PLAYLIST_STALL_RECOVERY_POLLS || 3));
 
 // ── Background poller + retained buffer ─────────────────────────────────────────
 // These channels are ON-DEMAND: the upstream starts a fresh encoder (seq=0, 1 seg)
@@ -110,10 +112,14 @@ const MIN_VISIBLE_SEGMENTS = Math.max(1, Number(process.env.MIN_VISIBLE_SEGMENTS
 const MIN_START_SEGMENTS = Math.max(MIN_VISIBLE_SEGMENTS + LIVE_DELAY_SEGMENTS, Number(process.env.MIN_START_SEGMENTS || 4));
 const SERVE_SEGMENTS = Math.max(MIN_VISIBLE_SEGMENTS, Number(process.env.SERVE_SEGMENTS || 6));
 const PREFETCH_WINDOW_SEGMENTS = Math.max(MIN_START_SEGMENTS, Number(process.env.PREFETCH_WINDOW_SEGMENTS || 8));
+const SEGMENT_AUTH_RECOVERY_DISTINCT_SEGMENTS = Math.max(
+    SEGMENT_AUTH_FAILURE_LIMIT,
+    Number(process.env.SEGMENT_AUTH_RECOVERY_DISTINCT_SEGMENTS || (PREFETCH_WINDOW_SEGMENTS + MIN_VISIBLE_SEGMENTS))
+);
 const PRIME_WAIT_MS = Number(process.env.PRIME_WAIT_MS || 1500);
 const MANIFEST_TYPE_WAIT_MS = Number(process.env.MANIFEST_TYPE_WAIT_MS || 1500);
-const STARTUP_REAL_SEGMENTS = Math.max(MIN_VISIBLE_SEGMENTS, Number(process.env.STARTUP_REAL_SEGMENTS || 3));
-const STARTUP_REAL_WAIT_MS = Number(process.env.STARTUP_REAL_WAIT_MS || 70000);
+const STARTUP_REAL_SEGMENTS = Math.max(MIN_VISIBLE_SEGMENTS, Number(process.env.STARTUP_REAL_SEGMENTS || 2));
+const STARTUP_REAL_WAIT_MS = Number(process.env.STARTUP_REAL_WAIT_MS || 20000);
 const POLLER_IDLE_STOP_MS = Number(process.env.POLLER_IDLE_STOP_MS || 5 * 60 * 1000); // stop if player gone
 const POLL_MIN_MS = Number(process.env.POLL_MIN_MS || 2500);
 const POLL_MAX_MS = Number(process.env.POLL_MAX_MS || 12000);
@@ -1427,7 +1433,9 @@ function noteSegmentFetchSuccess(id) {
     const rt = getActiveRuntimeForSegment(id);
     if (!rt) return;
     rt.segmentAuthFailures = 0;
+    rt.segmentAuthFailureIds?.clear();
     rt.firstSegmentAuthFailureAt = null;
+    rt.lastSegmentAuthFailureStatus = null;
     rt.lastSuccessfulSegmentFetchAt = Date.now();
 }
 
@@ -1438,14 +1446,20 @@ function noteSegmentFetchFailure(id, status) {
 
     const now = Date.now();
     rt.segmentAuthFailures = (rt.segmentAuthFailures || 0) + 1;
+    if (!rt.segmentAuthFailureIds) rt.segmentAuthFailureIds = new Set();
+    rt.segmentAuthFailureIds.add(id);
     rt.firstSegmentAuthFailureAt = rt.firstSegmentAuthFailureAt || now;
     rt.lastSegmentAuthFailureAt = now;
+    rt.lastSegmentAuthFailureStatus = status;
 
     const failureMs = now - rt.firstSegmentAuthFailureAt;
-    const warmRun = getPlayableWarmRun(rt, MIN_VISIBLE_SEGMENTS).count;
-    if (warmRun >= MIN_START_SEGMENTS) return;
+    const successfulSegmentIdleMs = rt.lastSuccessfulSegmentFetchAt
+        ? now - rt.lastSuccessfulSegmentFetchAt
+        : Infinity;
     if (rt.segmentAuthFailures < SEGMENT_AUTH_FAILURE_LIMIT) return;
+    if (rt.segmentAuthFailureIds.size < SEGMENT_AUTH_RECOVERY_DISTINCT_SEGMENTS) return;
     if (failureMs < SEGMENT_AUTH_FAILURE_MIN_MS) return;
+    if (successfulSegmentIdleMs < SEGMENT_AUTH_FAILURE_MIN_MS) return;
     recoverChannelSession(rt, `segment-status-${status}`);
 }
 
@@ -1461,8 +1475,14 @@ function recoverChannelSession(rt, reason) {
 
     rt.lastSegmentRecoveryAt = now;
     rt.segmentAuthFailures = 0;
+    rt.segmentAuthFailureIds?.clear();
     rt.firstSegmentAuthFailureAt = null;
     rt.lastSegmentAuthFailureAt = null;
+    rt.lastSegmentAuthFailureStatus = null;
+    rt.playlistHoldSince = null;
+    rt.playlistHoldPolls = 0;
+    rt.playlistStallSince = null;
+    rt.playlistStallPolls = 0;
     rt.generation++;
     rt.seqBase = nextSeqBase;
     rt.segs = [];
@@ -1481,6 +1501,53 @@ function recoverChannelSession(rt, reason) {
     console.warn(`[CHANNEL RECOVER] channel="${rt.label}" reason=${reason} seqBase=${rt.seqBase} gen=${rt.generation}`);
     rt.timer = setTimeout(() => pollChannelLoop(rt), 0);
     if (rt.timer.unref) rt.timer.unref();
+}
+
+function notePlaylistServeHealth(rt, served) {
+    if (!rt?.primedOnce) return;
+    const now = Date.now();
+    const segmentIdleMs = rt.lastSegmentAt ? now - rt.lastSegmentAt : null;
+    const bufferIdleMs = rt.lastBufferAddedAt ? now - rt.lastBufferAddedAt : null;
+    const manifestStatus = Number(rt.lastPollStatus);
+    const activeManifestError = rt.pollFailures > 0
+        && (manifestStatus === 401 || manifestStatus === 403 || manifestStatus >= 500);
+    const recentManifestError = activeManifestError && rt.lastManifestErrorAt
+        && now - rt.lastManifestErrorAt <= Math.max(PLAYLIST_STALL_RECOVERY_MS * 2, POLL_MAX_MS * 2);
+    const stalledPlayback = segmentIdleMs && segmentIdleMs >= PLAYLIST_STALL_RECOVERY_MS;
+    const stalledBuffer = bufferIdleMs && bufferIdleMs >= PLAYLIST_STALL_RECOVERY_MS;
+    if (!stalledPlayback || !stalledBuffer || !recentManifestError) {
+        rt.playlistStallSince = null;
+        rt.playlistStallPolls = 0;
+        return;
+    }
+    rt.playlistStallSince = rt.playlistStallSince || now;
+    rt.playlistStallPolls = (rt.playlistStallPolls || 0) + 1;
+    if (rt.playlistStallPolls < PLAYLIST_STALL_RECOVERY_POLLS) return;
+    recoverChannelSession(rt, `playlist-stall-status-${rt.lastPollStatus || "unknown"}`);
+}
+
+function notePlaylistHoldHealth(rt, reason) {
+    if (!rt?.primedOnce) return;
+    const now = Date.now();
+    const segmentIdleMs = rt.lastSegmentAt ? now - rt.lastSegmentAt : Infinity;
+    const manifestStatus = Number(rt.lastPollStatus);
+    const hasManifestError = rt.pollFailures > 0
+        && (manifestStatus === 401 || manifestStatus === 403 || manifestStatus >= 500);
+    const hasSegmentAuthFailures = (rt.segmentAuthFailures || 0) >= SEGMENT_AUTH_FAILURE_LIMIT;
+    const stalePlayback = segmentIdleMs >= PLAYLIST_STALL_RECOVERY_MS;
+
+    if (reason !== "no-warm-cache" || (!hasSegmentAuthFailures && !hasManifestError && !stalePlayback)) {
+        rt.playlistHoldSince = null;
+        rt.playlistHoldPolls = 0;
+        return;
+    }
+
+    rt.playlistHoldSince = rt.playlistHoldSince || now;
+    rt.playlistHoldPolls = (rt.playlistHoldPolls || 0) + 1;
+    if (rt.playlistHoldPolls < PLAYLIST_STALL_RECOVERY_POLLS) return;
+    if (now - rt.playlistHoldSince < PLAYLIST_STALL_RECOVERY_MS) return;
+    const status = rt.lastSegmentAuthFailureStatus || rt.lastPollStatus || "stale";
+    recoverChannelSession(rt, `playlist-hold-${reason}-status-${status}`);
 }
 
 function parseSegments(playlist, baseUrl, scope = baseUrl, mediaSequence = null) {
@@ -1519,11 +1586,14 @@ function stopPoller(rt, reason) {
     cancelPrefetch(reason);
     rt.segs = []; rt.byId = new Set(); rt.seqBase = 0; rt.lastSeq = -1; rt.servedEdge = null; rt.primedOnce = false; rt.lastServedPlaylist = null; rt.holdPlaylist = null;
     rt.discontinuityBase = 0; rt.pendingDiscontinuity = false;
-    rt.lastManifestAt = null; rt.lastSegmentAt = null; rt.segmentRequests = 0;
+    rt.lastManifestAt = null; rt.lastSegmentAt = null; rt.lastBufferAddedAt = null; rt.segmentRequests = 0;
     rt.lastRequestedSeq = null; rt.lastUpstreamEndSeq = null;
     rt.lastPollStatus = null; rt.pollFailures = 0; rt.lastManifestErrorAt = null;
-    rt.segmentAuthFailures = 0; rt.firstSegmentAuthFailureAt = null; rt.lastSegmentAuthFailureAt = null;
+    rt.segmentAuthFailures = 0; rt.firstSegmentAuthFailureAt = null; rt.lastSegmentAuthFailureAt = null; rt.lastSegmentAuthFailureStatus = null;
+    rt.segmentAuthFailureIds?.clear();
     rt.lastSegmentRecoveryAt = null; rt.lastSuccessfulSegmentFetchAt = null;
+    rt.playlistHoldSince = null; rt.playlistHoldPolls = 0;
+    rt.playlistStallSince = null; rt.playlistStallPolls = 0;
     rt.generation++;
     console.log(`[POLLER STOP] channel="${rt.label}" reason=${reason}`);
 }
@@ -1544,11 +1614,14 @@ function ensureChannel(url, label) {
             target: 6, lastSeq: -1, isMaster: false, lastPlayerAt: Date.now(),
             running: false, timer: null, pollAbort: null, servedEdge: null, primedOnce: false, lastServedPlaylist: null, holdPlaylist: null,
             discontinuityBase: 0, pendingDiscontinuity: false,
-            lastManifestAt: null, lastSegmentAt: null, segmentRequests: 0,
+            lastManifestAt: null, lastSegmentAt: null, lastBufferAddedAt: null, segmentRequests: 0,
             lastRequestedSeq: null, lastUpstreamEndSeq: null,
             lastPollStatus: null, pollFailures: 0, lastManifestErrorAt: null,
-            segmentAuthFailures: 0, firstSegmentAuthFailureAt: null, lastSegmentAuthFailureAt: null,
-            lastSegmentRecoveryAt: null, lastSuccessfulSegmentFetchAt: null
+            segmentAuthFailures: 0, firstSegmentAuthFailureAt: null, lastSegmentAuthFailureAt: null, lastSegmentAuthFailureStatus: null,
+            segmentAuthFailureIds: new Set(),
+            lastSegmentRecoveryAt: null, lastSuccessfulSegmentFetchAt: null,
+            playlistHoldSince: null, playlistHoldPolls: 0,
+            playlistStallSince: null, playlistStallPolls: 0
         };
         channels.set(url, rt);
     }
@@ -1659,6 +1732,9 @@ function ingestPlaylist(rt, playlist, baseUrl, info) {
         rt.seqBase++;
     }
     if (added > 0) {
+        rt.lastBufferAddedAt = Date.now();
+        rt.playlistStallSince = null;
+        rt.playlistStallPolls = 0;
         queueRuntimePrefetch(rt);
         console.log(`[BUFFER] channel="${rt.label}" +${added} depth=${rt.segs.length}/${RETAIN_SEGMENTS} seqBase=${rt.seqBase} cache=${segCache.size}/${formatBytes(segCacheBytes)} prefetch=${prefetchActive}+${prefetchQueue.length}`);
     }
@@ -1699,6 +1775,8 @@ function buildServedPlaylist(rt, hostBase, configKey) {
     const startIdx = Math.max(activeRun.start, endIdx - SERVE_SEGMENTS + 1);
     if (gapJumped && rt.segs[startIdx]) rt.segs[startIdx].discontinuity = true;
     const win = rt.segs.slice(startIdx, endIdx + 1);
+    const forceStartDiscontinuity = rt.segs.slice(0, startIdx).some(s => s.discontinuity)
+        && !win.some(s => s.discontinuity);
     const mediaSeq = rt.seqBase + startIdx;
     const discontinuitySequence = rt.discontinuityBase
         + rt.segs.slice(0, startIdx).filter(s => s.discontinuity).length;
@@ -1710,8 +1788,8 @@ function buildServedPlaylist(rt, hostBase, configKey) {
         `#EXT-X-MEDIA-SEQUENCE:${mediaSeq}`,
         `#EXT-X-DISCONTINUITY-SEQUENCE:${discontinuitySequence}`
     ];
-    for (const s of win) {
-        if (s.discontinuity) lines.push("#EXT-X-DISCONTINUITY");
+    for (const [idx, s] of win.entries()) {
+        if (s.discontinuity || (idx === 0 && forceStartDiscontinuity)) lines.push("#EXT-X-DISCONTINUITY");
         lines.push(`#EXTINF:${Number(s.duration || rt.target || 6).toFixed(3)},`);
         lines.push(`${hostBase}/${configKey}/proxy/seg?s=${encodeURIComponent(s.id)}`);
     }
@@ -1753,6 +1831,19 @@ function setPlaylistHeaders(res) {
     res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, no-transform");
     res.setHeader("Pragma", "no-cache");
+}
+
+function sendWaitingPlaylist(res, channel, reason, mediaSeq, waited) {
+    setPlaylistHeaders(res);
+    res.setHeader("Retry-After", "1");
+    console.warn(`[HLS WAIT] channel="${channel}" reason=${reason} seq=${mediaSeq} waited=${waited}ms`);
+    return res.send([
+        "#EXTM3U",
+        "#EXT-X-VERSION:3",
+        "#EXT-X-TARGETDURATION:2",
+        `#EXT-X-MEDIA-SEQUENCE:${Math.max(0, mediaSeq || 0)}`,
+        ""
+    ].join("\n"));
 }
 
 function getLatestWarmIndex(rt) {
@@ -1863,17 +1954,16 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
             if (holdPlaylist) {
                 setPlaylistHeaders(res);
                 console.warn(`[HLS HOLD] channel="${ch.name}" reason=no-warm-cache seq=${holdPlaylist.mediaSeq} edge=${holdPlaylist.edge} warmRun=${getPlaybackWarmRun(rt).count}/${MIN_START_SEGMENTS} waited=${Date.now() - t0}ms`);
+                notePlaylistHoldHealth(rt, "no-warm-cache");
                 return res.send(holdPlaylist.playlist);
             }
-            const retryAfterSeconds = 2;
-            setPlaylistHeaders(res);
-            res.setHeader("Retry-After", String(retryAfterSeconds));
             console.warn(`[HLS NOT READY] channel="${ch.name}" warmRun=${getPlaybackWarmRun(rt).count}/${warmTarget} waited=${Date.now() - t0}ms`);
-            return res.status(503).send("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n");
+            return sendWaitingPlaylist(res, ch.name, "no-warm-cache", rt.seqBase, Date.now() - t0);
         }
-        if (!readyAfterWait.ready && holdPlaylist) {
+        if (!readyAfterWait.ready && readyAfterWait.window < MIN_VISIBLE_SEGMENTS && holdPlaylist) {
             setPlaylistHeaders(res);
             console.warn(`[HLS HOLD] channel="${ch.name}" reason=short-window seq=${holdPlaylist.mediaSeq} edge=${holdPlaylist.edge} warmRun=${getPlayableWarmRun(rt, MIN_VISIBLE_SEGMENTS).count}/${MIN_VISIBLE_SEGMENTS} window=${readyAfterWait.window}/${MIN_VISIBLE_SEGMENTS} waited=${Date.now() - t0}ms`);
+            notePlaylistHoldHealth(rt, "short-window");
             return res.send(holdPlaylist.playlist);
         }
         if (!rt.primedOnce && !readyAfterWait.ready) {
@@ -1886,13 +1976,11 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
             if (holdPlaylist) {
                 setPlaylistHeaders(res);
                 console.warn(`[HLS HOLD] channel="${ch.name}" reason=${served.reason} seq=${holdPlaylist.mediaSeq} edge=${holdPlaylist.edge} warmRun=${served.warmRun}/${MIN_VISIBLE_SEGMENTS} waited=${Date.now() - t0}ms`);
+                notePlaylistHoldHealth(rt, served.reason);
                 return res.send(holdPlaylist.playlist);
             }
-            const retryAfterSeconds = 2;
-            setPlaylistHeaders(res);
-            res.setHeader("Retry-After", String(retryAfterSeconds));
             console.warn(`[HLS NOT READY] channel="${ch.name}" reason=${served.reason} warmRun=${served.warmRun}/${MIN_VISIBLE_SEGMENTS} waited=${Date.now() - t0}ms`);
-            return res.status(503).send("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n");
+            return sendWaitingPlaylist(res, ch.name, served.reason, rt.seqBase, Date.now() - t0);
         }
         const { playlist, count, mediaSeq, edge, hi, warmRun: servedWarmRun, readyAhead } = served;
         rt.lastServedPlaylist = { playlist, mediaSeq, edge };
@@ -1902,6 +1990,7 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         const degraded = readyAhead < LIVE_DELAY_SEGMENTS;
         console.log(`[HLS SERVE] channel="${ch.name}" window=${count} seq=${mediaSeq} edge=${edge}/${hi} held=${hi - edge}/${LIVE_DELAY_SEGMENTS} readyAhead=${readyAhead} warmRun=${servedWarmRun}${degraded ? " degraded=1" : ""} gen=${rt.generation} segmentIdle=${segmentIdle} segmentReq=${rt.segmentRequests} cache=${segCache.size}/${formatBytes(segCacheBytes)} prefetch=${prefetchActive}+${prefetchQueue.length} waited=${Date.now() - t0}ms`);
         res.send(playlist);
+        notePlaylistServeHealth(rt, served);
     } catch (err) {
         console.error(`[HLS ERROR] ${err.message}`);
         if (!res.headersSent) res.status(502).send("#EXTM3U\n#EXT-X-ENDLIST\n");

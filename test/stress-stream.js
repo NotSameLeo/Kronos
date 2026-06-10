@@ -51,6 +51,7 @@ function createMockUpstream() {
         masterManifests: 0,
         forbiddenUntil: 0,
         segmentForbiddenUntil: 0,
+        segmentForbiddenRequests: 0,
         manifestRequestsDuringForbidden: 0,
         expiredSegments: new Map()
     };
@@ -127,6 +128,7 @@ function createMockUpstream() {
 
         if (url.pathname === "/control/forbid-segments") {
             state.segmentForbiddenUntil = Date.now() + Number(url.searchParams.get("ms") || 0);
+            state.segmentForbiddenRequests = Number(url.searchParams.get("requests") || 0);
             res.writeHead(204);
             res.end();
             return;
@@ -216,7 +218,8 @@ function createMockUpstream() {
                 const attempt = (state.segmentAttempts.get(key) || 0) + 1;
                 state.segmentAttempts.set(key, attempt);
                 const seq = Number(sequence);
-                if (Date.now() < state.segmentForbiddenUntil) {
+                if (state.segmentForbiddenRequests > 0 || Date.now() < state.segmentForbiddenUntil) {
+                    if (state.segmentForbiddenRequests > 0) state.segmentForbiddenRequests--;
                     res.writeHead(403, { "content-type": "text/plain" });
                     res.end("segment auth expired");
                     return;
@@ -286,12 +289,13 @@ async function main() {
             MIN_START_SEGMENTS: "4",
             MIN_VISIBLE_SEGMENTS: "2",
             PRIME_WAIT_MS: "120",
-            STARTUP_REAL_SEGMENTS: "3",
+            STARTUP_REAL_SEGMENTS: "2",
             STARTUP_REAL_WAIT_MS: "6000",
             PREFETCH_WINDOW_SEGMENTS: "8",
             SEGMENT_AUTH_FAILURE_LIMIT: "3",
             SEGMENT_AUTH_FAILURE_MIN_MS: "3000",
             SEGMENT_AUTH_RECOVERY_COOLDOWN_MS: "800",
+            PLAYLIST_STALL_RECOVERY_POLLS: "2",
             RETAIN_SEGMENTS: "18",
             SERVE_SEGMENTS: "5",
             POLL_MIN_MS: "70",
@@ -384,7 +388,7 @@ async function main() {
         await waitForHealth();
 
         const initial = await readManifest("A");
-        assert(initial.segments.length >= 3, "initial playlist did not wait for a real startup cushion");
+        assert(initial.segments.length >= 2, "initial playlist did not wait for playable real media");
         assert(initial.segments.length <= 5, "initial real playlist exceeded its visible window");
         assert(initial.segments.every(segment => !segment.includes("/black.ts")), "startup served placeholder media");
         assert(maxInitialManifestMs < 5000, `initial real manifest took too long (${maxInitialManifestMs}ms)`);
@@ -455,9 +459,9 @@ async function main() {
         // Some providers keep returning fresh manifests while every segment URL is
         // forbidden. Kronos must restart the HLS session instead of holding the last
         // good playlist forever.
-        await request(`${upstreamOrigin}/control/forbid-segments?ms=5200`);
+        await request(`${upstreamOrigin}/control/forbid-segments?ms=6500`);
         const authRecoveryCursor = logs.join("").length;
-        const authDeadline = Date.now() + 4200;
+        const authDeadline = Date.now() + 5200;
         while (Date.now() < authDeadline) {
             const frozen = await readManifest("A");
             await assertManifestCached(frozen);
@@ -475,7 +479,14 @@ async function main() {
         }
         assert(recoveredAuth, "segment auth failure did not recover with a fresh session");
         const authRecoveryLogs = logs.join("").slice(authRecoveryCursor);
-        assert(authRecoveryLogs.includes("reason=segment-status-403"), "segment auth recovery reason was not logged");
+        assert(
+            authRecoveryLogs.includes("reason=segment-status-403")
+                || authRecoveryLogs.includes("reason=playlist-stall-status-403")
+                || authRecoveryLogs.includes("reason=playlist-hold-no-warm-cache-status-403"),
+            "segment auth, playlist stall, or playlist hold recovery reason was not logged"
+        );
+        await request(`${upstreamOrigin}/control/forbid-segments?ms=0`);
+        await waitForCushion("A");
 
         await request(`${upstreamOrigin}/control/restart?id=A`);
         await sleep(250);
@@ -548,6 +559,10 @@ async function main() {
         assert(text.includes("[CHANNEL RESTART]"), "encoder restart path was not exercised");
         assert(text.includes("[CHANNEL RECOVER]"), "segment auth recovery path was not exercised");
         assert(!/\[HLS SERVE\].*window=1\b/.test(text), "served a single-segment media playlist");
+        const playableShortWindowHolds = text
+            .split("\n")
+            .filter(line => /\[HLS HOLD\].*reason=short-window/.test(line) && /window=([2-9]\d*)\/2\b/.test(line));
+        assert.equal(playableShortWindowHolds.length, 0, `held a playable short-window manifest: ${playableShortWindowHolds[0] || ""}`);
         assert(text.includes("reason=channel-switch"), "zapping cancellation path was not exercised");
         assert(text.includes("reason=player-idle"), "idle cleanup path was not exercised");
         assert(text.includes("reason=direct-stream"), "direct stream cancellation path was not exercised");
@@ -562,7 +577,7 @@ async function main() {
             manifestRequestsDuringForbidden: mock.state.manifestRequestsDuringForbidden,
             cache: stats.cache,
             activeChannel: activeAfter,
-            exercised: ["real-startup-prime", "published-warm-cushion", "bounded-visible-window", "token-rotation", "invalid-manifest", "geo-403", "expired-segment-skip", "sustained-403-gap", "segment-auth-recovery", "slow-segments", "aborted-segment", "x2-consumption", "encoder-restart", "zapping", "idle-reopen", "direct-stream-gate", "master-playlist"]
+            exercised: ["real-startup-prime", "published-warm-cushion", "bounded-visible-window", "token-rotation", "invalid-manifest", "geo-403", "expired-segment-skip", "sustained-403-gap", "segment-auth-recovery", "playlist-stall-recovery", "slow-segments", "aborted-segment", "x2-consumption", "encoder-restart", "zapping", "idle-reopen", "direct-stream-gate", "master-playlist"]
         }, null, 2));
     } catch (err) {
         console.error(logs.join(""));
