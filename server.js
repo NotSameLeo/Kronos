@@ -45,7 +45,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "3.2.8";
+const RELEASE_VERSION = "3.2.9";
 const ADDON_TYPE = "tv";
 const CATALOG_TTL = 30 * 60 * 1000;
 const EPG_CACHE_TTL = Number(process.env.EPG_CACHE_TTL || 6 * 60 * 60 * 1000);
@@ -54,7 +54,7 @@ const EPG_MAX_BYTES = Number(process.env.EPG_MAX_BYTES || 160 * 1024 * 1024);
 const EPG_RETRY_DELAY_MS = Number(process.env.EPG_RETRY_DELAY_MS || 15000);
 const EPG_FIRST_CATALOG_WAIT_MS = Number(process.env.EPG_FIRST_CATALOG_WAIT_MS || 0);
 const EPG_REFRESH_INTERVAL_MS = Number(process.env.EPG_REFRESH_INTERVAL_MS || EPG_CACHE_TTL);
-const DEFAULT_EPG_PRELOAD_URL = "";
+const DEFAULT_EPG_PRELOAD_URL = "https://iptv-epg.org/files/epg-it.xml.gz";
 const EPG_PRELOAD_URL = String(process.env.EPG_PRELOAD_URL || DEFAULT_EPG_PRELOAD_URL).trim();
 const EPG_PRELOAD_URLS = parseUrlList(process.env.EPG_PRELOAD_URLS || EPG_PRELOAD_URL);
 const EPG_STARTUP_WATCH_MS = Number(process.env.EPG_STARTUP_WATCH_MS || 30000);
@@ -217,9 +217,10 @@ function isLegacyGuideProxyUrl(value) {
 function getEffectiveEpgUrl(config, lists = []) {
     const configured = String(config?.e || "").trim();
     const derived = lists.map(list => deriveXtreamEpgUrl(list.url)).filter(Boolean);
-    const candidates = [...new Set([...derived, configured, ...EPG_PRELOAD_URLS])].filter(Boolean);
-    if (!configured) return candidates[0] || "";
+    if (configured && !isLegacyGuideProxyUrl(configured)) return configured;
+    if (EPG_PRELOAD_URLS.length) return EPG_PRELOAD_URLS[0];
     if (isLegacyGuideProxyUrl(configured) && derived.length) return derived[0];
+    if (!configured && derived.length) return derived[0];
     return configured;
 }
 

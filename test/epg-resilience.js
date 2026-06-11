@@ -41,7 +41,7 @@ async function request(url, options = {}, timeoutMs = 3000) {
 }
 
 function createMock() {
-    const state = { epgHits: 0, guideHits: 0, playlistHits: 0 };
+    const state = { epgHits: 0, guideHits: 0, playlistHits: 0, xtreamEpgHits: 0 };
     const server = http.createServer((req, res) => {
         const origin = `http://127.0.0.1:${server.address().port}`;
         if (req.url.startsWith("/get.php")) {
@@ -67,6 +67,12 @@ function createMock() {
             return;
         }
         if (req.url.startsWith("/xmltv.php")) {
+            state.xtreamEpgHits++;
+            res.writeHead(500, { "content-type": "text/plain" });
+            res.end("provider EPG is not usable");
+            return;
+        }
+        if (req.url === "/global.xml") {
             state.epgHits++;
             const now = Date.now();
             const body = [
@@ -122,7 +128,7 @@ async function main() {
         env: {
             ...process.env,
             PORT: String(port),
-            EPG_PRELOAD_URL: `${upstreamOrigin}/xmltv.php?username=stress&password=secret`,
+            EPG_PRELOAD_URL: `${upstreamOrigin}/global.xml`,
             EPG_REQUEST_TIMEOUT: "120",
             EPG_RETRY_DELAY_MS: "100",
             PLAYLIST_RETRY_WINDOW_MS: "1000",
@@ -144,7 +150,8 @@ async function main() {
         assert(elapsed < 500, `catalog waited for EPG download (${elapsed}ms)`);
         assert.equal(mock.state.playlistHits, 2, "playlist was not recovered by its internal retry");
         assert.equal(mock.state.epgHits, 1, "concurrent catalog requests started duplicate EPG downloads");
-        assert.equal(mock.state.guideHits, 0, "legacy guide.gzip was fetched instead of derived XMLTV");
+        assert.equal(mock.state.guideHits, 0, "legacy guide.gzip was fetched instead of the global EPG");
+        assert.equal(mock.state.xtreamEpgHits, 0, "provider-derived EPG was preferred over the global EPG");
 
         let description = "";
         let debug = null;
@@ -168,7 +175,7 @@ async function main() {
 
         const text = logs.join("");
         assert(text.includes("[EPG PRELOAD]"), "startup EPG preload was not started");
-        assert(text.includes("[EPG RESOLVE]"), "legacy EPG URL was not resolved to derived XMLTV");
+        assert(text.includes("[EPG RESOLVE]"), "legacy EPG URL was not resolved to the global EPG");
         assert(text.includes("[EPG PENDING]"), "background EPG state was not logged");
         assert(text.includes("[EPG ERROR]"), "timeout path was not exercised");
         assert(text.includes("[EPG RETRY SCHEDULED]"), "automatic retry was not scheduled");
