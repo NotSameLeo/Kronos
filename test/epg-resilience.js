@@ -80,7 +80,7 @@ function createMock() {
                 "<tv>",
                 '<channel id="stress.it"><display-name>STRESS</display-name></channel>',
                 `<programme start="${xmltvDate(new Date(now - 60000))}" stop="${xmltvDate(new Date(now + 60000))}" channel="stress.it"><title>Film attuale</title><desc>Film attuale: Descrizione attuale.</desc></programme>`,
-                `<programme start="${xmltvDate(new Date(now + 60000))}" stop="${xmltvDate(new Date(now + 120000))}" channel="stress.it"><title>Film successivo</title><desc>Film successivo - Descrizione successiva.</desc></programme>`,
+                `<programme start="${xmltvDate(new Date(now + 60000))}" stop="${xmltvDate(new Date(now + 120000))}" channel="stress.it"><title>Regretting You - Tutto quello che non ti ho detto</title><desc>Tutto quello che non ti ho detto. - Josh Boone filma un nuovo bestseller.</desc></programme>`,
                 "</tv>"
             ].join("");
             const send = () => {
@@ -165,13 +165,14 @@ async function main() {
 
         assert(mock.state.epgHits >= 2, "EPG retry did not run automatically");
         assert(description.includes("🔴\u00a0In\u00a0Onda:\u00a0FILM\u00a0ATTUALE\u00a0("), "current programme format is incorrect");
-        assert(description.includes(")\u00a0|\u00a0Trama:\u00a0Descrizione\u00a0attuale\u00a0\u00a0║\u00a0\u00a0🔵\u00a0A\u00a0Seguire:\u00a0FILM\u00a0SUCCESSIVO\u00a0("), "inline EPG separator spacing is incorrect");
-        assert(description.includes(")\u00a0|\u00a0Trama:\u00a0Descrizione\u00a0successiva"), "next programme format is incorrect");
+        assert(description.includes(")\u00a0|\u00a0Trama:\u00a0Descrizione\u00a0attuale\u00a0\u00a0║\u00a0\u00a0🔵\u00a0A\u00a0Seguire:\u00a0REGRETTING\u00a0YOU\u00a0-\u00a0TUTTO\u00a0QUELLO\u00a0CHE\u00a0NON\u00a0TI\u00a0HO\u00a0DETTO\u00a0("), "inline EPG separator spacing is incorrect");
+        assert(description.includes(")\u00a0|\u00a0Trama:\u00a0Josh\u00a0Boone\u00a0filma\u00a0un\u00a0nuovo\u00a0bestseller"), "next programme format is incorrect");
         assert(!description.includes("▌"), "old test separator is still present");
         assert(!description.includes("Descrizione attuale."), "current description still has a trailing period");
         assert(!description.endsWith("."), "next description still has a trailing period");
         assert(!description.includes("Trama:\u00a0Film\u00a0attuale"), "current description repeats the programme title");
-        assert(!description.includes("Trama:\u00a0Film\u00a0successivo"), "next description repeats the programme title");
+        assert(!description.includes("Trama:\u00a0Tutto\u00a0quello\u00a0che\u00a0non\u00a0ti\u00a0ho\u00a0detto"), "next description repeats the programme title");
+        assert(!description.includes("Trama:\u00a0ti\u00a0ho\u00a0detto"), "next description was partially stripped");
         assert(!description.includes("€"), "stray euro prefix is still present");
         assert.equal(debug.cache.epgFetch.state, "ready", "EPG did not recover without restart");
 

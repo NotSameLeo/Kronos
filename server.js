@@ -48,7 +48,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "3.2.11";
+const RELEASE_VERSION = "3.2.12";
 const ADDON_TYPE = "tv";
 const CATALOG_TTL = 30 * 60 * 1000;
 const EPG_CACHE_TTL = Number(process.env.EPG_CACHE_TTL || 6 * 60 * 60 * 1000);
@@ -601,9 +601,32 @@ function formatProgramme(label, programme) {
 
 function stripRepeatedTitlePrefix(description, title) {
     const text = String(description || "").trim();
-    const target = epgComparableKey(title);
-    if (!text || !target) return text;
+    const candidates = getEpgTitlePrefixCandidates(title);
+    if (!text || !candidates.length) return text;
 
+    for (const candidate of candidates) {
+        const cleaned = stripComparablePrefix(text, candidate);
+        if (cleaned) return cleaned;
+    }
+    return text;
+}
+
+function getEpgTitlePrefixCandidates(title) {
+    const raw = String(title || "").trim();
+    if (!raw) return [];
+    const values = [raw];
+    for (const part of raw.split(/\s[-–—:|]\s/u)) {
+        const text = part.trim();
+        if (epgComparableKey(text).length >= 8) values.push(text);
+    }
+    return [...new Map(values
+        .map(value => [epgComparableKey(value), value])
+        .filter(([key]) => key.length >= 8)
+    ).values()].sort((a, b) => epgComparableKey(b).length - epgComparableKey(a).length);
+}
+
+function stripComparablePrefix(text, candidate) {
+    const target = epgComparableKey(candidate);
     let seen = "";
     for (let i = 0; i < text.length; i++) {
         const part = epgComparableKey(text[i]);
@@ -615,11 +638,16 @@ function stripRepeatedTitlePrefix(description, title) {
         }
         if (seen === target) {
             const cleaned = text.slice(i + 1).replace(/^[\s:;.,\-–—|]+/u, "").trim();
-            return cleaned || text;
+            if (!cleaned) return null;
+            // If the remainder starts lowercase, we probably stripped only part of
+            // a longer title/sentence (e.g. "Tutto quello che non ti ho detto" ->
+            // "ti ho detto. - ..."). Keeping the original is less harmful.
+            if (/^\p{Ll}/u.test(cleaned)) return null;
+            return cleaned;
         }
         break;
     }
-    return text;
+    return null;
 }
 
 function epgComparableKey(value) {
