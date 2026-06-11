@@ -41,10 +41,10 @@ async function request(url, options = {}, timeoutMs = 3000) {
 }
 
 function createMock() {
-    const state = { epgHits: 0, playlistHits: 0 };
+    const state = { epgHits: 0, guideHits: 0, playlistHits: 0 };
     const server = http.createServer((req, res) => {
         const origin = `http://127.0.0.1:${server.address().port}`;
-        if (req.url === "/playlist.m3u") {
+        if (req.url.startsWith("/get.php")) {
             state.playlistHits++;
             if (state.playlistHits === 1) {
                 res.writeHead(503, { "content-type": "text/plain" });
@@ -60,7 +60,13 @@ function createMock() {
             ].join("\n"));
             return;
         }
-        if (req.url === "/epg.gz") {
+        if (req.url === "/guide.gzip") {
+            state.guideHits++;
+            res.writeHead(404, { "content-type": "text/plain" });
+            res.end("old guide proxy is gone");
+            return;
+        }
+        if (req.url.startsWith("/xmltv.php")) {
             state.epgHits++;
             const now = Date.now();
             const body = [
@@ -103,9 +109,9 @@ async function main() {
     const mock = createMock();
     await new Promise(resolve => mock.server.listen(0, "127.0.0.1", resolve));
     const upstreamOrigin = `http://127.0.0.1:${mock.server.address().port}`;
-    const sourceUrl = `${upstreamOrigin}/playlist.m3u`;
+    const sourceUrl = `${upstreamOrigin}/get.php?username=stress&password=secret&type=m3u_plus&output=hls`;
     const streamUrl = `${upstreamOrigin}/live/stress.m3u8`;
-    const config = encodeConfig({ l: [{ n: "Stress", u: sourceUrl }], g: ["IT | TEST"], gm: "filter", e: `${upstreamOrigin}/epg.gz` });
+    const config = encodeConfig({ l: [{ n: "Stress", u: sourceUrl }], g: ["IT | TEST"], gm: "filter", e: `${upstreamOrigin}/guide.gzip` });
     const port = 19000 + Math.floor(Math.random() * 1000);
     const kronosOrigin = `http://127.0.0.1:${port}`;
     const id = channelId(sourceUrl, streamUrl);
@@ -116,6 +122,7 @@ async function main() {
         env: {
             ...process.env,
             PORT: String(port),
+            EPG_PRELOAD_URL: `${upstreamOrigin}/xmltv.php?username=stress&password=secret`,
             EPG_REQUEST_TIMEOUT: "120",
             EPG_RETRY_DELAY_MS: "100",
             PLAYLIST_RETRY_WINDOW_MS: "1000",
@@ -137,6 +144,7 @@ async function main() {
         assert(elapsed < 500, `catalog waited for EPG download (${elapsed}ms)`);
         assert.equal(mock.state.playlistHits, 2, "playlist was not recovered by its internal retry");
         assert.equal(mock.state.epgHits, 1, "concurrent catalog requests started duplicate EPG downloads");
+        assert.equal(mock.state.guideHits, 0, "legacy guide.gzip was fetched instead of derived XMLTV");
 
         let description = "";
         let debug = null;
@@ -160,6 +168,7 @@ async function main() {
 
         const text = logs.join("");
         assert(text.includes("[EPG PRELOAD]"), "startup EPG preload was not started");
+        assert(text.includes("[EPG RESOLVE]"), "legacy EPG URL was not resolved to derived XMLTV");
         assert(text.includes("[EPG PENDING]"), "background EPG state was not logged");
         assert(text.includes("[EPG ERROR]"), "timeout path was not exercised");
         assert(text.includes("[EPG RETRY SCHEDULED]"), "automatic retry was not scheduled");

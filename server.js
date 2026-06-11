@@ -45,7 +45,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "3.2.7";
+const RELEASE_VERSION = "3.2.8";
 const ADDON_TYPE = "tv";
 const CATALOG_TTL = 30 * 60 * 1000;
 const EPG_CACHE_TTL = Number(process.env.EPG_CACHE_TTL || 6 * 60 * 60 * 1000);
@@ -54,8 +54,9 @@ const EPG_MAX_BYTES = Number(process.env.EPG_MAX_BYTES || 160 * 1024 * 1024);
 const EPG_RETRY_DELAY_MS = Number(process.env.EPG_RETRY_DELAY_MS || 15000);
 const EPG_FIRST_CATALOG_WAIT_MS = Number(process.env.EPG_FIRST_CATALOG_WAIT_MS || 0);
 const EPG_REFRESH_INTERVAL_MS = Number(process.env.EPG_REFRESH_INTERVAL_MS || EPG_CACHE_TTL);
-const DEFAULT_EPG_PRELOAD_URL = "http://172.30.0.10:8080/guide.gzip";
+const DEFAULT_EPG_PRELOAD_URL = "";
 const EPG_PRELOAD_URL = String(process.env.EPG_PRELOAD_URL || DEFAULT_EPG_PRELOAD_URL).trim();
+const EPG_PRELOAD_URLS = parseUrlList(process.env.EPG_PRELOAD_URLS || EPG_PRELOAD_URL);
 const EPG_STARTUP_WATCH_MS = Number(process.env.EPG_STARTUP_WATCH_MS || 30000);
 const CATALOG_PRELOAD_CONFIGS = parseCatalogPreloadConfigs(process.env.CATALOG_PRELOAD_CONFIGS || process.env.KRONOS_PRELOAD_CONFIGS || "");
 const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 20000);
@@ -165,6 +166,14 @@ function parseCatalogPreloadConfigs(raw) {
         .filter(Boolean);
 }
 
+function parseUrlList(raw) {
+    const urls = String(raw || "")
+        .split(/[,\s]+/)
+        .map(value => value.trim())
+        .filter(Boolean);
+    return [...new Set(urls)];
+}
+
 function extractConfigKey(value) {
     const raw = String(value || "").trim();
     if (!raw) return "";
@@ -179,6 +188,39 @@ function extractConfigKey(value) {
         if (parts[0]) return parts[0];
     } catch {}
     return raw.replace(/^\/+|\/+$/g, "");
+}
+
+function deriveXtreamEpgUrl(sourceUrl) {
+    try {
+        const parsed = new URL(sourceUrl);
+        const username = parsed.searchParams.get("username");
+        const password = parsed.searchParams.get("password");
+        if (!username || !password) return "";
+        const epg = new URL("/xmltv.php", parsed.origin);
+        epg.searchParams.set("username", username);
+        epg.searchParams.set("password", password);
+        return epg.toString();
+    } catch {
+        return "";
+    }
+}
+
+function isLegacyGuideProxyUrl(value) {
+    try {
+        const parsed = new URL(value);
+        return /\/guide\.gzip$/i.test(parsed.pathname);
+    } catch {
+        return false;
+    }
+}
+
+function getEffectiveEpgUrl(config, lists = []) {
+    const configured = String(config?.e || "").trim();
+    const derived = lists.map(list => deriveXtreamEpgUrl(list.url)).filter(Boolean);
+    const candidates = [...new Set([...derived, configured, ...EPG_PRELOAD_URLS])].filter(Boolean);
+    if (!configured) return candidates[0] || "";
+    if (isLegacyGuideProxyUrl(configured) && derived.length) return derived[0];
+    return configured;
 }
 
 function encodeProxyUrl(url) { return Buffer.from(String(url), "utf8").toString("base64url"); }
@@ -297,18 +339,19 @@ function scheduleEPGPeriodicRefresh(epgUrl) {
 }
 
 function startEPGStartupPreload() {
-    if (!EPG_PRELOAD_URL) return;
-    console.log(`[EPG PRELOAD] url=${EPG_PRELOAD_URL}`);
-    startEPGBackgroundRefresh(EPG_PRELOAD_URL, "startup");
+    if (!EPG_PRELOAD_URLS.length) return;
+    console.log(`[EPG PRELOAD] urls=${EPG_PRELOAD_URLS.length}`);
+    EPG_PRELOAD_URLS.forEach(epgUrl => startEPGBackgroundRefresh(epgUrl, "startup"));
 
     if (EPG_STARTUP_WATCH_MS <= 0) return;
     const started = Date.now();
     const timer = setInterval(() => {
-        if (getCachedEPG(EPG_PRELOAD_URL) || Date.now() - started >= EPG_STARTUP_WATCH_MS) {
+        const pending = EPG_PRELOAD_URLS.filter(epgUrl => !getCachedEPG(epgUrl));
+        if (!pending.length || Date.now() - started >= EPG_STARTUP_WATCH_MS) {
             clearInterval(timer);
             return;
         }
-        startEPGBackgroundRefresh(EPG_PRELOAD_URL, "startup-watch");
+        pending.forEach(epgUrl => startEPGBackgroundRefresh(epgUrl, "startup-watch"));
     }, 3000);
     if (timer.unref) timer.unref();
 }
@@ -726,14 +769,17 @@ async function fetchAndProcessChannels(configKey, config, options = {}) {
     if (memoryCache.channelInflight[configKey] && !options.force) return memoryCache.channelInflight[configKey];
     const promise = (async () => {
         memoryCache.isUpdating[configKey] = true;
-        subscribeConfigToEPG(configKey, config);
-        const epgPromise = config.e
-            ? ensureEPGRefresh(config.e).catch(err => {
+        const lists = getConfiguredLists(config);
+        const epgUrl = getEffectiveEpgUrl(config, lists);
+        const effectiveConfig = epgUrl === config.e ? config : { ...config, e: epgUrl };
+        if (config.e && epgUrl && epgUrl !== config.e) console.log(`[EPG RESOLVE] configured=${config.e} effective=${epgUrl}`);
+        subscribeConfigToEPG(configKey, effectiveConfig);
+        const epgPromise = epgUrl
+            ? ensureEPGRefresh(epgUrl).catch(err => {
                 console.error("[EPG REFRESH]", err.message);
                 return null;
             })
             : null;
-        const lists = getConfiguredLists(config);
         const selectedGroups = Array.isArray(config.g) ? config.g : [];
         const selectedSet = new Set(selectedGroups.map(normalizeGroupName));
         const bucketGroup = selectedGroups[0] || "Kronos";
@@ -756,17 +802,17 @@ async function fetchAndProcessChannels(configKey, config, options = {}) {
                     group: config.gm === "bucket" ? bucketGroup : c.group
                 };
             });
-        let epgData = getCachedEPG(config.e);
-        if (config.e && !epgData && epgPromise && EPG_FIRST_CATALOG_WAIT_MS > 0) {
+        let epgData = getCachedEPG(epgUrl);
+        if (epgUrl && !epgData && epgPromise && EPG_FIRST_CATALOG_WAIT_MS > 0) {
             console.log(`[EPG WAIT] upTo=${EPG_FIRST_CATALOG_WAIT_MS / 1000}s`);
             epgData = await Promise.race([
                 epgPromise,
                 sleep(EPG_FIRST_CATALOG_WAIT_MS).then(() => null)
             ]);
-            if (!epgData) epgData = getCachedEPG(config.e);
+            if (!epgData) epgData = getCachedEPG(epgUrl);
         }
         const { channels, matched: epgMatched } = attachEPGToChannels(rawChannels, epgData);
-        if (config.e && !epgData) console.log("[EPG PENDING] catalog served without guide; background refresh active");
+        if (epgUrl && !epgData) console.log("[EPG PENDING] catalog served without guide; background refresh active");
 
         memoryCache.channelItems[configKey] = channels;
         memoryCache.channelIndex[configKey] = buildChannelIndex(channels);
@@ -776,7 +822,7 @@ async function fetchAndProcessChannels(configKey, config, options = {}) {
             feedChannels: epgData?.channelCount || 0
         };
         memoryCache.lastUpdate[configKey] = Date.now();
-        if (config.e) console.log(`[EPG MATCH] matched=${epgMatched}/${channels.length} feedChannels=${epgData?.channelCount || 0}`);
+        if (epgUrl) console.log(`[EPG MATCH] matched=${epgMatched}/${channels.length} feedChannels=${epgData?.channelCount || 0}`);
         console.log(`[CATALOG OK] channels=${channels.length} lists=${lists.length}`);
         return channels;
     })();
@@ -2248,6 +2294,8 @@ app.get("/:base64Config/debug", async (req, res) => {
         const configKey = req.params.base64Config;
         const config = decodeConfig(configKey);
         const channels = await getChannelsFromCache(configKey, config);
+        const effectiveConfig = memoryCache.configByKey[configKey] || config;
+        const effectiveEpgUrl = effectiveConfig.e || "";
         res.json({
             version: RELEASE_VERSION,
             mode: "buffered-hls-relay",
@@ -2263,9 +2311,10 @@ app.get("/:base64Config/debug", async (req, res) => {
                 lastUpdate: memoryCache.lastUpdate[configKey],
                 isUpdating: memoryCache.isUpdating[configKey],
                 epg: memoryCache.epgMatchStats[configKey] || null,
-                epgFetch: config.e ? {
-                    ...(memoryCache.epgStatus[config.e] || { state: "idle" }),
-                    inflight: !!memoryCache.epgInflight[config.e]
+                epgFetch: effectiveEpgUrl ? {
+                    url: effectiveEpgUrl,
+                    ...(memoryCache.epgStatus[effectiveEpgUrl] || { state: "idle" }),
+                    inflight: !!memoryCache.epgInflight[effectiveEpgUrl]
                 } : null
             },
             sampleChannels: channels.slice(0, 5).map(c => ({
@@ -2298,7 +2347,7 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`🩹 segment playerRetry=${SEGMENT_PLAYER_RETRIES} delay=${SEGMENT_PLAYER_RETRY_DELAY_MS}ms`);
     console.log(`🔐 segment authRecovery=${SEGMENT_AUTH_FAILURE_LIMIT}/${SEGMENT_AUTH_FAILURE_MIN_MS / 1000}s cooldown=${SEGMENT_AUTH_RECOVERY_COOLDOWN_MS / 1000}s`);
     console.log(`🪟 buffer: retain/serve=${RETAIN_SEGMENTS}/${SERVE_SEGMENTS} liveDelay=${LIVE_DELAY_SEGMENTS}segs prime=${MIN_START_SEGMENTS}segs startup=${STARTUP_REAL_SEGMENTS}segs/${STARTUP_REAL_WAIT_MS / 1000}s prefetchWindow=${PREFETCH_WINDOW_SEGMENTS} wait=${PRIME_WAIT_MS / 1000}s typeWait=${MANIFEST_TYPE_WAIT_MS / 1000}s minVisible=${MIN_VISIBLE_SEGMENTS} idleStop=${POLLER_IDLE_STOP_MS / 1000}s`);
-    console.log(`📺 epg timezone=${EPG_TIME_ZONE} timeout=${EPG_REQUEST_TIMEOUT / 1000}s firstWait=${EPG_FIRST_CATALOG_WAIT_MS / 1000}s retryDelay=${EPG_RETRY_DELAY_MS / 1000}s cacheTTL=${EPG_CACHE_TTL / 1000}s refresh=${EPG_REFRESH_INTERVAL_MS / 1000}s preload=${EPG_PRELOAD_URL ? "on" : "off"} startupWatch=${EPG_STARTUP_WATCH_MS / 1000}s`);
+    console.log(`📺 epg timezone=${EPG_TIME_ZONE} timeout=${EPG_REQUEST_TIMEOUT / 1000}s firstWait=${EPG_FIRST_CATALOG_WAIT_MS / 1000}s retryDelay=${EPG_RETRY_DELAY_MS / 1000}s cacheTTL=${EPG_CACHE_TTL / 1000}s refresh=${EPG_REFRESH_INTERVAL_MS / 1000}s preload=${EPG_PRELOAD_URLS.length} startupWatch=${EPG_STARTUP_WATCH_MS / 1000}s`);
     console.log(`📚 catalog preload=${CATALOG_PRELOAD_CONFIGS.length}`);
     console.log("=".repeat(60) + "\n");
     startEPGStartupPreload();
