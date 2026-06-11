@@ -12,6 +12,9 @@ const PORT = process.env.PORT || 7000;
 const LOG_TIME_ZONE = process.env.LOG_TIME_ZONE || process.env.EPG_TIME_ZONE || "Europe/Rome";
 const logTimeFormatter = new Intl.DateTimeFormat("it-IT", {
     timeZone: LOG_TIME_ZONE,
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
@@ -45,7 +48,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "3.2.9";
+const RELEASE_VERSION = "3.2.10";
 const ADDON_TYPE = "tv";
 const CATALOG_TTL = 30 * 60 * 1000;
 const EPG_CACHE_TTL = Number(process.env.EPG_CACHE_TTL || 6 * 60 * 60 * 1000);
@@ -121,6 +124,7 @@ const PRIME_WAIT_MS = Number(process.env.PRIME_WAIT_MS || 1500);
 const MANIFEST_TYPE_WAIT_MS = Number(process.env.MANIFEST_TYPE_WAIT_MS || 1500);
 const STARTUP_REAL_SEGMENTS = Math.max(MIN_VISIBLE_SEGMENTS, Number(process.env.STARTUP_REAL_SEGMENTS || 2));
 const STARTUP_REAL_WAIT_MS = Number(process.env.STARTUP_REAL_WAIT_MS || 20000);
+const STARTUP_PARTIAL_WAIT_MS = Math.min(STARTUP_REAL_WAIT_MS, Number(process.env.STARTUP_PARTIAL_WAIT_MS || 3000));
 const POLLER_IDLE_STOP_MS = Number(process.env.POLLER_IDLE_STOP_MS || 5 * 60 * 1000); // stop if player gone
 const POLL_MIN_MS = Number(process.env.POLL_MIN_MS || 2500);
 const POLL_MAX_MS = Number(process.env.POLL_MAX_MS || 12000);
@@ -1847,6 +1851,40 @@ function buildServedPlaylist(rt, hostBase, configKey) {
     };
 }
 
+function buildStartupPartialPlaylist(rt, hostBase, configKey) {
+    const warmRun = getPlayableWarmRun(rt, 1);
+    if (warmRun.count <= 0) return null;
+    const endIdx = Math.min(warmRun.end, Math.max(warmRun.start, getLatestWarmIndex(rt)));
+    const seg = rt.segs[endIdx];
+    if (!seg || !getSegFromCache(seg.id)) return null;
+
+    rt.servedEdge = rt.seqBase + endIdx;
+    const mediaSeq = rt.servedEdge;
+    const discontinuitySequence = rt.discontinuityBase
+        + rt.segs.slice(0, endIdx).filter(s => s.discontinuity).length;
+    const target = Math.max(1, Math.ceil(Number(seg.duration || rt.target || 6)));
+    const lines = [
+        "#EXTM3U",
+        "#EXT-X-VERSION:3",
+        `#EXT-X-TARGETDURATION:${target}`,
+        `#EXT-X-MEDIA-SEQUENCE:${mediaSeq}`,
+        `#EXT-X-DISCONTINUITY-SEQUENCE:${discontinuitySequence}`
+    ];
+    if (seg.discontinuity) lines.push("#EXT-X-DISCONTINUITY");
+    lines.push(`#EXTINF:${Number(seg.duration || rt.target || 6).toFixed(3)},`);
+    lines.push(`${hostBase}/${configKey}/proxy/seg?s=${encodeURIComponent(seg.id)}`);
+
+    return {
+        playlist: lines.join("\n") + "\n",
+        count: 1,
+        mediaSeq,
+        edge: rt.servedEdge,
+        hi: rt.seqBase + rt.segs.length - 1,
+        warmRun: warmRun.count,
+        readyAhead: Math.max(0, warmRun.end - endIdx)
+    };
+}
+
 function getServeReadiness(rt) {
     const warmRun = getPlayableWarmRun(rt, MIN_VISIBLE_SEGMENTS);
     if (warmRun.count <= 0) return { ready: false, window: 0, readyAhead: 0 };
@@ -1982,6 +2020,7 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
             const startedWait = Date.now();
             while (rt.running && !rt.isMaster && !getStartupReadiness(rt).ready) {
                 if (Date.now() - startedWait >= STARTUP_REAL_WAIT_MS) break;
+                if (Date.now() - startedWait >= STARTUP_PARTIAL_WAIT_MS && getPlayableWarmRun(rt, 1).count > 0) break;
                 rt.lastPlayerAt = Date.now();
                 await sleep(50);
             }
@@ -2014,7 +2053,18 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
             return res.send(holdPlaylist.playlist);
         }
         if (!rt.primedOnce && !readyAfterWait.ready) {
-            console.warn(`[HLS START PARTIAL] channel="${ch.name}" warmRun=${getPlaybackWarmRun(rt).count}/${STARTUP_REAL_SEGMENTS} waited=${Date.now() - t0}ms`);
+            const partial = buildStartupPartialPlaylist(rt, host, configKey);
+            if (partial) {
+                rt.primedOnce = true;
+                rt.lastServedPlaylist = { playlist: partial.playlist, mediaSeq: partial.mediaSeq, edge: partial.edge };
+                rt.holdPlaylist = rt.lastServedPlaylist;
+                setPlaylistHeaders(res);
+                console.warn(`[HLS START PARTIAL] channel="${ch.name}" window=${partial.count} seq=${partial.mediaSeq} edge=${partial.edge}/${partial.hi} warmRun=${partial.warmRun}/${STARTUP_REAL_SEGMENTS} waited=${Date.now() - t0}ms`);
+                res.send(partial.playlist);
+                notePlaylistServeHealth(rt, partial);
+                return;
+            }
+            console.warn(`[HLS START PARTIAL MISS] channel="${ch.name}" warmRun=${getPlaybackWarmRun(rt).count}/${STARTUP_REAL_SEGMENTS} waited=${Date.now() - t0}ms`);
         }
         rt.primedOnce = true;
 
@@ -2347,7 +2397,7 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`⏩ prefetch concurrency=${SEGMENT_PREFETCH_CONCURRENCY} cacheTTL=${SEGMENT_CACHE_TTL / 1000}s`);
     console.log(`🩹 segment playerRetry=${SEGMENT_PLAYER_RETRIES} delay=${SEGMENT_PLAYER_RETRY_DELAY_MS}ms`);
     console.log(`🔐 segment authRecovery=${SEGMENT_AUTH_FAILURE_LIMIT}/${SEGMENT_AUTH_FAILURE_MIN_MS / 1000}s cooldown=${SEGMENT_AUTH_RECOVERY_COOLDOWN_MS / 1000}s`);
-    console.log(`🪟 buffer: retain/serve=${RETAIN_SEGMENTS}/${SERVE_SEGMENTS} liveDelay=${LIVE_DELAY_SEGMENTS}segs prime=${MIN_START_SEGMENTS}segs startup=${STARTUP_REAL_SEGMENTS}segs/${STARTUP_REAL_WAIT_MS / 1000}s prefetchWindow=${PREFETCH_WINDOW_SEGMENTS} wait=${PRIME_WAIT_MS / 1000}s typeWait=${MANIFEST_TYPE_WAIT_MS / 1000}s minVisible=${MIN_VISIBLE_SEGMENTS} idleStop=${POLLER_IDLE_STOP_MS / 1000}s`);
+    console.log(`🪟 buffer: retain/serve=${RETAIN_SEGMENTS}/${SERVE_SEGMENTS} liveDelay=${LIVE_DELAY_SEGMENTS}segs prime=${MIN_START_SEGMENTS}segs startup=${STARTUP_REAL_SEGMENTS}segs/${STARTUP_REAL_WAIT_MS / 1000}s partialWait=${STARTUP_PARTIAL_WAIT_MS / 1000}s prefetchWindow=${PREFETCH_WINDOW_SEGMENTS} wait=${PRIME_WAIT_MS / 1000}s typeWait=${MANIFEST_TYPE_WAIT_MS / 1000}s minVisible=${MIN_VISIBLE_SEGMENTS} idleStop=${POLLER_IDLE_STOP_MS / 1000}s`);
     console.log(`📺 epg timezone=${EPG_TIME_ZONE} timeout=${EPG_REQUEST_TIMEOUT / 1000}s firstWait=${EPG_FIRST_CATALOG_WAIT_MS / 1000}s retryDelay=${EPG_RETRY_DELAY_MS / 1000}s cacheTTL=${EPG_CACHE_TTL / 1000}s refresh=${EPG_REFRESH_INTERVAL_MS / 1000}s preload=${EPG_PRELOAD_URLS.length} startupWatch=${EPG_STARTUP_WATCH_MS / 1000}s`);
     console.log(`📚 catalog preload=${CATALOG_PRELOAD_CONFIGS.length}`);
     console.log("=".repeat(60) + "\n");
