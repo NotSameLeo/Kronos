@@ -48,7 +48,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "3.2.10";
+const RELEASE_VERSION = "3.2.11";
 const ADDON_TYPE = "tv";
 const CATALOG_TTL = 30 * 60 * 1000;
 const EPG_CACHE_TTL = Number(process.env.EPG_CACHE_TTL || 6 * 60 * 60 * 1000);
@@ -595,8 +595,39 @@ function formatEpgDescription(programmes) {
 }
 
 function formatProgramme(label, programme) {
-    const description = String(programme.desc || "").slice(0, 500).trim().replace(/\.+$/, "");
+    const description = stripRepeatedTitlePrefix(programme.desc || "", programme.title).slice(0, 500).trim().replace(/\.+$/, "");
     return nbsp(`${label}: ${String(programme.title || "").toUpperCase()} (${formatTime(programme.start)} - ${formatTime(programme.stop)}) | Trama: ${description}`);
+}
+
+function stripRepeatedTitlePrefix(description, title) {
+    const text = String(description || "").trim();
+    const target = epgComparableKey(title);
+    if (!text || !target) return text;
+
+    let seen = "";
+    for (let i = 0; i < text.length; i++) {
+        const part = epgComparableKey(text[i]);
+        if (!part) continue;
+        seen += part;
+        if (seen.length < target.length) {
+            if (!target.startsWith(seen)) break;
+            continue;
+        }
+        if (seen === target) {
+            const cleaned = text.slice(i + 1).replace(/^[\s:;.,\-–—|]+/u, "").trim();
+            return cleaned || text;
+        }
+        break;
+    }
+    return text;
+}
+
+function epgComparableKey(value) {
+    return String(value || "")
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "");
 }
 
 function nbsp(text) {

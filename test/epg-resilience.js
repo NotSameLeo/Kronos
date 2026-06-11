@@ -79,8 +79,8 @@ function createMock() {
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
                 "<tv>",
                 '<channel id="stress.it"><display-name>STRESS</display-name></channel>',
-                `<programme start="${xmltvDate(new Date(now - 60000))}" stop="${xmltvDate(new Date(now + 60000))}" channel="stress.it"><title>Film attuale</title><desc>Descrizione attuale.</desc></programme>`,
-                `<programme start="${xmltvDate(new Date(now + 60000))}" stop="${xmltvDate(new Date(now + 120000))}" channel="stress.it"><title>Film successivo</title><desc>Descrizione successiva.</desc></programme>`,
+                `<programme start="${xmltvDate(new Date(now - 60000))}" stop="${xmltvDate(new Date(now + 60000))}" channel="stress.it"><title>Film attuale</title><desc>Film attuale: Descrizione attuale.</desc></programme>`,
+                `<programme start="${xmltvDate(new Date(now + 60000))}" stop="${xmltvDate(new Date(now + 120000))}" channel="stress.it"><title>Film successivo</title><desc>Film successivo - Descrizione successiva.</desc></programme>`,
                 "</tv>"
             ].join("");
             const send = () => {
@@ -170,6 +170,8 @@ async function main() {
         assert(!description.includes("▌"), "old test separator is still present");
         assert(!description.includes("Descrizione attuale."), "current description still has a trailing period");
         assert(!description.endsWith("."), "next description still has a trailing period");
+        assert(!description.includes("Trama:\u00a0Film\u00a0attuale"), "current description repeats the programme title");
+        assert(!description.includes("Trama:\u00a0Film\u00a0successivo"), "next description repeats the programme title");
         assert(!description.includes("€"), "stray euro prefix is still present");
         assert.equal(debug.cache.epgFetch.state, "ready", "EPG did not recover without restart");
 
