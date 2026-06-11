@@ -48,7 +48,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "3.2.12";
+const RELEASE_VERSION = "3.2.13";
 const ADDON_TYPE = "tv";
 const CATALOG_TTL = 30 * 60 * 1000;
 const EPG_CACHE_TTL = Number(process.env.EPG_CACHE_TTL || 6 * 60 * 60 * 1000);
@@ -104,18 +104,18 @@ const PLAYLIST_STALL_RECOVERY_POLLS = Math.max(1, Number(process.env.PLAYLIST_ST
 // buffer, and (c) prefetches segments. The player sees a smaller live window so
 // it cannot wander back into old segments after a temporary stall.
 const RETAIN_SEGMENTS = Number(process.env.RETAIN_SEGMENTS || 18);
-// Warm segments only help the player if they are advertised in the playlist.
-// Keep the option for providers that require an artificial live delay, but do
-// not hide ready media by default.
-const LIVE_DELAY_SEGMENTS = Math.max(0, Number(process.env.LIVE_DELAY_SEGMENTS ?? 0));
+// Keep playback slightly behind the newest cached segment. With Xtream-style IPTV
+// the upstream periodically returns 502/403 bursts; serving the absolute live edge
+// gives Stremio no cushion and causes mid-stream buffering.
+const LIVE_DELAY_SEGMENTS = Math.max(0, Number(process.env.LIVE_DELAY_SEGMENTS ?? 2));
 // Anti-jump limit: advance the served live edge by at most this many segments per
 // request while retained history still exists. If upstream history disappears,
 // catching up is unavoidable.
 const MAX_EDGE_ADVANCE = Number(process.env.MAX_EDGE_ADVANCE || 2);
 const MIN_VISIBLE_SEGMENTS = Math.max(1, Number(process.env.MIN_VISIBLE_SEGMENTS || 2));
 const MIN_START_SEGMENTS = Math.max(MIN_VISIBLE_SEGMENTS + LIVE_DELAY_SEGMENTS, Number(process.env.MIN_START_SEGMENTS || 4));
-const SERVE_SEGMENTS = Math.max(MIN_VISIBLE_SEGMENTS, Number(process.env.SERVE_SEGMENTS || 6));
-const PREFETCH_WINDOW_SEGMENTS = Math.max(MIN_START_SEGMENTS, Number(process.env.PREFETCH_WINDOW_SEGMENTS || 8));
+const SERVE_SEGMENTS = Math.max(MIN_VISIBLE_SEGMENTS, Number(process.env.SERVE_SEGMENTS || 7));
+const PREFETCH_WINDOW_SEGMENTS = Math.max(MIN_START_SEGMENTS + LIVE_DELAY_SEGMENTS, Number(process.env.PREFETCH_WINDOW_SEGMENTS || 12));
 const SEGMENT_AUTH_RECOVERY_DISTINCT_SEGMENTS = Math.max(
     SEGMENT_AUTH_FAILURE_LIMIT,
     Number(process.env.SEGMENT_AUTH_RECOVERY_DISTINCT_SEGMENTS || (PREFETCH_WINDOW_SEGMENTS + MIN_VISIBLE_SEGMENTS))
@@ -1222,7 +1222,10 @@ function queuePrefetch(ids) {
 function getRuntimePrefetchIds(rt) {
     const ids = rt.segs.map(s => s.id);
     if (!ids.length) return [];
-    if (!rt.primedOnce) return ids.slice(-MIN_START_SEGMENTS).filter(id => !deadSegIds.has(id));
+    if (!rt.primedOnce) {
+        return ids.slice(-MIN_START_SEGMENTS)
+            .filter(id => !deadSegIds.has(id) && !getSegFromCache(id));
+    }
 
     let startIdx;
     if (rt.lastRequestedSeq != null) {
@@ -1232,8 +1235,26 @@ function getRuntimePrefetchIds(rt) {
     } else {
         startIdx = Math.max(0, ids.length - MIN_START_SEGMENTS);
     }
+    const selected = [];
+    const addCandidate = id => {
+        if (selected.length >= PREFETCH_WINDOW_SEGMENTS) return;
+        if (deadSegIds.has(id) || getSegFromCache(id) || selected.includes(id)) return;
+        selected.push(id);
+    };
+
     const from = Math.min(startIdx, ids.length);
-    return ids.slice(from, from + PREFETCH_WINDOW_SEGMENTS).filter(id => !deadSegIds.has(id));
+    for (let i = from; i < ids.length && selected.length < PREFETCH_WINDOW_SEGMENTS; i++) {
+        addCandidate(ids[i]);
+    }
+
+    // If the player has not requested a segment recently, the playback cursor can
+    // lag behind while the poller keeps ingesting new playlist entries. Keep warming
+    // the newest tail instead of letting cached entries consume the whole window.
+    const tailStart = Math.max(0, ids.length - PREFETCH_WINDOW_SEGMENTS);
+    for (let i = tailStart; i < ids.length && selected.length < PREFETCH_WINDOW_SEGMENTS; i++) {
+        addCandidate(ids[i]);
+    }
+    return selected;
 }
 
 function queueRuntimePrefetch(rt) {
@@ -1601,6 +1622,7 @@ function recoverChannelSession(rt, reason) {
     rt.servedEdge = null;
     rt.primedOnce = false;
     rt.pendingDiscontinuity = true;
+    rt.pendingPlaylistDiscontinuity = true;
     rt.lastRequestedSeq = null;
     rt.lastUpstreamEndSeq = null;
     rt.lastServedPlaylist = holdPlaylist || null;
@@ -1695,7 +1717,7 @@ function stopPoller(rt, reason) {
     if (rt.pollAbort) { rt.pollAbort.abort(); rt.pollAbort = null; }
     cancelPrefetch(reason);
     rt.segs = []; rt.byId = new Set(); rt.seqBase = 0; rt.lastSeq = -1; rt.servedEdge = null; rt.primedOnce = false; rt.lastServedPlaylist = null; rt.holdPlaylist = null;
-    rt.discontinuityBase = 0; rt.pendingDiscontinuity = false;
+    rt.discontinuityBase = 0; rt.pendingDiscontinuity = false; rt.pendingPlaylistDiscontinuity = false;
     rt.lastManifestAt = null; rt.lastSegmentAt = null; rt.lastBufferAddedAt = null; rt.segmentRequests = 0;
     rt.lastRequestedSeq = null; rt.lastUpstreamEndSeq = null;
     rt.lastPollStatus = null; rt.pollFailures = 0; rt.lastManifestErrorAt = null;
@@ -1723,7 +1745,7 @@ function ensureChannel(url, label) {
             url, label, segs: [], byId: new Set(), seqBase: 0, generation: 0,
             target: 6, lastSeq: -1, isMaster: false, lastPlayerAt: Date.now(),
             running: false, timer: null, pollAbort: null, servedEdge: null, primedOnce: false, lastServedPlaylist: null, holdPlaylist: null,
-            discontinuityBase: 0, pendingDiscontinuity: false,
+            discontinuityBase: 0, pendingDiscontinuity: false, pendingPlaylistDiscontinuity: false,
             lastManifestAt: null, lastSegmentAt: null, lastBufferAddedAt: null, segmentRequests: 0,
             lastRequestedSeq: null, lastUpstreamEndSeq: null,
             lastPollStatus: null, pollFailures: 0, lastManifestErrorAt: null,
@@ -1806,7 +1828,7 @@ function ingestPlaylist(rt, playlist, baseUrl, info) {
         // MEDIA-SEQUENCE never goes backward → it rejoins live moving forward instead
         // of "jumping to the beginning". New generation keeps stale cache out.
         rt.seqBase = rt.seqBase + rt.segs.length;
-        rt.segs = []; rt.byId = new Set(); rt.primedOnce = false; rt.pendingDiscontinuity = true;
+        rt.segs = []; rt.byId = new Set(); rt.primedOnce = false; rt.pendingDiscontinuity = true; rt.pendingPlaylistDiscontinuity = true;
         rt.lastRequestedSeq = null; rt.lastUpstreamEndSeq = null; rt.servedEdge = null;
         console.log(`[CHANNEL RESTART] channel="${rt.label}" seq ${rt.lastSeq}->${seq} gen=${rt.generation} continuing seqBase=${rt.seqBase}`);
     }
@@ -1818,6 +1840,7 @@ function ingestPlaylist(rt, playlist, baseUrl, info) {
     if (rt.lastUpstreamEndSeq != null && firstUpstreamSeq != null && firstUpstreamSeq > rt.lastUpstreamEndSeq + 1) {
         const missing = firstUpstreamSeq - rt.lastUpstreamEndSeq - 1;
         rt.pendingDiscontinuity = true;
+        rt.pendingPlaylistDiscontinuity = true;
         console.warn(`[CHANNEL GAP] channel="${rt.label}" missing=${missing} upstreamSeq=${rt.lastUpstreamEndSeq}->${firstUpstreamSeq}`);
     }
 
@@ -1885,8 +1908,9 @@ function buildServedPlaylist(rt, hostBase, configKey) {
     const startIdx = Math.max(activeRun.start, endIdx - SERVE_SEGMENTS + 1);
     if (gapJumped && rt.segs[startIdx]) rt.segs[startIdx].discontinuity = true;
     const win = rt.segs.slice(startIdx, endIdx + 1);
-    const forceStartDiscontinuity = rt.segs.slice(0, startIdx).some(s => s.discontinuity)
-        && !win.some(s => s.discontinuity);
+    const hasWindowDiscontinuity = win.some(s => s.discontinuity);
+    const forceStartDiscontinuity = !hasWindowDiscontinuity
+        && (rt.pendingPlaylistDiscontinuity || rt.segs.slice(0, startIdx).some(s => s.discontinuity));
     const mediaSeq = rt.seqBase + startIdx;
     const discontinuitySequence = rt.discontinuityBase
         + rt.segs.slice(0, startIdx).filter(s => s.discontinuity).length;
@@ -1902,6 +1926,9 @@ function buildServedPlaylist(rt, hostBase, configKey) {
         if (s.discontinuity || (idx === 0 && forceStartDiscontinuity)) lines.push("#EXT-X-DISCONTINUITY");
         lines.push(`#EXTINF:${Number(s.duration || rt.target || 6).toFixed(3)},`);
         lines.push(`${hostBase}/${configKey}/proxy/seg?s=${encodeURIComponent(s.id)}`);
+    }
+    if (hasWindowDiscontinuity || forceStartDiscontinuity) {
+        rt.pendingPlaylistDiscontinuity = false;
     }
     return {
         playlist: lines.join("\n") + "\n",
@@ -2111,7 +2138,7 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
             notePlaylistHoldHealth(rt, "short-window");
             return res.send(holdPlaylist.playlist);
         }
-        if (!rt.primedOnce && !readyAfterWait.ready) {
+        if (fresh && !readyAfterWait.ready) {
             const partial = buildStartupPartialPlaylist(rt, host, configKey);
             if (partial) {
                 rt.primedOnce = true;

@@ -285,13 +285,13 @@ async function main() {
             PREFETCH_RETRY_DELAY_MS: "30",
             MANIFEST_FORBIDDEN_BACKOFF_MS: "220",
             POLL_ERROR_BACKOFF_MS: "80",
-            LIVE_DELAY_SEGMENTS: "0",
+            LIVE_DELAY_SEGMENTS: "2",
             MIN_START_SEGMENTS: "4",
             MIN_VISIBLE_SEGMENTS: "2",
             PRIME_WAIT_MS: "120",
             STARTUP_REAL_SEGMENTS: "2",
             STARTUP_REAL_WAIT_MS: "6000",
-            PREFETCH_WINDOW_SEGMENTS: "8",
+            PREFETCH_WINDOW_SEGMENTS: "12",
             SEGMENT_AUTH_FAILURE_LIMIT: "3",
             SEGMENT_AUTH_FAILURE_MIN_MS: "3000",
             SEGMENT_AUTH_RECOVERY_COOLDOWN_MS: "800",
@@ -490,9 +490,17 @@ async function main() {
 
         await request(`${upstreamOrigin}/control/restart?id=A`);
         await sleep(250);
-        const restarted = await readManifest("A");
-        assert(restarted.discontinuities > 0, "encoder restart was not marked as an HLS discontinuity");
-        assert(restarted.segments.length >= 4, "encoder restart did not publish the warm cushion");
+        let restarted = null;
+        for (let i = 0; i < 80; i++) {
+            const candidate = await readManifest("A");
+            if (candidate.discontinuities > 0) {
+                restarted = candidate;
+                break;
+            }
+            await sleep(80);
+        }
+        assert(restarted, "encoder restart was not marked as an HLS discontinuity");
+        assert(restarted.segments.length >= 2, "encoder restart did not publish a playable delayed window");
         assert(restarted.segments.length <= 5, "encoder restart exceeded the visible playlist limit");
         await consume("A", 12, 70);
 
