@@ -48,7 +48,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "3.3.0";
+const RELEASE_VERSION = "3.3.1";
 const ADDON_TYPE = "tv";
 const PLAYBACK_MODE = "uhf-direct-relay";
 const CATALOG_TTL = 30 * 60 * 1000;
@@ -70,17 +70,10 @@ const PLAYLIST_RETRY_WINDOW_MS = Number(process.env.PLAYLIST_RETRY_WINDOW_MS || 
 const PLAYLIST_RETRY_DELAY_MS = Number(process.env.PLAYLIST_RETRY_DELAY_MS || 2000);
 const EPG_TIME_ZONE = process.env.EPG_TIME_ZONE || "Europe/Rome";
 
-// Manifest retry — fixes Xtream "invalid manifest on first hit" (stream spins up
-// server-side on first request, returns garbage, is valid on retry).
-const MANIFEST_RETRY_DELAY_MS = Number(process.env.MANIFEST_RETRY_DELAY_MS || 2000);
-const CONFIGURED_MANIFEST_RETRY_WINDOW_MS = Number(process.env.MANIFEST_RETRY_WINDOW_MS || 15000);
-const MANIFEST_RETRY_WINDOW_MS = process.env.NODE_ENV === "production"
-    ? Math.max(CONFIGURED_MANIFEST_RETRY_WINDOW_MS, HLS_REQUEST_TIMEOUT + MANIFEST_RETRY_DELAY_MS + 15000, 45000)
-    : CONFIGURED_MANIFEST_RETRY_WINDOW_MS;
 const SLOW_SEGMENT_MS = Number(process.env.SLOW_SEGMENT_MS || 4000);
 
 // ─────────────────────────────────────────────────────────────────────────────
-// In-memory catalog, EPG and logo caches. Playback state is managed below.
+// In-memory catalog, EPG and logo caches. Playback is intentionally stateless.
 // ─────────────────────────────────────────────────────────────────────────────
 const memoryCache = {
     channelItems: {},     // configKey -> channels[]
@@ -228,11 +221,6 @@ function getSegmentLabel(sourceUrl) {
     } catch {
         return String(sourceUrl || "").split("?")[0].split("/").filter(Boolean).pop() || "segment";
     }
-}
-
-function getHttpStatus(err) {
-    const status = Number(err?.kronosStatus || err?.response?.status || 0);
-    return Number.isFinite(status) && status > 0 ? status : null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -679,8 +667,7 @@ async function fetchPlaylist(sourceUrl, options = {}) {
     while (Date.now() < deadline) {
         attempt++;
         try {
-            const waitMs = Math.max(1, deadline - Date.now());
-            const response = await withUpstream(() => axios.get(sourceUrl, {
+            const response = await axios.get(sourceUrl, {
                 timeout: Math.max(1, Math.min(options.timeout || PLAYLIST_REQUEST_TIMEOUT, deadline - Date.now())),
                 maxRedirects: 5,
                 headers: {
@@ -690,7 +677,7 @@ async function fetchPlaylist(sourceUrl, options = {}) {
                     "Connection": "keep-alive"
                 },
                 validateStatus: s => s >= 200 && s < 300
-            }), true, waitMs);
+            });
             const data = String(response.data || "");
             if (!data.trimStart().startsWith("#EXTM3U")) throw new Error("Invalid M3U playlist from upstream");
             console.log("[FETCH PLAYLIST OK]", sourceUrl, "size=" + data.length, "attempt=" + attempt);
@@ -853,11 +840,7 @@ async function getChannelsFromCache(configKey, config) {
     if (!cached) return await fetchAndProcessChannels(configKey, config);
     if (!memoryCache.channelIndex[configKey]) memoryCache.channelIndex[configKey] = buildChannelIndex(cached);
     if (Date.now() - (memoryCache.lastUpdate[configKey] || 0) > CATALOG_TTL) {
-        // Catalog refreshes are not time-critical. Defer them while a channel is
-        // active so a slow M3U download cannot occupy the provider's single slot.
-        if (!isPlaybackActive()) {
-            fetchAndProcessChannels(configKey, config).catch(err => console.error("[CATALOG REFRESH]", err.message));
-        }
+        fetchAndProcessChannels(configKey, config).catch(err => console.error("[CATALOG REFRESH]", err.message));
     }
     return cached;
 }
@@ -872,106 +855,30 @@ async function getChannelById(configKey, config, id) {
     return memoryCache.channelIndex[configKey]?.[id] || null;
 }
 
-function isPlaybackActive() {
-    return upstreamBusy || upstreamWaiters.length > 0;
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // HLS relay
 // ─────────────────────────────────────────────────────────────────────────────
-// ── Upstream connection gate (provider max_connections=1) ───────────────────────
-// Manifest and segment requests go through this single-slot mutex, so Kronos does
-// not open competing upstream connections for the same account.
-let upstreamBusy = false;
-const upstreamWaiters = [];   // { resolve, prio }
-function acquireUpstream(prio, timeoutMs = 0) {
-    if (!upstreamBusy) { upstreamBusy = true; return Promise.resolve(); }
-    return new Promise((resolve, reject) => {
-        const w = {
-            resolve: () => {
-                if (w.timer) clearTimeout(w.timer);
-                resolve();
-            },
-            prio: !!prio,
-            timer: null
-        };
-        if (prio) {
-            const i = upstreamWaiters.findIndex(x => !x.prio);
-            if (i === -1) upstreamWaiters.push(w);
-            else upstreamWaiters.splice(i, 0, w);
-        } else {
-            upstreamWaiters.push(w);
-        }
-        if (timeoutMs > 0) {
-            w.timer = setTimeout(() => {
-                const i = upstreamWaiters.indexOf(w);
-                if (i !== -1) upstreamWaiters.splice(i, 1);
-                reject(new Error("Upstream gate timeout"));
-            }, timeoutMs);
-            if (w.timer.unref) w.timer.unref();
-        }
-    });
-}
-function releaseUpstream() {
-    const w = upstreamWaiters.shift();
-    if (w) w.resolve();        // hand the slot to the next waiter (stays busy)
-    else upstreamBusy = false;
-}
-async function withUpstream(fn, prio = false, timeoutMs = 0) {
-    await acquireUpstream(prio, timeoutMs);
-    try { return await fn(); }
-    finally { releaseUpstream(); }
-}
-
-// Fetch a manifest for at most MANIFEST_RETRY_WINDOW_MS. There is no separate
-// retry count: keep trying every MANIFEST_RETRY_DELAY_MS while time remains.
+// Fetch exactly the manifest requested by the player. No retry loop, gate,
+// prebuffer, synthetic live window or session state.
 async function fetchUpstreamHLS(sourceUrl, label = "stream", signal = null) {
-    const deadline = Date.now() + MANIFEST_RETRY_WINDOW_MS;
-    let lastErr = null;
-    let attempt = 0;
-
-    while (Date.now() < deadline && !signal?.aborted) {
-        attempt++;
-        try {
-            const r = await withUpstream(() => {
-                return axios.get(sourceUrl, {
-                    timeout: HLS_REQUEST_TIMEOUT,
-                    signal,
-                    maxRedirects: 5,
-                    headers: {
-                        "User-Agent": UPSTREAM_UA,
-                        "Accept": "application/x-mpegURL, application/vnd.apple.mpegurl, audio/mpegurl, text/plain, */*",
-                        "Accept-Encoding": "gzip, deflate",
-                        "Connection": "keep-alive"
-                    },
-                    validateStatus: s => s >= 200 && s < 300
-                });
-            }, true);
-            const finalUrl = r.request?.res?.responseUrl || sourceUrl;
-            const text = String(r.data || "").trim();
-            if (!text.startsWith("#EXTM3U")) {
-                lastErr = new Error("Invalid HLS manifest from upstream");
-                console.warn(`[HLS RETRY] channel="${label}" attempt=${attempt} reason=invalid-body`);
-            } else {
-                const info = analyzeHLS(text);
-                if (attempt > 1) console.log(`[HLS RECOVERED] channel="${label}" after=${attempt} attempts`);
-                return { data: r.data, finalUrl, info };
-            }
-        } catch (err) {
-            lastErr = err;
-            const status = getHttpStatus(err);
-            if (status) err.kronosStatus = status;
-            console.warn(`[HLS RETRY] channel="${label}" attempt=${attempt} reason=${err.message}`);
-            // A 401/403 is normally a provider-side cooldown or session lock.
-            // Retrying it every few seconds only extends the denial window and
-            // steals the single upstream slot from cached segment playback.
-            if (status === 401 || status === 403) throw err;
-        }
-        const sleepMs = Math.min(MANIFEST_RETRY_DELAY_MS, deadline - Date.now());
-        if (sleepMs > 0) await sleep(sleepMs);
+    const r = await axios.get(sourceUrl, {
+        timeout: HLS_REQUEST_TIMEOUT,
+        signal,
+        maxRedirects: 5,
+        headers: {
+            "User-Agent": UPSTREAM_UA,
+            "Accept": "application/x-mpegURL, application/vnd.apple.mpegurl, audio/mpegurl, text/plain, */*",
+            "Accept-Encoding": "gzip, deflate",
+            "Connection": "keep-alive"
+        },
+        validateStatus: s => s >= 200 && s < 300
+    });
+    const finalUrl = r.request?.res?.responseUrl || sourceUrl;
+    const text = String(r.data || "").trim();
+    if (!text.startsWith("#EXTM3U")) {
+        throw new Error(`Invalid HLS manifest from upstream for ${label}`);
     }
-    if (signal?.aborted) throw new Error("Manifest fetch aborted");
-    throw lastErr || new Error("Manifest fetch failed");
+    return { data: r.data, finalUrl, info: analyzeHLS(text) };
 }
 
 // Transparent HLS relay: do not invent media-sequences, segment ids or cache
@@ -1274,7 +1181,7 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
         decodeConfig(req.params.base64Config);
         if (!req.query.u) return res.status(400).end();
         sourceUrl = decodeProxyUrl(req.query.u);
-        await withUpstream(() => streamSegment(req, res, sourceUrl, started), true);
+        await streamSegment(req, res, sourceUrl, started);
     } catch (err) {
         console.error(`[SEG ERROR] ${getSegmentLabel(sourceUrl)} ${err.message}`);
         if (!res.headersSent) res.status(502).end();
@@ -1365,10 +1272,7 @@ app.get("/:base64Config/stats", (req, res) => {
             epgMaps: Object.keys(memoryCache.epgData).length,
             logos: Object.keys(memoryCache.logoData).length
         },
-        upstream: {
-            gateBusy: upstreamBusy,
-            waiters: upstreamWaiters.length
-        }
+        upstream: { directRelay: true }
     });
 });
 
@@ -1407,8 +1311,7 @@ app.get("/:base64Config/debug", async (req, res) => {
             groups: [...new Set(channels.map(c => c.group))].slice(0, 50),
             constants: {
                 ADDON_TYPE, RELEASE_VERSION, PLAYBACK_MODE, HLS_REQUEST_TIMEOUT, SEG_REQUEST_TIMEOUT,
-                PLAYLIST_REQUEST_TIMEOUT, PLAYLIST_RETRY_WINDOW_MS, PLAYLIST_RETRY_DELAY_MS,
-                MANIFEST_RETRY_WINDOW_MS, MANIFEST_RETRY_DELAY_MS
+                PLAYLIST_REQUEST_TIMEOUT, PLAYLIST_RETRY_WINDOW_MS, PLAYLIST_RETRY_DELAY_MS
             }
         });
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -1422,7 +1325,7 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`🌐 http://0.0.0.0:${PORT}`);
     console.log(`📦 Node ${process.version}`);
     console.log(`🎬 playback=${PLAYBACK_MODE} noBuffer=1 noPrefetch=1 noSegmentCache=1`);
-    console.log(`🔁 manifest retryWindow=${MANIFEST_RETRY_WINDOW_MS / 1000}s delay=${MANIFEST_RETRY_DELAY_MS / 1000}s`);
+    console.log(`🔁 manifest directFetch=1 timeout=${HLS_REQUEST_TIMEOUT / 1000}s`);
     console.log(`📋 playlist retryWindow=${PLAYLIST_RETRY_WINDOW_MS / 1000}s delay=${PLAYLIST_RETRY_DELAY_MS / 1000}s`);
     console.log(`🎞️ segment timeout=${SEG_REQUEST_TIMEOUT / 1000}s rangeForward=1`);
     console.log(`📺 epg timezone=${EPG_TIME_ZONE} timeout=${EPG_REQUEST_TIMEOUT / 1000}s firstWait=${EPG_FIRST_CATALOG_WAIT_MS / 1000}s retryDelay=${EPG_RETRY_DELAY_MS / 1000}s cacheTTL=${EPG_CACHE_TTL / 1000}s refresh=${EPG_REFRESH_INTERVAL_MS / 1000}s preload=${EPG_PRELOAD_URLS.length} startupWatch=${EPG_STARTUP_WATCH_MS / 1000}s`);

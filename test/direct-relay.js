@@ -96,8 +96,6 @@ async function main() {
             PORT: String(port),
             PLAYLIST_RETRY_WINDOW_MS: "1000",
             PLAYLIST_RETRY_DELAY_MS: "40",
-            MANIFEST_RETRY_WINDOW_MS: "1000",
-            MANIFEST_RETRY_DELAY_MS: "40",
             HLS_REQUEST_TIMEOUT: "700",
             SEG_REQUEST_TIMEOUT: "1000"
         },
