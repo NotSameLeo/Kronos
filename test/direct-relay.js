@@ -97,6 +97,9 @@ async function main() {
             PLAYLIST_RETRY_WINDOW_MS: "1000",
             PLAYLIST_RETRY_DELAY_MS: "40",
             HLS_REQUEST_TIMEOUT: "700",
+            HLS_LIVE_MIN_VISIBLE_SEGMENTS: "1",
+            HLS_LIVE_MIN_SEGMENTS: "1",
+            HLS_LIVE_HOLDBACK_SEGMENTS: "0",
             SEG_REQUEST_TIMEOUT: "1000"
         },
         stdio: ["ignore", "pipe", "pipe"]
