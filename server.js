@@ -48,7 +48,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "3.2.16";
+const RELEASE_VERSION = "3.2.17";
 const ADDON_TYPE = "tv";
 const HLS_RELAY_MODE = normalizeHlsRelayMode(process.env.HLS_RELAY_MODE || "direct");
 const CATALOG_TTL = 30 * 60 * 1000;
@@ -72,8 +72,11 @@ const EPG_TIME_ZONE = process.env.EPG_TIME_ZONE || "Europe/Rome";
 
 // Manifest retry — fixes Xtream "invalid manifest on first hit" (stream spins up
 // server-side on first request, returns garbage, is valid on retry).
-const MANIFEST_RETRY_WINDOW_MS = Number(process.env.MANIFEST_RETRY_WINDOW_MS || 15000);
 const MANIFEST_RETRY_DELAY_MS = Number(process.env.MANIFEST_RETRY_DELAY_MS || 2000);
+const CONFIGURED_MANIFEST_RETRY_WINDOW_MS = Number(process.env.MANIFEST_RETRY_WINDOW_MS || 15000);
+const MANIFEST_RETRY_WINDOW_MS = process.env.NODE_ENV === "production"
+    ? Math.max(CONFIGURED_MANIFEST_RETRY_WINDOW_MS, HLS_REQUEST_TIMEOUT + MANIFEST_RETRY_DELAY_MS + 15000, 45000)
+    : CONFIGURED_MANIFEST_RETRY_WINDOW_MS;
 const MANIFEST_FORBIDDEN_BACKOFF_MS = Number(process.env.MANIFEST_FORBIDDEN_BACKOFF_MS || 10000);
 const POLL_ERROR_BACKOFF_MS = Number(process.env.POLL_ERROR_BACKOFF_MS || 5000);
 
