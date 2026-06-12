@@ -48,8 +48,9 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "3.2.15";
+const RELEASE_VERSION = "3.2.16";
 const ADDON_TYPE = "tv";
+const HLS_RELAY_MODE = normalizeHlsRelayMode(process.env.HLS_RELAY_MODE || "direct");
 const CATALOG_TTL = 30 * 60 * 1000;
 const EPG_CACHE_TTL = Number(process.env.EPG_CACHE_TTL || 6 * 60 * 60 * 1000);
 const EPG_REQUEST_TIMEOUT = Number(process.env.EPG_REQUEST_TIMEOUT || 20000);
@@ -241,6 +242,11 @@ function encodeProxyUrl(url) { return Buffer.from(String(url), "utf8").toString(
 function decodeProxyUrl(enc) { return Buffer.from(String(enc), "base64url").toString("utf8"); }
 function hashKey(value) { return crypto.createHash("sha1").update(String(value)).digest("hex").slice(0, 20); }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function normalizeHlsRelayMode(value) {
+    const mode = String(value || "").trim().toLowerCase();
+    return mode === "buffered" ? "buffered" : "direct";
+}
+function isBufferedHlsRelay() { return HLS_RELAY_MODE === "buffered"; }
 
 function analyzeHLS(text) {
     const lines = String(text || "").split(/\r?\n/).map(l => l.trim()).filter(Boolean);
@@ -1099,6 +1105,32 @@ function rewriteHLSUrls(playlist, baseUrl, hostBase, configKey, scope = baseUrl)
     return { rewritten, segIds };
 }
 
+// Transparent HLS relay: do not invent media-sequences, segment ids or cache
+// state. This mirrors a normal IPTV player behind the server-side VPN: every
+// refreshed manifest carries the current token-bearing segment URLs.
+function rewriteHLSUrlsDirect(playlist, baseUrl, hostBase, configKey) {
+    const plUrl = abs => `${hostBase}/${configKey}/proxy/live.m3u8?u=${encodeProxyUrl(abs)}`;
+    const segUrl = abs => `${hostBase}/${configKey}/proxy/seg?u=${encodeProxyUrl(abs)}`;
+    const pick = abs => isHlsUrl(abs) ? plUrl(abs) : segUrl(abs);
+    let mediaUrls = 0;
+
+    const rewritten = String(playlist || "").split(/\r?\n/).map(line => {
+        const t = line.trim();
+        if (!t) return line;
+        if (t.startsWith("#")) {
+            return line.replace(/URI=("([^"]+)"|'([^']+)')/g, (_, quoted, d, s) => {
+                const uri = d || s;
+                const q = quoted.startsWith("'") ? "'" : '"';
+                return `URI=${q}${pick(toAbsoluteUrl(uri, baseUrl))}${q}`;
+            });
+        }
+        mediaUrls++;
+        return pick(toAbsoluteUrl(t, baseUrl));
+    }).join("\n");
+
+    return { rewritten, mediaUrls };
+}
+
 // ── Segment cache, keyed by stable segId (full 200 only; Range bypasses) ────────
 const segCache = new Map();       // segId -> { buffer, headers, status, size, fetchedAt }
 const segInflight = new Map();    // segId -> Promise<entry|null>
@@ -1348,9 +1380,12 @@ async function getLogoDataUri(logoUrl) {
 
 function buildStream(channel, host, configKey) {
     if (isHlsUrl(channel.url)) {
+        const url = isBufferedHlsRelay()
+            ? `${host}/${configKey}/hls/${channel.id}/index.m3u8`
+            : `${host}/${configKey}/proxy/live.m3u8?u=${encodeProxyUrl(channel.url)}&label=${encodeURIComponent(channel.name)}`;
         return {
             title: channel.name, name: "TV",
-            url: `${host}/${configKey}/hls/${channel.id}/index.m3u8`,
+            url,
             behaviorHints: { notWebReady: true, bingeGroup: `kronos-${channel.id}` }
         };
     }
@@ -2305,6 +2340,24 @@ app.get("/:base64Config/proxy/pl", async (req, res) => {
     }
 });
 
+app.get("/:base64Config/proxy/live.m3u8", async (req, res) => {
+    try {
+        const configKey = req.params.base64Config;
+        decodeConfig(configKey);
+        if (!req.query.u) return res.status(400).send("#EXTM3U\n");
+        const sourceUrl = decodeProxyUrl(req.query.u);
+        const label = String(req.query.label || "direct-hls");
+        const { data, finalUrl, info } = await fetchUpstreamHLS(sourceUrl, label);
+        const { rewritten, mediaUrls } = rewriteHLSUrlsDirect(data, finalUrl, getPublicHost(req), configKey);
+        setPlaylistHeaders(res);
+        console.log(`[HLS DIRECT SERVE] channel="${label}" master=${info.isMaster ? 1 : 0} media=${mediaUrls}`);
+        res.send(rewritten);
+    } catch (err) {
+        console.error(`[HLS DIRECT ERROR] ${err.message}`);
+        if (!res.headersSent) res.status(502).send("#EXTM3U\n#EXT-X-ENDLIST\n");
+    }
+});
+
 app.get("/:base64Config/proxy/seg", async (req, res) => {
     const started = Date.now();
     let sourceUrl = null;
@@ -2538,7 +2591,7 @@ app.get("/:base64Config/debug", async (req, res) => {
         const effectiveEpgUrl = effectiveConfig.e || "";
         res.json({
             version: RELEASE_VERSION,
-            mode: "buffered-hls-relay",
+            mode: HLS_RELAY_MODE === "buffered" ? "buffered-hls-relay" : "direct-hls-relay",
             config: {
                 hasUrl: !!config.u,
                 hasMultiLists: Array.isArray(config.l),
@@ -2563,7 +2616,7 @@ app.get("/:base64Config/debug", async (req, res) => {
             })),
             groups: [...new Set(channels.map(c => c.group))].slice(0, 50),
             constants: {
-                ADDON_TYPE, RELEASE_VERSION, HLS_REQUEST_TIMEOUT, SEG_REQUEST_TIMEOUT,
+                ADDON_TYPE, RELEASE_VERSION, HLS_RELAY_MODE, HLS_REQUEST_TIMEOUT, SEG_REQUEST_TIMEOUT,
                 LIVE_DELAY_SEGMENTS, MIN_START_SEGMENTS, MIN_VISIBLE_SEGMENTS, STARTUP_REAL_SEGMENTS, STARTUP_REAL_WAIT_MS,
                 PRIME_WAIT_MS, MANIFEST_TYPE_WAIT_MS, RETAIN_SEGMENTS, SERVE_SEGMENTS, PREFETCH_WINDOW_SEGMENTS,
                 SEGMENT_AUTH_FAILURE_LIMIT, SEGMENT_AUTH_FAILURE_MIN_MS, SEGMENT_AUTH_RECOVERY_COOLDOWN_MS,
@@ -2577,10 +2630,11 @@ app.get("/:base64Config/debug", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 app.listen(PORT, "0.0.0.0", () => {
     console.log("\n" + "=".repeat(60));
-    console.log(`K.R.O.N.O.S. ${RELEASE_VERSION} - buffered HLS relay`);
+    console.log(`K.R.O.N.O.S. ${RELEASE_VERSION} - ${HLS_RELAY_MODE} HLS relay`);
     console.log("=".repeat(60));
     console.log(`🌐 http://0.0.0.0:${PORT}`);
     console.log(`📦 Node ${process.version}`);
+    console.log(`🎬 hls mode=${HLS_RELAY_MODE}`);
     console.log(`🔁 manifest retryWindow=${MANIFEST_RETRY_WINDOW_MS / 1000}s delay=${MANIFEST_RETRY_DELAY_MS / 1000}s`);
     console.log(`⛔ manifest forbiddenBackoff=${MANIFEST_FORBIDDEN_BACKOFF_MS / 1000}s pollErrorBackoff=${POLL_ERROR_BACKOFF_MS / 1000}s poll=${POLL_MIN_MS}-${POLL_MAX_MS}ms`);
     console.log(`📋 playlist retryWindow=${PLAYLIST_RETRY_WINDOW_MS / 1000}s delay=${PLAYLIST_RETRY_DELAY_MS / 1000}s`);

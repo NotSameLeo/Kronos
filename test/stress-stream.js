@@ -277,6 +277,7 @@ async function main() {
         env: {
             ...process.env,
             PORT: String(port),
+            HLS_RELAY_MODE: "buffered",
             MANIFEST_RETRY_WINDOW_MS: "1600",
             MANIFEST_RETRY_DELAY_MS: "60",
             HLS_REQUEST_TIMEOUT: "600",
