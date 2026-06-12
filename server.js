@@ -48,7 +48,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "3.3.2";
+const RELEASE_VERSION = "3.3.3";
 const ADDON_TYPE = "tv";
 const PLAYBACK_MODE = "uhf-direct-relay";
 const CATALOG_TTL = 30 * 60 * 1000;
@@ -65,6 +65,9 @@ const EPG_STARTUP_WATCH_MS = Number(process.env.EPG_STARTUP_WATCH_MS || 30000);
 const CATALOG_PRELOAD_CONFIGS = parseCatalogPreloadConfigs(process.env.CATALOG_PRELOAD_CONFIGS || process.env.KRONOS_PRELOAD_CONFIGS || "");
 const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 20000);
 const SEG_REQUEST_TIMEOUT = Number(process.env.SEG_REQUEST_TIMEOUT || 45000);
+const SEGMENT_UPSTREAM_CONCURRENCY = Math.max(1, Number(process.env.SEGMENT_UPSTREAM_CONCURRENCY || 1));
+const SEGMENT_UPSTREAM_RETRIES = Math.max(0, Number(process.env.SEGMENT_UPSTREAM_RETRIES || 1));
+const SEGMENT_UPSTREAM_RETRY_DELAY_MS = Math.max(0, Number(process.env.SEGMENT_UPSTREAM_RETRY_DELAY_MS || 250));
 const PLAYLIST_REQUEST_TIMEOUT = Number(process.env.PLAYLIST_REQUEST_TIMEOUT || 20000);
 const PLAYLIST_RETRY_WINDOW_MS = Number(process.env.PLAYLIST_RETRY_WINDOW_MS || 30000);
 const PLAYLIST_RETRY_DELAY_MS = Number(process.env.PLAYLIST_RETRY_DELAY_MS || 2000);
@@ -228,6 +231,27 @@ function getSegmentLabel(sourceUrl) {
     } catch {
         return String(sourceUrl || "").split("?")[0].split("/").filter(Boolean).pop() || "segment";
     }
+}
+
+function getSegmentQueueKey(sourceUrl) {
+    try {
+        const u = new URL(sourceUrl);
+        const dir = u.pathname.replace(/\/[^/]*$/, "/");
+        return `${u.protocol}//${u.host}${dir}`;
+    } catch {
+        return String(sourceUrl || "").split("?")[0].replace(/\/[^/]*$/, "/");
+    }
+}
+
+function getErrorStatus(err) {
+    const status = Number(err?.response?.status || err?.status || 0);
+    return Number.isFinite(status) && status > 0 ? status : null;
+}
+
+function isRetryableSegmentError(err) {
+    const status = getErrorStatus(err);
+    if ([408, 425, 429, 500, 502, 503, 504].includes(status)) return true;
+    return ["ECONNRESET", "ECONNABORTED", "ETIMEDOUT", "EPIPE"].includes(err?.code);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1166,6 +1190,59 @@ function setPlaylistHeaders(res) {
     res.setHeader("Pragma", "no-cache");
 }
 
+const segmentQueues = new Map();
+
+function acquireSegmentSlot(key, signal) {
+    let state = segmentQueues.get(key);
+    if (!state) {
+        state = { active: 0, waiters: [] };
+        segmentQueues.set(key, state);
+    }
+
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        let waiter = null;
+
+        const cleanupAbort = () => signal?.removeEventListener?.("abort", onAbort);
+        const release = () => {
+            state.active = Math.max(0, state.active - 1);
+            const next = state.waiters.shift();
+            if (next) next();
+            else if (state.active === 0) segmentQueues.delete(key);
+        };
+        const grant = () => {
+            if (settled) return;
+            settled = true;
+            cleanupAbort();
+            state.active++;
+            resolve(release);
+        };
+        const onAbort = () => {
+            if (settled) return;
+            settled = true;
+            if (waiter) {
+                const i = state.waiters.indexOf(waiter);
+                if (i !== -1) state.waiters.splice(i, 1);
+            }
+            cleanupAbort();
+            if (state.active === 0 && state.waiters.length === 0) segmentQueues.delete(key);
+            reject(new Error("Segment request aborted"));
+        };
+
+        if (signal?.aborted) return onAbort();
+        if (state.active < SEGMENT_UPSTREAM_CONCURRENCY) return grant();
+        waiter = grant;
+        state.waiters.push(waiter);
+        signal?.addEventListener?.("abort", onAbort, { once: true });
+    });
+}
+
+async function withSegmentSlot(sourceUrl, signal, fn) {
+    const release = await acquireSegmentSlot(getSegmentQueueKey(sourceUrl), signal);
+    try { return await fn(); }
+    finally { release(); }
+}
+
 app.get("/:base64Config/proxy/live.m3u8", async (req, res) => {
     const controller = makeAbortController(res);
     try {
@@ -1195,7 +1272,7 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
         decodeConfig(req.params.base64Config);
         if (!req.query.u) return res.status(400).end();
         sourceUrl = decodeProxyUrl(req.query.u);
-        await streamSegment(req, res, sourceUrl, started, controller.signal);
+        await withSegmentSlot(sourceUrl, controller.signal, () => streamSegment(req, res, sourceUrl, started, controller.signal));
     } catch (err) {
         if (controller.signal.aborted) return;
         console.error(`[SEG ERROR] ${getSegmentLabel(sourceUrl)} ${err.message}`);
@@ -1206,21 +1283,36 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
 
 // Stream a segment straight through. Kronos must behave like a normal IPTV
 // client behind the server-side VPN: no segment cache, no synthetic ids.
+async function fetchSegmentResponse(sourceUrl, headers, signal = null) {
+    let lastErr = null;
+    for (let attempt = 1; attempt <= SEGMENT_UPSTREAM_RETRIES + 1; attempt++) {
+        try {
+            return await axios.get(sourceUrl, {
+                responseType: "stream",
+                timeout: SEG_REQUEST_TIMEOUT,
+                signal,
+                maxRedirects: 5,
+                headers,
+                decompress: false,
+                maxBodyLength: Infinity,
+                maxContentLength: Infinity,
+                validateStatus: s => s >= 200 && s < 400
+            });
+        } catch (err) {
+            lastErr = err;
+            if (signal?.aborted || !isRetryableSegmentError(err) || attempt > SEGMENT_UPSTREAM_RETRIES) throw err;
+            console.warn(`[SEG RETRY] ${getSegmentLabel(sourceUrl)} attempt=${attempt} reason=${err.message}`);
+            if (SEGMENT_UPSTREAM_RETRY_DELAY_MS > 0) await sleep(SEGMENT_UPSTREAM_RETRY_DELAY_MS);
+        }
+    }
+    throw lastErr || new Error("Segment fetch failed");
+}
+
 async function streamSegment(req, res, sourceUrl, started, signal = null) {
     const headers = { "User-Agent": UPSTREAM_UA, "Accept": "*/*", "Accept-Encoding": "identity", "Connection": "keep-alive" };
     if (req.headers.range) headers.Range = req.headers.range;
 
-    const response = await axios.get(sourceUrl, {
-        responseType: "stream",
-        timeout: SEG_REQUEST_TIMEOUT,
-        signal,
-        maxRedirects: 5,
-        headers,
-        decompress: false,
-        maxBodyLength: Infinity,
-        maxContentLength: Infinity,
-        validateStatus: s => s >= 200 && s < 400
-    });
+    const response = await fetchSegmentResponse(sourceUrl, headers, signal);
 
     const upstream = response.data;
     ["content-type", "content-length", "content-range", "accept-ranges",
@@ -1288,7 +1380,11 @@ app.get("/:base64Config/stats", (req, res) => {
             epgMaps: Object.keys(memoryCache.epgData).length,
             logos: Object.keys(memoryCache.logoData).length
         },
-        upstream: { directRelay: true }
+        upstream: {
+            directRelay: true,
+            segmentConcurrency: SEGMENT_UPSTREAM_CONCURRENCY,
+            segmentQueues: segmentQueues.size
+        }
     });
 });
 
@@ -1327,6 +1423,7 @@ app.get("/:base64Config/debug", async (req, res) => {
             groups: [...new Set(channels.map(c => c.group))].slice(0, 50),
             constants: {
                 ADDON_TYPE, RELEASE_VERSION, PLAYBACK_MODE, HLS_REQUEST_TIMEOUT, SEG_REQUEST_TIMEOUT,
+                SEGMENT_UPSTREAM_CONCURRENCY, SEGMENT_UPSTREAM_RETRIES, SEGMENT_UPSTREAM_RETRY_DELAY_MS,
                 PLAYLIST_REQUEST_TIMEOUT, PLAYLIST_RETRY_WINDOW_MS, PLAYLIST_RETRY_DELAY_MS
             }
         });
@@ -1343,7 +1440,7 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`🎬 playback=${PLAYBACK_MODE} noBuffer=1 noPrefetch=1 noSegmentCache=1`);
     console.log(`🔁 manifest directFetch=1 timeout=${HLS_REQUEST_TIMEOUT / 1000}s`);
     console.log(`📋 playlist retryWindow=${PLAYLIST_RETRY_WINDOW_MS / 1000}s delay=${PLAYLIST_RETRY_DELAY_MS / 1000}s`);
-    console.log(`🎞️ segment timeout=${SEG_REQUEST_TIMEOUT / 1000}s rangeForward=1`);
+    console.log(`🎞️ segment timeout=${SEG_REQUEST_TIMEOUT / 1000}s rangeForward=1 upstreamConcurrency=${SEGMENT_UPSTREAM_CONCURRENCY} retries=${SEGMENT_UPSTREAM_RETRIES}`);
     console.log(`📺 epg timezone=${EPG_TIME_ZONE} timeout=${EPG_REQUEST_TIMEOUT / 1000}s firstWait=${EPG_FIRST_CATALOG_WAIT_MS / 1000}s retryDelay=${EPG_RETRY_DELAY_MS / 1000}s cacheTTL=${EPG_CACHE_TTL / 1000}s refresh=${EPG_REFRESH_INTERVAL_MS / 1000}s preload=${EPG_PRELOAD_URLS.length} startupWatch=${EPG_STARTUP_WATCH_MS / 1000}s`);
     console.log(`📚 catalog preload=${CATALOG_PRELOAD_CONFIGS.length}`);
     console.log("=".repeat(60) + "\n");
