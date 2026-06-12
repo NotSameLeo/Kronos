@@ -289,9 +289,11 @@ async function main() {
             MIN_START_SEGMENTS: "4",
             MIN_VISIBLE_SEGMENTS: "2",
             PRIME_WAIT_MS: "120",
-            STARTUP_REAL_SEGMENTS: "2",
+            STARTUP_REAL_SEGMENTS: "4",
             STARTUP_REAL_WAIT_MS: "6000",
             PREFETCH_WINDOW_SEGMENTS: "12",
+            STALE_PLAYBACK_RUN_MS: "500",
+            STALE_PLAYBACK_RUN_GAP: "4",
             SEGMENT_AUTH_FAILURE_LIMIT: "3",
             SEGMENT_AUTH_FAILURE_MIN_MS: "3000",
             SEGMENT_AUTH_RECOVERY_COOLDOWN_MS: "800",
@@ -431,7 +433,10 @@ async function main() {
         assert(recoveredExpired, "expired segment run did not recover with a discontinuity");
         const expiredLogs = logs.join("").slice(expiredLogCursor);
         assert(expiredLogs.includes("[SEG DEAD]"), "expired segments were not marked dead");
-        assert(expiredLogs.includes("[HLS GAP JUMP]"), "expired segment gap was not jumped");
+        assert(
+            expiredLogs.includes("[HLS GAP JUMP]") || expiredLogs.includes("[HLS RUN RECENTER]"),
+            "expired segment gap was not jumped or recentered"
+        );
 
         // A sustained provider-side 403 advances the upstream timeline beyond its
         // six-segment manifest window. Kronos must keep serving only cached history,
@@ -486,6 +491,7 @@ async function main() {
             "segment auth, playlist stall, or playlist hold recovery reason was not logged"
         );
         await request(`${upstreamOrigin}/control/forbid-segments?ms=0`);
+        await request(`${upstreamOrigin}/control/expire-segments?id=A&through=-1`);
         await waitForCushion("A");
 
         await request(`${upstreamOrigin}/control/restart?id=A`);

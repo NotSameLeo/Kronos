@@ -48,7 +48,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "3.2.13";
+const RELEASE_VERSION = "3.2.14";
 const ADDON_TYPE = "tv";
 const CATALOG_TTL = 30 * 60 * 1000;
 const EPG_CACHE_TTL = Number(process.env.EPG_CACHE_TTL || 6 * 60 * 60 * 1000);
@@ -122,12 +122,25 @@ const SEGMENT_AUTH_RECOVERY_DISTINCT_SEGMENTS = Math.max(
 );
 const PRIME_WAIT_MS = Number(process.env.PRIME_WAIT_MS || 1500);
 const MANIFEST_TYPE_WAIT_MS = Number(process.env.MANIFEST_TYPE_WAIT_MS || 1500);
-const STARTUP_REAL_SEGMENTS = Math.max(MIN_VISIBLE_SEGMENTS, Number(process.env.STARTUP_REAL_SEGMENTS || 2));
-const STARTUP_REAL_WAIT_MS = Number(process.env.STARTUP_REAL_WAIT_MS || 20000);
-const STARTUP_PARTIAL_WAIT_MS = Math.min(STARTUP_REAL_WAIT_MS, Number(process.env.STARTUP_PARTIAL_WAIT_MS || 3000));
+const STARTUP_REAL_SEGMENTS = Math.max(
+    MIN_VISIBLE_SEGMENTS + LIVE_DELAY_SEGMENTS,
+    Number(process.env.STARTUP_REAL_SEGMENTS || (MIN_VISIBLE_SEGMENTS + LIVE_DELAY_SEGMENTS))
+);
+const STARTUP_REAL_WAIT_MS = Number(process.env.STARTUP_REAL_WAIT_MS || 40000);
+const ALLOW_STARTUP_PARTIAL = String(process.env.ALLOW_STARTUP_PARTIAL || "0") === "1";
+const STARTUP_PARTIAL_WAIT_MS = ALLOW_STARTUP_PARTIAL
+    ? Math.min(STARTUP_REAL_WAIT_MS, Number(process.env.STARTUP_PARTIAL_WAIT_MS || 3000))
+    : 0;
 const POLLER_IDLE_STOP_MS = Number(process.env.POLLER_IDLE_STOP_MS || 5 * 60 * 1000); // stop if player gone
 const POLL_MIN_MS = Number(process.env.POLL_MIN_MS || 2500);
 const POLL_MAX_MS = Number(process.env.POLL_MAX_MS || 12000);
+const STALE_PLAYBACK_RUN_MS = Number(process.env.STALE_PLAYBACK_RUN_MS || 90 * 1000);
+const STALE_PLAYBACK_RUN_GAP = Math.max(
+    MIN_VISIBLE_SEGMENTS + LIVE_DELAY_SEGMENTS,
+    Number(process.env.STALE_PLAYBACK_RUN_GAP || 6)
+);
+const MANIFEST_ONLY_IDLE_STOP_MS = Number(process.env.MANIFEST_ONLY_IDLE_STOP_MS || 3 * 60 * 1000);
+const MANIFEST_ONLY_IDLE_MIN_REQUESTS = Math.max(3, Number(process.env.MANIFEST_ONLY_IDLE_MIN_REQUESTS || 8));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // In-memory catalog, EPG and logo caches. Playback state is managed below.
@@ -1598,13 +1611,19 @@ function recoverChannelSession(rt, reason) {
     if (!rt?.running) return;
     const now = Date.now();
     if (now - (rt.lastSegmentRecoveryAt || 0) < SEGMENT_AUTH_RECOVERY_COOLDOWN_MS) return;
+    rt.lastSegmentRecoveryAt = now;
+    restartChannelSession(rt, reason, { keepHold: true });
+}
 
+function restartChannelSession(rt, reason, options = {}) {
+    if (!rt?.running) return;
+    const now = Date.now();
+    const keepHold = options.keepHold !== false;
     const holdPlaylist = rt.lastServedPlaylist || rt.holdPlaylist;
     const nextSeqBase = Number.isFinite(holdPlaylist?.edge)
         ? holdPlaylist.edge + 1
         : rt.seqBase + rt.segs.length;
 
-    rt.lastSegmentRecoveryAt = now;
     rt.segmentAuthFailures = 0;
     rt.segmentAuthFailureIds?.clear();
     rt.firstSegmentAuthFailureAt = null;
@@ -1625,12 +1644,17 @@ function recoverChannelSession(rt, reason) {
     rt.pendingPlaylistDiscontinuity = true;
     rt.lastRequestedSeq = null;
     rt.lastUpstreamEndSeq = null;
-    rt.lastServedPlaylist = holdPlaylist || null;
-    rt.holdPlaylist = holdPlaylist || null;
-    cancelPrefetch(`segment-recover-${reason}`);
+    rt.lastServedPlaylist = keepHold ? (holdPlaylist || null) : null;
+    rt.holdPlaylist = keepHold ? (holdPlaylist || null) : null;
+    rt.lastSegmentAt = null;
+    rt.lastSuccessfulSegmentFetchAt = null;
+    rt.lastServedAt = null;
+    rt.segmentRequests = 0;
+    rt.playlistRequestsSinceSegment = 0;
+    cancelPrefetch(`channel-recover-${reason}`);
     if (rt.pollAbort) { rt.pollAbort.abort(); rt.pollAbort = null; }
     if (rt.timer) { clearTimeout(rt.timer); rt.timer = null; }
-    console.warn(`[CHANNEL RECOVER] channel="${rt.label}" reason=${reason} seqBase=${rt.seqBase} gen=${rt.generation}`);
+    console.warn(`[CHANNEL RECOVER] channel="${rt.label}" reason=${reason} seqBase=${rt.seqBase} gen=${rt.generation} keepHold=${keepHold ? 1 : 0}`);
     rt.timer = setTimeout(() => pollChannelLoop(rt), 0);
     if (rt.timer.unref) rt.timer.unref();
 }
@@ -1718,7 +1742,8 @@ function stopPoller(rt, reason) {
     cancelPrefetch(reason);
     rt.segs = []; rt.byId = new Set(); rt.seqBase = 0; rt.lastSeq = -1; rt.servedEdge = null; rt.primedOnce = false; rt.lastServedPlaylist = null; rt.holdPlaylist = null;
     rt.discontinuityBase = 0; rt.pendingDiscontinuity = false; rt.pendingPlaylistDiscontinuity = false;
-    rt.lastManifestAt = null; rt.lastSegmentAt = null; rt.lastBufferAddedAt = null; rt.segmentRequests = 0;
+    rt.lastManifestAt = null; rt.lastSegmentAt = null; rt.lastBufferAddedAt = null; rt.lastServedAt = null; rt.segmentRequests = 0;
+    rt.playlistRequests = 0; rt.playlistRequestsSinceSegment = 0;
     rt.lastRequestedSeq = null; rt.lastUpstreamEndSeq = null;
     rt.lastPollStatus = null; rt.pollFailures = 0; rt.lastManifestErrorAt = null;
     rt.segmentAuthFailures = 0; rt.firstSegmentAuthFailureAt = null; rt.lastSegmentAuthFailureAt = null; rt.lastSegmentAuthFailureStatus = null;
@@ -1746,7 +1771,8 @@ function ensureChannel(url, label) {
             target: 6, lastSeq: -1, isMaster: false, lastPlayerAt: Date.now(),
             running: false, timer: null, pollAbort: null, servedEdge: null, primedOnce: false, lastServedPlaylist: null, holdPlaylist: null,
             discontinuityBase: 0, pendingDiscontinuity: false, pendingPlaylistDiscontinuity: false,
-            lastManifestAt: null, lastSegmentAt: null, lastBufferAddedAt: null, segmentRequests: 0,
+            lastManifestAt: null, lastSegmentAt: null, lastBufferAddedAt: null, lastServedAt: null, segmentRequests: 0,
+            playlistRequests: 0, playlistRequestsSinceSegment: 0,
             lastRequestedSeq: null, lastUpstreamEndSeq: null,
             lastPollStatus: null, pollFailures: 0, lastManifestErrorAt: null,
             segmentAuthFailures: 0, firstSegmentAuthFailureAt: null, lastSegmentAuthFailureAt: null, lastSegmentAuthFailureStatus: null,
@@ -1765,6 +1791,43 @@ function ensureChannel(url, label) {
         pollChannelLoop(rt);
     }
     return rt;
+}
+
+function notePlaylistRequest(rt) {
+    if (!rt) return;
+    rt.lastPlayerAt = Date.now();
+    rt.playlistRequests = (rt.playlistRequests || 0) + 1;
+    rt.playlistRequestsSinceSegment = (rt.playlistRequestsSinceSegment || 0) + 1;
+}
+
+function noteSegmentRequest(rt, segId) {
+    if (!rt) return;
+    const now = Date.now();
+    rt.lastPlayerAt = now;
+    rt.lastSegmentAt = now;
+    rt.segmentRequests++;
+    rt.playlistRequestsSinceSegment = 0;
+    const segmentIdx = rt.segs.findIndex(segment => segment.id === segId);
+    if (segmentIdx >= 0) {
+        const requestedSeq = rt.seqBase + segmentIdx;
+        rt.lastRequestedSeq = Math.max(rt.lastRequestedSeq ?? requestedSeq, requestedSeq);
+    }
+    queueRuntimePrefetch(rt);
+}
+
+function maybeRecycleManifestOnlySession(rt) {
+    if (!rt?.running || !rt.primedOnce) return false;
+    if ((rt.playlistRequestsSinceSegment || 0) < MANIFEST_ONLY_IDLE_MIN_REQUESTS) return false;
+
+    const now = Date.now();
+    const idleBasis = rt.lastSegmentAt || rt.lastServedAt;
+    if (!idleBasis) return false;
+    const idleMs = now - idleBasis;
+    if (idleMs < MANIFEST_ONLY_IDLE_STOP_MS) return false;
+
+    console.warn(`[PLAYER STALE] channel="${rt.label}" manifestOnly=${rt.playlistRequestsSinceSegment || 0} noSegmentFor=${idleMs}ms action=session-restart`);
+    restartChannelSession(rt, "manifest-only-idle", { keepHold: false });
+    return true;
 }
 
 async function pollChannelLoop(rt) {
@@ -1876,7 +1939,7 @@ function ingestPlaylist(rt, playlist, baseUrl, info) {
 function buildServedPlaylist(rt, hostBase, configKey) {
     const lo = rt.seqBase;
     const hi = rt.seqBase + rt.segs.length - 1;
-    const warmRun = getPlayableWarmRun(rt, MIN_VISIBLE_SEGMENTS);
+    const warmRun = getServeWarmRun(rt, MIN_VISIBLE_SEGMENTS);
     if (warmRun.count < MIN_VISIBLE_SEGMENTS) {
         return { hold: true, reason: "short-warm-run", warmRun: warmRun.count };
     }
@@ -2071,6 +2134,34 @@ function getPlayableWarmRun(rt, minCount = MIN_VISIBLE_SEGMENTS) {
     return getLatestWarmRunAtLeast(rt, minCount) || preferred;
 }
 
+function getServeWarmRun(rt, minCount = MIN_VISIBLE_SEGMENTS) {
+    const preferred = getPlaybackWarmRun(rt);
+    const latest = getLatestWarmRunAtLeast(rt, minCount) || getLatestWarmRun(rt);
+    if (shouldRecenterPlaybackRun(rt, preferred, latest)) {
+        const gap = latest.end - preferred.end;
+        const segmentIdleMs = rt.lastSegmentAt ? Date.now() - rt.lastSegmentAt : 0;
+        console.warn(`[HLS RUN RECENTER] channel="${rt.label}" gap=${gap} segmentIdle=${segmentIdleMs}ms manifestOnly=${rt.playlistRequestsSinceSegment || 0}`);
+        rt.servedEdge = null;
+        rt.pendingPlaylistDiscontinuity = true;
+        return latest;
+    }
+    if (preferred.count >= minCount) return preferred;
+    return latest || preferred;
+}
+
+function shouldRecenterPlaybackRun(rt, preferred, latest) {
+    if (!rt?.primedOnce || !preferred || !latest) return false;
+    if (preferred.count < MIN_VISIBLE_SEGMENTS || latest.count < MIN_VISIBLE_SEGMENTS + LIVE_DELAY_SEGMENTS) return false;
+    const gap = latest.end - preferred.end;
+    if (gap < STALE_PLAYBACK_RUN_GAP) return false;
+    const edgeIdx = rt.servedEdge == null ? preferred.end : rt.servedEdge - rt.seqBase;
+    const readyAhead = Math.max(0, preferred.end - edgeIdx);
+    if (readyAhead >= LIVE_DELAY_SEGMENTS) return false;
+    const segmentIdleMs = rt.lastSegmentAt ? Date.now() - rt.lastSegmentAt : 0;
+    return segmentIdleMs >= STALE_PLAYBACK_RUN_MS
+        || (rt.playlistRequestsSinceSegment || 0) >= MANIFEST_ONLY_IDLE_MIN_REQUESTS;
+}
+
 function getDelayedWarmEdgeIndex(warmRun) {
     if (!warmRun || warmRun.count <= 0) return -1;
     let edge = Math.max(warmRun.start, warmRun.end - LIVE_DELAY_SEGMENTS);
@@ -2089,6 +2180,10 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         const host = getPublicHost(req);
 
         const rt = ensureChannel(ch.url, ch.name);
+        notePlaylistRequest(rt);
+        if (maybeRecycleManifestOnlySession(rt)) {
+            return sendWaitingPlaylist(res, ch.name, "manifest-only-idle", rt.seqBase, Date.now() - t0);
+        }
         const recoveryPlaylist = rt.lastServedPlaylist || rt.holdPlaylist;
         const coldStart = !recoveryPlaylist && rt.segmentRequests === 0 && rt.servedEdge == null && !rt.primedOnce;
         const warmRun = getPlayableWarmRun(rt, MIN_VISIBLE_SEGMENTS).count;
@@ -2106,7 +2201,9 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
             const startedWait = Date.now();
             while (rt.running && !rt.isMaster && !getStartupReadiness(rt).ready) {
                 if (Date.now() - startedWait >= STARTUP_REAL_WAIT_MS) break;
-                if (Date.now() - startedWait >= STARTUP_PARTIAL_WAIT_MS && getPlayableWarmRun(rt, 1).count > 0) break;
+                if (ALLOW_STARTUP_PARTIAL
+                    && Date.now() - startedWait >= STARTUP_PARTIAL_WAIT_MS
+                    && getPlayableWarmRun(rt, 1).count > 0) break;
                 rt.lastPlayerAt = Date.now();
                 await sleep(50);
             }
@@ -2139,18 +2236,20 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
             return res.send(holdPlaylist.playlist);
         }
         if (fresh && !readyAfterWait.ready) {
-            const partial = buildStartupPartialPlaylist(rt, host, configKey);
+            const partial = ALLOW_STARTUP_PARTIAL ? buildStartupPartialPlaylist(rt, host, configKey) : null;
             if (partial) {
                 rt.primedOnce = true;
                 rt.lastServedPlaylist = { playlist: partial.playlist, mediaSeq: partial.mediaSeq, edge: partial.edge };
                 rt.holdPlaylist = rt.lastServedPlaylist;
+                rt.lastServedAt = Date.now();
                 setPlaylistHeaders(res);
                 console.warn(`[HLS START PARTIAL] channel="${ch.name}" window=${partial.count} seq=${partial.mediaSeq} edge=${partial.edge}/${partial.hi} warmRun=${partial.warmRun}/${STARTUP_REAL_SEGMENTS} waited=${Date.now() - t0}ms`);
                 res.send(partial.playlist);
                 notePlaylistServeHealth(rt, partial);
                 return;
             }
-            console.warn(`[HLS START PARTIAL MISS] channel="${ch.name}" warmRun=${getPlaybackWarmRun(rt).count}/${STARTUP_REAL_SEGMENTS} waited=${Date.now() - t0}ms`);
+            console.warn(`[HLS START WAIT] channel="${ch.name}" warmRun=${getPlaybackWarmRun(rt).count}/${STARTUP_REAL_SEGMENTS} window=${readyAfterWait.window}/${STARTUP_REAL_SEGMENTS} waited=${Date.now() - t0}ms`);
+            return sendWaitingPlaylist(res, ch.name, "startup-warming", rt.seqBase, Date.now() - t0);
         }
         rt.primedOnce = true;
 
@@ -2168,6 +2267,7 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
         const { playlist, count, mediaSeq, edge, hi, warmRun: servedWarmRun, readyAhead } = served;
         rt.lastServedPlaylist = { playlist, mediaSeq, edge };
         rt.holdPlaylist = rt.lastServedPlaylist;
+        rt.lastServedAt = Date.now();
         setPlaylistHeaders(res);
         const segmentIdle = rt.lastSegmentAt ? `${Date.now() - rt.lastSegmentAt}ms` : "never";
         const degraded = readyAhead < LIVE_DELAY_SEGMENTS;
@@ -2232,15 +2332,7 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
             // Cached segment reads still count as activity for the current player.
             // Late reads from a previously selected channel must not keep the new one alive.
             if (activeOwnsSegment) {
-                activeRt.lastPlayerAt = Date.now();
-                activeRt.lastSegmentAt = Date.now();
-                activeRt.segmentRequests++;
-                const segmentIdx = activeRt.segs.findIndex(segment => segment.id === segId);
-                if (segmentIdx >= 0) {
-                    const requestedSeq = activeRt.seqBase + segmentIdx;
-                    activeRt.lastRequestedSeq = Math.max(activeRt.lastRequestedSeq ?? requestedSeq, requestedSeq);
-                }
-                queueRuntimePrefetch(activeRt);
+                noteSegmentRequest(activeRt, segId);
             }
             const cached = getSegFromCache(segId);
             if (cached) return sendCachedSeg(req, res, cached, segId, "HIT");
@@ -2420,7 +2512,10 @@ app.get("/:base64Config/stats", (req, res) => {
             segmentAuthFailures: rt.segmentAuthFailures || 0,
             segmentAuthFailureMs: rt.firstSegmentAuthFailureAt ? Date.now() - rt.firstSegmentAuthFailureAt : null,
             lastSegmentRecoveryIdleMs: rt.lastSegmentRecoveryAt ? Date.now() - rt.lastSegmentRecoveryAt : null,
-            segmentRequests: rt.segmentRequests, lastRequestedSeq: rt.lastRequestedSeq
+            segmentRequests: rt.segmentRequests, lastRequestedSeq: rt.lastRequestedSeq,
+            playlistRequests: rt.playlistRequests || 0,
+            playlistRequestsSinceSegment: rt.playlistRequestsSinceSegment || 0,
+            lastServedIdleMs: rt.lastServedAt ? Date.now() - rt.lastServedAt : null
         })),
         activeChannel: activeChannelUrl ? (channels.get(activeChannelUrl)?.label || "?") : null
     });
@@ -2464,7 +2559,8 @@ app.get("/:base64Config/debug", async (req, res) => {
                 LIVE_DELAY_SEGMENTS, MIN_START_SEGMENTS, MIN_VISIBLE_SEGMENTS, STARTUP_REAL_SEGMENTS, STARTUP_REAL_WAIT_MS,
                 PRIME_WAIT_MS, MANIFEST_TYPE_WAIT_MS, RETAIN_SEGMENTS, SERVE_SEGMENTS, PREFETCH_WINDOW_SEGMENTS,
                 SEGMENT_AUTH_FAILURE_LIMIT, SEGMENT_AUTH_FAILURE_MIN_MS, SEGMENT_AUTH_RECOVERY_COOLDOWN_MS,
-                MANIFEST_FORBIDDEN_BACKOFF_MS, POLL_ERROR_BACKOFF_MS, POLL_MIN_MS, POLL_MAX_MS
+                MANIFEST_FORBIDDEN_BACKOFF_MS, POLL_ERROR_BACKOFF_MS, POLL_MIN_MS, POLL_MAX_MS,
+                STALE_PLAYBACK_RUN_MS, STALE_PLAYBACK_RUN_GAP, MANIFEST_ONLY_IDLE_STOP_MS, MANIFEST_ONLY_IDLE_MIN_REQUESTS
             }
         });
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -2483,7 +2579,8 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`⏩ prefetch concurrency=${SEGMENT_PREFETCH_CONCURRENCY} cacheTTL=${SEGMENT_CACHE_TTL / 1000}s`);
     console.log(`🩹 segment playerRetry=${SEGMENT_PLAYER_RETRIES} delay=${SEGMENT_PLAYER_RETRY_DELAY_MS}ms`);
     console.log(`🔐 segment authRecovery=${SEGMENT_AUTH_FAILURE_LIMIT}/${SEGMENT_AUTH_FAILURE_MIN_MS / 1000}s cooldown=${SEGMENT_AUTH_RECOVERY_COOLDOWN_MS / 1000}s`);
-    console.log(`🪟 buffer: retain/serve=${RETAIN_SEGMENTS}/${SERVE_SEGMENTS} liveDelay=${LIVE_DELAY_SEGMENTS}segs prime=${MIN_START_SEGMENTS}segs startup=${STARTUP_REAL_SEGMENTS}segs/${STARTUP_REAL_WAIT_MS / 1000}s partialWait=${STARTUP_PARTIAL_WAIT_MS / 1000}s prefetchWindow=${PREFETCH_WINDOW_SEGMENTS} wait=${PRIME_WAIT_MS / 1000}s typeWait=${MANIFEST_TYPE_WAIT_MS / 1000}s minVisible=${MIN_VISIBLE_SEGMENTS} idleStop=${POLLER_IDLE_STOP_MS / 1000}s`);
+    console.log(`🪟 buffer: retain/serve=${RETAIN_SEGMENTS}/${SERVE_SEGMENTS} liveDelay=${LIVE_DELAY_SEGMENTS}segs prime=${MIN_START_SEGMENTS}segs startup=${STARTUP_REAL_SEGMENTS}segs/${STARTUP_REAL_WAIT_MS / 1000}s partial=${ALLOW_STARTUP_PARTIAL ? `${STARTUP_PARTIAL_WAIT_MS / 1000}s` : "off"} prefetchWindow=${PREFETCH_WINDOW_SEGMENTS} wait=${PRIME_WAIT_MS / 1000}s typeWait=${MANIFEST_TYPE_WAIT_MS / 1000}s minVisible=${MIN_VISIBLE_SEGMENTS} idleStop=${POLLER_IDLE_STOP_MS / 1000}s`);
+    console.log(`🧭 playback watchdog: staleRun=${STALE_PLAYBACK_RUN_MS / 1000}s/${STALE_PLAYBACK_RUN_GAP}segs manifestOnly=${MANIFEST_ONLY_IDLE_STOP_MS / 1000}s/${MANIFEST_ONLY_IDLE_MIN_REQUESTS}reqs`);
     console.log(`📺 epg timezone=${EPG_TIME_ZONE} timeout=${EPG_REQUEST_TIMEOUT / 1000}s firstWait=${EPG_FIRST_CATALOG_WAIT_MS / 1000}s retryDelay=${EPG_RETRY_DELAY_MS / 1000}s cacheTTL=${EPG_CACHE_TTL / 1000}s refresh=${EPG_REFRESH_INTERVAL_MS / 1000}s preload=${EPG_PRELOAD_URLS.length} startupWatch=${EPG_STARTUP_WATCH_MS / 1000}s`);
     console.log(`📚 catalog preload=${CATALOG_PRELOAD_CONFIGS.length}`);
     console.log("=".repeat(60) + "\n");
