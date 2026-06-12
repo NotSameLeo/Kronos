@@ -48,7 +48,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "3.3.1";
+const RELEASE_VERSION = "3.3.2";
 const ADDON_TYPE = "tv";
 const PLAYBACK_MODE = "uhf-direct-relay";
 const CATALOG_TTL = 30 * 60 * 1000;
@@ -195,6 +195,13 @@ function toAbsoluteUrl(value, baseUrl) {
 function isHttpUrl(v) { return /^https?:\/\//i.test(String(v || "")); }
 function isHlsUrl(v) { return /\.m3u8(?:[?#].*)?$/i.test(String(v || "")); }
 function isPlayableHttpUrl(v) { return /^https?:\/\//i.test(String(v || "")); }
+function makeAbortController(res) {
+    const controller = new AbortController();
+    res.on("close", () => {
+        if (!res.writableEnded) controller.abort();
+    });
+    return controller;
+}
 
 function escapeXml(value) {
     return String(value || "")
@@ -887,7 +894,11 @@ async function fetchUpstreamHLS(sourceUrl, label = "stream", signal = null) {
 function rewriteHLSUrlsDirect(playlist, baseUrl, hostBase, configKey) {
     const plUrl = abs => `${hostBase}/${configKey}/proxy/live.m3u8?u=${encodeProxyUrl(abs)}`;
     const segUrl = abs => `${hostBase}/${configKey}/proxy/seg?u=${encodeProxyUrl(abs)}`;
-    const pick = abs => isHlsUrl(abs) ? plUrl(abs) : segUrl(abs);
+    const pick = value => {
+        const abs = toAbsoluteUrl(value, baseUrl);
+        if (!isHttpUrl(abs)) return value;
+        return isHlsUrl(abs) ? plUrl(abs) : segUrl(abs);
+    };
     let mediaUrls = 0;
 
     const rewritten = String(playlist || "").split(/\r?\n/).map(line => {
@@ -897,11 +908,11 @@ function rewriteHLSUrlsDirect(playlist, baseUrl, hostBase, configKey) {
             return line.replace(/URI=("([^"]+)"|'([^']+)')/g, (_, quoted, d, s) => {
                 const uri = d || s;
                 const q = quoted.startsWith("'") ? "'" : '"';
-                return `URI=${q}${pick(toAbsoluteUrl(uri, baseUrl))}${q}`;
+                return `URI=${q}${pick(uri)}${q}`;
             });
         }
         mediaUrls++;
-        return pick(toAbsoluteUrl(t, baseUrl));
+        return pick(t);
     }).join("\n");
 
     return { rewritten, mediaUrls };
@@ -1156,18 +1167,20 @@ function setPlaylistHeaders(res) {
 }
 
 app.get("/:base64Config/proxy/live.m3u8", async (req, res) => {
+    const controller = makeAbortController(res);
     try {
         const configKey = req.params.base64Config;
         decodeConfig(configKey);
         if (!req.query.u) return res.status(400).send("#EXTM3U\n");
         const sourceUrl = decodeProxyUrl(req.query.u);
         const label = String(req.query.label || "direct-hls");
-        const { data, finalUrl, info } = await fetchUpstreamHLS(sourceUrl, label);
+        const { data, finalUrl, info } = await fetchUpstreamHLS(sourceUrl, label, controller.signal);
         const { rewritten, mediaUrls } = rewriteHLSUrlsDirect(data, finalUrl, getPublicHost(req), configKey);
         setPlaylistHeaders(res);
         console.log(`[HLS DIRECT SERVE] channel="${label}" master=${info.isMaster ? 1 : 0} media=${mediaUrls}`);
         res.send(rewritten);
     } catch (err) {
+        if (controller.signal.aborted) return;
         console.error(`[HLS DIRECT ERROR] ${err.message}`);
         if (!res.headersSent) res.status(502).send("#EXTM3U\n#EXT-X-ENDLIST\n");
     }
@@ -1175,14 +1188,16 @@ app.get("/:base64Config/proxy/live.m3u8", async (req, res) => {
 
 app.get("/:base64Config/proxy/seg", async (req, res) => {
     const started = Date.now();
+    const controller = makeAbortController(res);
     let sourceUrl = null;
 
     try {
         decodeConfig(req.params.base64Config);
         if (!req.query.u) return res.status(400).end();
         sourceUrl = decodeProxyUrl(req.query.u);
-        await streamSegment(req, res, sourceUrl, started);
+        await streamSegment(req, res, sourceUrl, started, controller.signal);
     } catch (err) {
+        if (controller.signal.aborted) return;
         console.error(`[SEG ERROR] ${getSegmentLabel(sourceUrl)} ${err.message}`);
         if (!res.headersSent) res.status(502).end();
         else if (!res.destroyed) res.destroy(err);
@@ -1191,13 +1206,14 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
 
 // Stream a segment straight through. Kronos must behave like a normal IPTV
 // client behind the server-side VPN: no segment cache, no synthetic ids.
-async function streamSegment(req, res, sourceUrl, started) {
+async function streamSegment(req, res, sourceUrl, started, signal = null) {
     const headers = { "User-Agent": UPSTREAM_UA, "Accept": "*/*", "Accept-Encoding": "identity", "Connection": "keep-alive" };
     if (req.headers.range) headers.Range = req.headers.range;
 
     const response = await axios.get(sourceUrl, {
         responseType: "stream",
         timeout: SEG_REQUEST_TIMEOUT,
+        signal,
         maxRedirects: 5,
         headers,
         decompress: false,
