@@ -139,7 +139,7 @@ async function main() {
     try {
         await waitForHealth();
         let playlist = await readManifest();
-        assert(playlist.segments.length >= 2, "startup did not wait for real media");
+        assert.equal(playlist.segments.length, 3, "startup did not use the fixed startup segment count");
         const segmentUrl = new URL(playlist.segments.at(-1), kronosOrigin).toString();
         const segment = await request(segmentUrl, { headers: { Range: "bytes=0-" } }, 5000);
         assert(segment.ok, `initial segment returned ${segment.status}`);

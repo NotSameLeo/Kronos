@@ -48,7 +48,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "3.2.14";
+const RELEASE_VERSION = "3.2.15";
 const ADDON_TYPE = "tv";
 const CATALOG_TTL = 30 * 60 * 1000;
 const EPG_CACHE_TTL = Number(process.env.EPG_CACHE_TTL || 6 * 60 * 60 * 1000);
@@ -123,14 +123,10 @@ const SEGMENT_AUTH_RECOVERY_DISTINCT_SEGMENTS = Math.max(
 const PRIME_WAIT_MS = Number(process.env.PRIME_WAIT_MS || 1500);
 const MANIFEST_TYPE_WAIT_MS = Number(process.env.MANIFEST_TYPE_WAIT_MS || 1500);
 const STARTUP_REAL_SEGMENTS = Math.max(
-    MIN_VISIBLE_SEGMENTS + LIVE_DELAY_SEGMENTS,
-    Number(process.env.STARTUP_REAL_SEGMENTS || (MIN_VISIBLE_SEGMENTS + LIVE_DELAY_SEGMENTS))
+    MIN_VISIBLE_SEGMENTS,
+    Number(process.env.STARTUP_REAL_SEGMENTS || MIN_START_SEGMENTS)
 );
 const STARTUP_REAL_WAIT_MS = Number(process.env.STARTUP_REAL_WAIT_MS || 40000);
-const ALLOW_STARTUP_PARTIAL = String(process.env.ALLOW_STARTUP_PARTIAL || "0") === "1";
-const STARTUP_PARTIAL_WAIT_MS = ALLOW_STARTUP_PARTIAL
-    ? Math.min(STARTUP_REAL_WAIT_MS, Number(process.env.STARTUP_PARTIAL_WAIT_MS || 3000))
-    : 0;
 const POLLER_IDLE_STOP_MS = Number(process.env.POLLER_IDLE_STOP_MS || 5 * 60 * 1000); // stop if player gone
 const POLL_MIN_MS = Number(process.env.POLL_MIN_MS || 2500);
 const POLL_MAX_MS = Number(process.env.POLL_MAX_MS || 12000);
@@ -2000,18 +1996,24 @@ function buildServedPlaylist(rt, hostBase, configKey) {
     };
 }
 
-function buildStartupPartialPlaylist(rt, hostBase, configKey) {
-    const warmRun = getPlayableWarmRun(rt, 1);
-    if (warmRun.count <= 0) return null;
-    const endIdx = Math.min(warmRun.end, Math.max(warmRun.start, getLatestWarmIndex(rt)));
-    const seg = rt.segs[endIdx];
-    if (!seg || !getSegFromCache(seg.id)) return null;
+function buildFixedStartupPlaylist(rt, hostBase, configKey) {
+    const warmRun = getPlayableWarmRun(rt, STARTUP_REAL_SEGMENTS);
+    if (warmRun.count < STARTUP_REAL_SEGMENTS) return null;
+
+    const endIdx = warmRun.end;
+    const startIdx = endIdx - STARTUP_REAL_SEGMENTS + 1;
+    if (startIdx < warmRun.start) return null;
+    const win = rt.segs.slice(startIdx, endIdx + 1);
+    if (win.length !== STARTUP_REAL_SEGMENTS || win.some(s => !getSegFromCache(s.id))) return null;
 
     rt.servedEdge = rt.seqBase + endIdx;
-    const mediaSeq = rt.servedEdge;
+    const mediaSeq = rt.seqBase + startIdx;
+    const hasWindowDiscontinuity = win.some(s => s.discontinuity);
+    const forceStartDiscontinuity = !hasWindowDiscontinuity
+        && (rt.pendingPlaylistDiscontinuity || rt.segs.slice(0, startIdx).some(s => s.discontinuity));
     const discontinuitySequence = rt.discontinuityBase
-        + rt.segs.slice(0, endIdx).filter(s => s.discontinuity).length;
-    const target = Math.max(1, Math.ceil(Number(seg.duration || rt.target || 6)));
+        + rt.segs.slice(0, startIdx).filter(s => s.discontinuity).length;
+    const target = Math.max(1, Math.ceil(Math.max(rt.target || 6, ...win.map(s => s.duration || 0))));
     const lines = [
         "#EXTM3U",
         "#EXT-X-VERSION:3",
@@ -2019,13 +2021,18 @@ function buildStartupPartialPlaylist(rt, hostBase, configKey) {
         `#EXT-X-MEDIA-SEQUENCE:${mediaSeq}`,
         `#EXT-X-DISCONTINUITY-SEQUENCE:${discontinuitySequence}`
     ];
-    if (seg.discontinuity) lines.push("#EXT-X-DISCONTINUITY");
-    lines.push(`#EXTINF:${Number(seg.duration || rt.target || 6).toFixed(3)},`);
-    lines.push(`${hostBase}/${configKey}/proxy/seg?s=${encodeURIComponent(seg.id)}`);
+    for (const [idx, s] of win.entries()) {
+        if (s.discontinuity || (idx === 0 && forceStartDiscontinuity)) lines.push("#EXT-X-DISCONTINUITY");
+        lines.push(`#EXTINF:${Number(s.duration || rt.target || 6).toFixed(3)},`);
+        lines.push(`${hostBase}/${configKey}/proxy/seg?s=${encodeURIComponent(s.id)}`);
+    }
+    if (hasWindowDiscontinuity || forceStartDiscontinuity) {
+        rt.pendingPlaylistDiscontinuity = false;
+    }
 
     return {
         playlist: lines.join("\n") + "\n",
-        count: 1,
+        count: win.length,
         mediaSeq,
         edge: rt.servedEdge,
         hi: rt.seqBase + rt.segs.length - 1,
@@ -2201,9 +2208,6 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
             const startedWait = Date.now();
             while (rt.running && !rt.isMaster && !getStartupReadiness(rt).ready) {
                 if (Date.now() - startedWait >= STARTUP_REAL_WAIT_MS) break;
-                if (ALLOW_STARTUP_PARTIAL
-                    && Date.now() - startedWait >= STARTUP_PARTIAL_WAIT_MS
-                    && getPlayableWarmRun(rt, 1).count > 0) break;
                 rt.lastPlayerAt = Date.now();
                 await sleep(50);
             }
@@ -2229,27 +2233,31 @@ app.get("/:base64Config/hls/:id/index.m3u8", async (req, res) => {
             console.warn(`[HLS NOT READY] channel="${ch.name}" warmRun=${getPlaybackWarmRun(rt).count}/${warmTarget} waited=${Date.now() - t0}ms`);
             return sendWaitingPlaylist(res, ch.name, "no-warm-cache", rt.seqBase, Date.now() - t0);
         }
+        if (fresh) {
+            if (!readyAfterWait.ready) {
+                console.warn(`[HLS START WAIT] channel="${ch.name}" warmRun=${getPlaybackWarmRun(rt).count}/${STARTUP_REAL_SEGMENTS} window=${readyAfterWait.window}/${STARTUP_REAL_SEGMENTS} waited=${Date.now() - t0}ms`);
+                return sendWaitingPlaylist(res, ch.name, "startup-warming", rt.seqBase, Date.now() - t0);
+            }
+            const startup = buildFixedStartupPlaylist(rt, host, configKey);
+            if (!startup) {
+                console.warn(`[HLS START WAIT] channel="${ch.name}" reason=fixed-startup-miss warmRun=${getPlaybackWarmRun(rt).count}/${STARTUP_REAL_SEGMENTS} waited=${Date.now() - t0}ms`);
+                return sendWaitingPlaylist(res, ch.name, "fixed-startup-miss", rt.seqBase, Date.now() - t0);
+            }
+            rt.primedOnce = true;
+            rt.lastServedPlaylist = { playlist: startup.playlist, mediaSeq: startup.mediaSeq, edge: startup.edge };
+            rt.holdPlaylist = rt.lastServedPlaylist;
+            rt.lastServedAt = Date.now();
+            setPlaylistHeaders(res);
+            console.log(`[HLS START SERVE] channel="${ch.name}" window=${startup.count}/${STARTUP_REAL_SEGMENTS} seq=${startup.mediaSeq} edge=${startup.edge}/${startup.hi} warmRun=${startup.warmRun} gen=${rt.generation} waited=${Date.now() - t0}ms`);
+            res.send(startup.playlist);
+            notePlaylistServeHealth(rt, startup);
+            return;
+        }
         if (!readyAfterWait.ready && readyAfterWait.window < MIN_VISIBLE_SEGMENTS && holdPlaylist) {
             setPlaylistHeaders(res);
             console.warn(`[HLS HOLD] channel="${ch.name}" reason=short-window seq=${holdPlaylist.mediaSeq} edge=${holdPlaylist.edge} warmRun=${getPlayableWarmRun(rt, MIN_VISIBLE_SEGMENTS).count}/${MIN_VISIBLE_SEGMENTS} window=${readyAfterWait.window}/${MIN_VISIBLE_SEGMENTS} waited=${Date.now() - t0}ms`);
             notePlaylistHoldHealth(rt, "short-window");
             return res.send(holdPlaylist.playlist);
-        }
-        if (fresh && !readyAfterWait.ready) {
-            const partial = ALLOW_STARTUP_PARTIAL ? buildStartupPartialPlaylist(rt, host, configKey) : null;
-            if (partial) {
-                rt.primedOnce = true;
-                rt.lastServedPlaylist = { playlist: partial.playlist, mediaSeq: partial.mediaSeq, edge: partial.edge };
-                rt.holdPlaylist = rt.lastServedPlaylist;
-                rt.lastServedAt = Date.now();
-                setPlaylistHeaders(res);
-                console.warn(`[HLS START PARTIAL] channel="${ch.name}" window=${partial.count} seq=${partial.mediaSeq} edge=${partial.edge}/${partial.hi} warmRun=${partial.warmRun}/${STARTUP_REAL_SEGMENTS} waited=${Date.now() - t0}ms`);
-                res.send(partial.playlist);
-                notePlaylistServeHealth(rt, partial);
-                return;
-            }
-            console.warn(`[HLS START WAIT] channel="${ch.name}" warmRun=${getPlaybackWarmRun(rt).count}/${STARTUP_REAL_SEGMENTS} window=${readyAfterWait.window}/${STARTUP_REAL_SEGMENTS} waited=${Date.now() - t0}ms`);
-            return sendWaitingPlaylist(res, ch.name, "startup-warming", rt.seqBase, Date.now() - t0);
         }
         rt.primedOnce = true;
 
@@ -2579,7 +2587,7 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`⏩ prefetch concurrency=${SEGMENT_PREFETCH_CONCURRENCY} cacheTTL=${SEGMENT_CACHE_TTL / 1000}s`);
     console.log(`🩹 segment playerRetry=${SEGMENT_PLAYER_RETRIES} delay=${SEGMENT_PLAYER_RETRY_DELAY_MS}ms`);
     console.log(`🔐 segment authRecovery=${SEGMENT_AUTH_FAILURE_LIMIT}/${SEGMENT_AUTH_FAILURE_MIN_MS / 1000}s cooldown=${SEGMENT_AUTH_RECOVERY_COOLDOWN_MS / 1000}s`);
-    console.log(`🪟 buffer: retain/serve=${RETAIN_SEGMENTS}/${SERVE_SEGMENTS} liveDelay=${LIVE_DELAY_SEGMENTS}segs prime=${MIN_START_SEGMENTS}segs startup=${STARTUP_REAL_SEGMENTS}segs/${STARTUP_REAL_WAIT_MS / 1000}s partial=${ALLOW_STARTUP_PARTIAL ? `${STARTUP_PARTIAL_WAIT_MS / 1000}s` : "off"} prefetchWindow=${PREFETCH_WINDOW_SEGMENTS} wait=${PRIME_WAIT_MS / 1000}s typeWait=${MANIFEST_TYPE_WAIT_MS / 1000}s minVisible=${MIN_VISIBLE_SEGMENTS} idleStop=${POLLER_IDLE_STOP_MS / 1000}s`);
+    console.log(`🪟 buffer: retain/serve=${RETAIN_SEGMENTS}/${SERVE_SEGMENTS} liveDelay=${LIVE_DELAY_SEGMENTS}segs prime=${MIN_START_SEGMENTS}segs startupFixed=${STARTUP_REAL_SEGMENTS}segs/${STARTUP_REAL_WAIT_MS / 1000}s prefetchWindow=${PREFETCH_WINDOW_SEGMENTS} wait=${PRIME_WAIT_MS / 1000}s typeWait=${MANIFEST_TYPE_WAIT_MS / 1000}s minVisible=${MIN_VISIBLE_SEGMENTS} idleStop=${POLLER_IDLE_STOP_MS / 1000}s`);
     console.log(`🧭 playback watchdog: staleRun=${STALE_PLAYBACK_RUN_MS / 1000}s/${STALE_PLAYBACK_RUN_GAP}segs manifestOnly=${MANIFEST_ONLY_IDLE_STOP_MS / 1000}s/${MANIFEST_ONLY_IDLE_MIN_REQUESTS}reqs`);
     console.log(`📺 epg timezone=${EPG_TIME_ZONE} timeout=${EPG_REQUEST_TIMEOUT / 1000}s firstWait=${EPG_FIRST_CATALOG_WAIT_MS / 1000}s retryDelay=${EPG_RETRY_DELAY_MS / 1000}s cacheTTL=${EPG_CACHE_TTL / 1000}s refresh=${EPG_REFRESH_INTERVAL_MS / 1000}s preload=${EPG_PRELOAD_URLS.length} startupWatch=${EPG_STARTUP_WATCH_MS / 1000}s`);
     console.log(`📚 catalog preload=${CATALOG_PRELOAD_CONFIGS.length}`);

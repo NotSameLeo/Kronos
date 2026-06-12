@@ -390,8 +390,7 @@ async function main() {
         await waitForHealth();
 
         const initial = await readManifest("A");
-        assert(initial.segments.length >= 2, "initial playlist did not wait for playable real media");
-        assert(initial.segments.length <= 5, "initial real playlist exceeded its visible window");
+        assert.equal(initial.segments.length, 4, "initial playlist did not use the fixed startup segment count");
         assert(initial.segments.every(segment => !segment.includes("/black.ts")), "startup served placeholder media");
         assert(maxInitialManifestMs < 5000, `initial real manifest took too long (${maxInitialManifestMs}ms)`);
         await assertManifestCached(initial);
@@ -564,6 +563,8 @@ async function main() {
 
         const text = logs.join("");
         assert(text.includes("(priming real"), "real startup priming path was not exercised");
+        assert(text.includes("[HLS START SERVE]"), "fixed startup playlist path was not exercised");
+        assert(!text.includes("[HLS START PARTIAL]"), "startup partial path was exercised");
         assert(!text.includes("[HLS PLACEHOLDER]"), "startup fell back to placeholder media");
         assert(text.includes("[HLS RETRY]"), "manifest retry path was not exercised");
         assert(text.includes("[POLLER ERR]"), "manifest poller recovery path was not exercised");
