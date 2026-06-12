@@ -48,7 +48,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "3.3.5";
+const RELEASE_VERSION = "3.3.6";
 const ADDON_TYPE = "tv";
 const PLAYBACK_MODE = "uhf-direct-relay";
 const CATALOG_TTL = 30 * 60 * 1000;
@@ -66,6 +66,9 @@ const CATALOG_PRELOAD_CONFIGS = parseCatalogPreloadConfigs(process.env.CATALOG_P
 const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 10000);
 const HLS_UPSTREAM_RETRIES = Math.max(0, Number(process.env.HLS_UPSTREAM_RETRIES || 1));
 const HLS_UPSTREAM_RETRY_DELAY_MS = Math.max(0, Number(process.env.HLS_UPSTREAM_RETRY_DELAY_MS || 250));
+const HLS_LIVE_MIN_SEGMENTS = Math.max(1, Number(process.env.HLS_LIVE_MIN_SEGMENTS || 3));
+const HLS_LIVE_WARMUP_WAIT_MS = Math.max(0, Number(process.env.HLS_LIVE_WARMUP_WAIT_MS || 35000));
+const HLS_LIVE_WARMUP_POLL_MS = Math.max(250, Number(process.env.HLS_LIVE_WARMUP_POLL_MS || 2000));
 const SEG_REQUEST_TIMEOUT = Number(process.env.SEG_REQUEST_TIMEOUT || 45000);
 const SEGMENT_UPSTREAM_CONCURRENCY = Math.max(1, Number(process.env.SEGMENT_UPSTREAM_CONCURRENCY || 1));
 const SEGMENT_UPSTREAM_RETRIES = Math.max(0, Number(process.env.SEGMENT_UPSTREAM_RETRIES || 1));
@@ -933,6 +936,46 @@ async function fetchUpstreamHLS(sourceUrl, label = "stream", signal = null) {
     throw lastErr || new Error(`HLS manifest fetch failed for ${label}`);
 }
 
+function needsLiveWarmup(info) {
+    if (!info || info.isMaster || !info.isLive) return false;
+    if (info.segmentCount >= HLS_LIVE_MIN_SEGMENTS) return false;
+    return (info.mediaSequence ?? 0) <= 1;
+}
+
+async function fetchPlayableHLS(sourceUrl, label = "stream", signal = null) {
+    const started = Date.now();
+    let result = await fetchUpstreamHLS(sourceUrl, label, signal);
+    if (!needsLiveWarmup(result.info) || HLS_LIVE_WARMUP_WAIT_MS <= 0) return { ...result, warmupMs: 0, warmupPolls: 0 };
+
+    let polls = 0;
+    console.warn(`[HLS WARMUP] channel="${label}" media=${result.info.segmentCount}/${HLS_LIVE_MIN_SEGMENTS} seq=${result.info.mediaSequence ?? "n/a"} target=${result.info.targetDuration ?? "n/a"}`);
+    while (!signal?.aborted && Date.now() - started < HLS_LIVE_WARMUP_WAIT_MS) {
+        polls++;
+        await sleep(HLS_LIVE_WARMUP_POLL_MS);
+        result = await fetchUpstreamHLS(sourceUrl, label, signal);
+        if (!needsLiveWarmup(result.info)) {
+            const warmupMs = Date.now() - started;
+            console.log(`[HLS WARMUP READY] channel="${label}" media=${result.info.segmentCount} seq=${result.info.mediaSequence ?? "n/a"} wait=${warmupMs}ms polls=${polls}`);
+            return { ...result, warmupMs, warmupPolls: polls };
+        }
+    }
+
+    console.warn(`[HLS WARMUP GIVEUP] channel="${label}" media=${result.info.segmentCount}/${HLS_LIVE_MIN_SEGMENTS} seq=${result.info.mediaSequence ?? "n/a"} wait=${Date.now() - started}ms polls=${polls}`);
+    return { ...result, warmupMs: Date.now() - started, warmupPolls: polls };
+}
+
+const hlsWarmups = new Map();
+
+async function fetchPlayableHLSShared(sourceUrl, label = "stream") {
+    const key = hashKey(sourceUrl);
+    const current = hlsWarmups.get(key);
+    if (current) return await current;
+    const promise = fetchPlayableHLS(sourceUrl, label);
+    hlsWarmups.set(key, promise);
+    try { return await promise; }
+    finally { hlsWarmups.delete(key); }
+}
+
 // Transparent HLS relay: do not invent media-sequences, segment ids or cache
 // state. This mirrors a normal IPTV player behind the server-side VPN: every
 // refreshed manifest carries the current token-bearing segment URLs.
@@ -1280,10 +1323,11 @@ app.get("/:base64Config/proxy/live.m3u8", async (req, res) => {
         if (!req.query.u) return res.status(400).send("#EXTM3U\n");
         const sourceUrl = decodeProxyUrl(req.query.u);
         label = String(req.query.label || "direct-hls");
-        const { data, finalUrl, info, attempts } = await fetchUpstreamHLS(sourceUrl, label, controller.signal);
+        const { data, finalUrl, info, attempts, warmupMs, warmupPolls } = await fetchPlayableHLSShared(sourceUrl, label);
+        if (controller.signal.aborted) return;
         const { rewritten, mediaUrls, firstMedia, lastMedia, queueKey } = rewriteHLSUrlsDirect(data, finalUrl, getPublicHost(req), configKey);
         setPlaylistHeaders(res);
-        console.log(`[HLS DIRECT SERVE] channel="${label}" master=${info.isMaster ? 1 : 0} media=${mediaUrls} seq=${info.mediaSequence ?? "n/a"} target=${info.targetDuration ?? "n/a"} first=${firstMedia || "n/a"} last=${lastMedia || "n/a"} q=${queueKey} attempts=${attempts} time=${Date.now() - started}ms`);
+        console.log(`[HLS DIRECT SERVE] channel="${label}" master=${info.isMaster ? 1 : 0} media=${mediaUrls} seq=${info.mediaSequence ?? "n/a"} target=${info.targetDuration ?? "n/a"} first=${firstMedia || "n/a"} last=${lastMedia || "n/a"} q=${queueKey} attempts=${attempts} warmup=${warmupMs || 0}ms polls=${warmupPolls || 0} time=${Date.now() - started}ms`);
         res.send(rewritten);
     } catch (err) {
         if (controller.signal.aborted) return;
@@ -1421,7 +1465,8 @@ app.get("/:base64Config/stats", (req, res) => {
         upstream: {
             directRelay: true,
             segmentConcurrency: SEGMENT_UPSTREAM_CONCURRENCY,
-            segmentQueues: segmentQueues.size
+            segmentQueues: segmentQueues.size,
+            hlsWarmups: hlsWarmups.size
         }
     });
 });
@@ -1462,6 +1507,7 @@ app.get("/:base64Config/debug", async (req, res) => {
             constants: {
                 ADDON_TYPE, RELEASE_VERSION, PLAYBACK_MODE, HLS_REQUEST_TIMEOUT, SEG_REQUEST_TIMEOUT,
                 HLS_UPSTREAM_RETRIES, HLS_UPSTREAM_RETRY_DELAY_MS,
+                HLS_LIVE_MIN_SEGMENTS, HLS_LIVE_WARMUP_WAIT_MS, HLS_LIVE_WARMUP_POLL_MS,
                 SEGMENT_UPSTREAM_CONCURRENCY, SEGMENT_UPSTREAM_RETRIES, SEGMENT_UPSTREAM_RETRY_DELAY_MS,
                 PLAYLIST_REQUEST_TIMEOUT, PLAYLIST_RETRY_WINDOW_MS, PLAYLIST_RETRY_DELAY_MS
             }
@@ -1477,7 +1523,7 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`🌐 http://0.0.0.0:${PORT}`);
     console.log(`📦 Node ${process.version}`);
     console.log(`🎬 playback=${PLAYBACK_MODE} noBuffer=1 noPrefetch=1 noSegmentCache=1`);
-    console.log(`🔁 manifest directFetch=1 timeout=${HLS_REQUEST_TIMEOUT / 1000}s retries=${HLS_UPSTREAM_RETRIES}`);
+    console.log(`🔁 manifest directFetch=1 timeout=${HLS_REQUEST_TIMEOUT / 1000}s retries=${HLS_UPSTREAM_RETRIES} liveMin=${HLS_LIVE_MIN_SEGMENTS} warmupWait=${HLS_LIVE_WARMUP_WAIT_MS / 1000}s`);
     console.log(`📋 playlist retryWindow=${PLAYLIST_RETRY_WINDOW_MS / 1000}s delay=${PLAYLIST_RETRY_DELAY_MS / 1000}s`);
     console.log(`🎞️ segment timeout=${SEG_REQUEST_TIMEOUT / 1000}s rangeForward=1 upstreamConcurrency=${SEGMENT_UPSTREAM_CONCURRENCY} retries=${SEGMENT_UPSTREAM_RETRIES}`);
     console.log(`📺 epg timezone=${EPG_TIME_ZONE} timeout=${EPG_REQUEST_TIMEOUT / 1000}s firstWait=${EPG_FIRST_CATALOG_WAIT_MS / 1000}s retryDelay=${EPG_RETRY_DELAY_MS / 1000}s cacheTTL=${EPG_CACHE_TTL / 1000}s refresh=${EPG_REFRESH_INTERVAL_MS / 1000}s preload=${EPG_PRELOAD_URLS.length} startupWatch=${EPG_STARTUP_WATCH_MS / 1000}s`);
