@@ -113,7 +113,7 @@ async function main() {
         assert.equal(streamResponse.status, 200, `stream returned ${streamResponse.status}`);
         const stream = (await streamResponse.json()).streams[0];
         assert(stream.url.includes("/proxy/live.m3u8?u="), "default HLS stream is not direct relay");
-        assert(!stream.url.includes(`/${config}/hls/`), "buffered HLS route leaked into direct mode");
+        assert(!stream.url.includes(`/${config}/hls/`), "legacy HLS route leaked into direct mode");
 
         const manifestResponse = await request(stream.url, {}, 2000);
         assert.equal(manifestResponse.status, 200, `manifest returned ${manifestResponse.status}`);
@@ -121,22 +121,29 @@ async function main() {
         assert(manifest.includes("/proxy/seg?u="), "direct manifest did not encode segment URLs");
         assert(!manifest.includes("/proxy/seg?s="), "direct manifest used stable segment ids");
 
+        const oldHlsResponse = await request(`${kronosOrigin}/${config}/hls/${id}/index.m3u8`, {}, 2000);
+        assert.equal(oldHlsResponse.status, 404, "legacy buffered HLS route is still exposed");
+
+        const oldNestedResponse = await request(`${kronosOrigin}/${config}/proxy/pl?u=${Buffer.from(streamUrl).toString("base64url")}`, {}, 2000);
+        assert.equal(oldNestedResponse.status, 404, "legacy stable nested-playlist route is still exposed");
+
         const segmentLine = manifest.split(/\r?\n/).find(line => line.includes("/proxy/seg?u="));
         const segmentUrl = new URL(segmentLine, kronosOrigin).toString();
         const segmentResponse = await request(segmentUrl, { headers: { Range: "bytes=0-" } }, 2000);
         assert(segmentResponse.ok, `segment returned ${segmentResponse.status}`);
-        assert.equal(segmentResponse.headers.get("x-kronos-cache"), "MISS");
+        assert.equal(segmentResponse.headers.get("x-kronos-relay"), "1");
+        assert.equal(segmentResponse.headers.get("x-kronos-cache"), null);
         await segmentResponse.arrayBuffer();
 
         const debug = await (await request(`${kronosOrigin}/${config}/debug`, {}, 2000)).json();
-        assert.equal(debug.mode, "direct-hls-relay", "debug mode did not report direct relay");
+        assert.equal(debug.mode, "uhf-direct-relay", "debug mode did not report UHF-like direct relay");
 
         console.log(JSON.stringify({
             ok: true,
             mode: debug.mode,
             manifests: mock.state.manifests,
             segments: mock.state.segments,
-            exercised: ["direct-hls-relay"]
+            exercised: ["uhf-direct-relay"]
         }, null, 2));
     } catch (err) {
         console.error(logs.join(""));

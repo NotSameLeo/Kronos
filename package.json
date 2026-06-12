@@ -1,14 +1,14 @@
 {
   "name": "kronos-channel-stremio",
-  "version": "3.2.17",
+  "version": "3.3.0",
   "description": "Kronos channel addon configurator for Stremio",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "check": "node --check server.js",
-    "stress": "node test/stress-stream.js",
+    "test:relay": "node test/direct-relay.js",
     "stress:epg": "node test/epg-resilience.js",
-    "test": "node test/direct-relay.js && node test/stress-stream.js && node test/manifest-only-watchdog.js && node test/epg-resilience.js"
+    "test": "node test/direct-relay.js && node test/epg-resilience.js"
   },
   "dependencies": {
     "axios": "^1.16.1",
