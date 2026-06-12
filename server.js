@@ -48,7 +48,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "3.3.4";
+const RELEASE_VERSION = "3.3.5";
 const ADDON_TYPE = "tv";
 const PLAYBACK_MODE = "uhf-direct-relay";
 const CATALOG_TTL = 30 * 60 * 1000;
@@ -63,7 +63,9 @@ const EPG_PRELOAD_URL = String(process.env.EPG_PRELOAD_URL || DEFAULT_EPG_PRELOA
 const EPG_PRELOAD_URLS = parseUrlList(process.env.EPG_PRELOAD_URLS || EPG_PRELOAD_URL);
 const EPG_STARTUP_WATCH_MS = Number(process.env.EPG_STARTUP_WATCH_MS || 30000);
 const CATALOG_PRELOAD_CONFIGS = parseCatalogPreloadConfigs(process.env.CATALOG_PRELOAD_CONFIGS || process.env.KRONOS_PRELOAD_CONFIGS || "");
-const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 20000);
+const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 10000);
+const HLS_UPSTREAM_RETRIES = Math.max(0, Number(process.env.HLS_UPSTREAM_RETRIES || 1));
+const HLS_UPSTREAM_RETRY_DELAY_MS = Math.max(0, Number(process.env.HLS_UPSTREAM_RETRY_DELAY_MS || 250));
 const SEG_REQUEST_TIMEOUT = Number(process.env.SEG_REQUEST_TIMEOUT || 45000);
 const SEGMENT_UPSTREAM_CONCURRENCY = Math.max(1, Number(process.env.SEGMENT_UPSTREAM_CONCURRENCY || 1));
 const SEGMENT_UPSTREAM_RETRIES = Math.max(0, Number(process.env.SEGMENT_UPSTREAM_RETRIES || 1));
@@ -252,6 +254,13 @@ function isRetryableSegmentError(err) {
     const status = getErrorStatus(err);
     if ([408, 425, 429, 500, 502, 503, 504].includes(status)) return true;
     return ["ECONNRESET", "ECONNABORTED", "ETIMEDOUT", "EPIPE"].includes(err?.code);
+}
+
+function isRetryableHlsError(err) {
+    const status = getErrorStatus(err);
+    if ([408, 425, 429, 500, 502, 503, 504].includes(status)) return true;
+    return ["ECONNRESET", "ECONNABORTED", "ETIMEDOUT", "EPIPE"].includes(err?.code)
+        || /timeout/i.test(String(err?.message || ""));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -889,27 +898,39 @@ async function getChannelById(configKey, config, id) {
 // ─────────────────────────────────────────────────────────────────────────────
 // HLS relay
 // ─────────────────────────────────────────────────────────────────────────────
-// Fetch exactly the manifest requested by the player. No retry loop, gate,
-// prebuffer, synthetic live window or session state.
+// Fetch the manifest requested by the player without inventing live state. A
+// short bounded retry absorbs transient Xtream 5xx/timeouts without hiding a
+// genuinely broken upstream behind synthetic playlists.
 async function fetchUpstreamHLS(sourceUrl, label = "stream", signal = null) {
-    const r = await axios.get(sourceUrl, {
-        timeout: HLS_REQUEST_TIMEOUT,
-        signal,
-        maxRedirects: 5,
-        headers: {
-            "User-Agent": UPSTREAM_UA,
-            "Accept": "application/x-mpegURL, application/vnd.apple.mpegurl, audio/mpegurl, text/plain, */*",
-            "Accept-Encoding": "gzip, deflate",
-            "Connection": "keep-alive"
-        },
-        validateStatus: s => s >= 200 && s < 300
-    });
-    const finalUrl = r.request?.res?.responseUrl || sourceUrl;
-    const text = String(r.data || "").trim();
-    if (!text.startsWith("#EXTM3U")) {
-        throw new Error(`Invalid HLS manifest from upstream for ${label}`);
+    let lastErr = null;
+    for (let attempt = 1; attempt <= HLS_UPSTREAM_RETRIES + 1; attempt++) {
+        try {
+            const r = await axios.get(sourceUrl, {
+                timeout: HLS_REQUEST_TIMEOUT,
+                signal,
+                maxRedirects: 5,
+                headers: {
+                    "User-Agent": UPSTREAM_UA,
+                    "Accept": "application/x-mpegURL, application/vnd.apple.mpegurl, audio/mpegurl, text/plain, */*",
+                    "Accept-Encoding": "gzip, deflate",
+                    "Connection": "keep-alive"
+                },
+                validateStatus: s => s >= 200 && s < 300
+            });
+            const finalUrl = r.request?.res?.responseUrl || sourceUrl;
+            const text = String(r.data || "").trim();
+            if (!text.startsWith("#EXTM3U")) {
+                throw new Error(`Invalid HLS manifest from upstream for ${label}`);
+            }
+            return { data: r.data, finalUrl, info: analyzeHLS(text), attempts: attempt };
+        } catch (err) {
+            lastErr = err;
+            if (signal?.aborted || !isRetryableHlsError(err) || attempt > HLS_UPSTREAM_RETRIES) throw err;
+            console.warn(`[HLS RETRY] channel="${label}" attempt=${attempt} reason=${err.message}`);
+            if (HLS_UPSTREAM_RETRY_DELAY_MS > 0) await sleep(HLS_UPSTREAM_RETRY_DELAY_MS);
+        }
     }
-    return { data: r.data, finalUrl, info: analyzeHLS(text) };
+    throw lastErr || new Error(`HLS manifest fetch failed for ${label}`);
 }
 
 // Transparent HLS relay: do not invent media-sequences, segment ids or cache
@@ -1250,22 +1271,26 @@ async function withSegmentSlot(queueKey, signal, fn) {
 }
 
 app.get("/:base64Config/proxy/live.m3u8", async (req, res) => {
+    const started = Date.now();
     const controller = makeAbortController(res);
+    let label = "direct-hls";
     try {
         const configKey = req.params.base64Config;
         decodeConfig(configKey);
         if (!req.query.u) return res.status(400).send("#EXTM3U\n");
         const sourceUrl = decodeProxyUrl(req.query.u);
-        const label = String(req.query.label || "direct-hls");
-        const { data, finalUrl, info } = await fetchUpstreamHLS(sourceUrl, label, controller.signal);
+        label = String(req.query.label || "direct-hls");
+        const { data, finalUrl, info, attempts } = await fetchUpstreamHLS(sourceUrl, label, controller.signal);
         const { rewritten, mediaUrls, firstMedia, lastMedia, queueKey } = rewriteHLSUrlsDirect(data, finalUrl, getPublicHost(req), configKey);
         setPlaylistHeaders(res);
-        console.log(`[HLS DIRECT SERVE] channel="${label}" master=${info.isMaster ? 1 : 0} media=${mediaUrls} seq=${info.mediaSequence ?? "n/a"} target=${info.targetDuration ?? "n/a"} first=${firstMedia || "n/a"} last=${lastMedia || "n/a"} q=${queueKey}`);
+        console.log(`[HLS DIRECT SERVE] channel="${label}" master=${info.isMaster ? 1 : 0} media=${mediaUrls} seq=${info.mediaSequence ?? "n/a"} target=${info.targetDuration ?? "n/a"} first=${firstMedia || "n/a"} last=${lastMedia || "n/a"} q=${queueKey} attempts=${attempts} time=${Date.now() - started}ms`);
         res.send(rewritten);
     } catch (err) {
         if (controller.signal.aborted) return;
-        console.error(`[HLS DIRECT ERROR] ${err.message}`);
-        if (!res.headersSent) res.status(502).send("#EXTM3U\n#EXT-X-ENDLIST\n");
+        const timeout = err?.code === "ECONNABORTED" || /timeout/i.test(String(err?.message || ""));
+        const status = timeout ? 504 : 502;
+        console.error(`[HLS DIRECT ERROR] channel="${label}" status=${status} time=${Date.now() - started}ms reason=${err.message}`);
+        if (!res.headersSent) res.status(status).type("text/plain").send("Upstream HLS manifest unavailable\n");
     }
 });
 
@@ -1436,6 +1461,7 @@ app.get("/:base64Config/debug", async (req, res) => {
             groups: [...new Set(channels.map(c => c.group))].slice(0, 50),
             constants: {
                 ADDON_TYPE, RELEASE_VERSION, PLAYBACK_MODE, HLS_REQUEST_TIMEOUT, SEG_REQUEST_TIMEOUT,
+                HLS_UPSTREAM_RETRIES, HLS_UPSTREAM_RETRY_DELAY_MS,
                 SEGMENT_UPSTREAM_CONCURRENCY, SEGMENT_UPSTREAM_RETRIES, SEGMENT_UPSTREAM_RETRY_DELAY_MS,
                 PLAYLIST_REQUEST_TIMEOUT, PLAYLIST_RETRY_WINDOW_MS, PLAYLIST_RETRY_DELAY_MS
             }
@@ -1451,7 +1477,7 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`🌐 http://0.0.0.0:${PORT}`);
     console.log(`📦 Node ${process.version}`);
     console.log(`🎬 playback=${PLAYBACK_MODE} noBuffer=1 noPrefetch=1 noSegmentCache=1`);
-    console.log(`🔁 manifest directFetch=1 timeout=${HLS_REQUEST_TIMEOUT / 1000}s`);
+    console.log(`🔁 manifest directFetch=1 timeout=${HLS_REQUEST_TIMEOUT / 1000}s retries=${HLS_UPSTREAM_RETRIES}`);
     console.log(`📋 playlist retryWindow=${PLAYLIST_RETRY_WINDOW_MS / 1000}s delay=${PLAYLIST_RETRY_DELAY_MS / 1000}s`);
     console.log(`🎞️ segment timeout=${SEG_REQUEST_TIMEOUT / 1000}s rangeForward=1 upstreamConcurrency=${SEGMENT_UPSTREAM_CONCURRENCY} retries=${SEGMENT_UPSTREAM_RETRIES}`);
     console.log(`📺 epg timezone=${EPG_TIME_ZONE} timeout=${EPG_REQUEST_TIMEOUT / 1000}s firstWait=${EPG_FIRST_CATALOG_WAIT_MS / 1000}s retryDelay=${EPG_RETRY_DELAY_MS / 1000}s cacheTTL=${EPG_CACHE_TTL / 1000}s refresh=${EPG_REFRESH_INTERVAL_MS / 1000}s preload=${EPG_PRELOAD_URLS.length} startupWatch=${EPG_STARTUP_WATCH_MS / 1000}s`);
