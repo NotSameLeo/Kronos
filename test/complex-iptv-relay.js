@@ -49,9 +49,9 @@ function browserLike(req) {
 function createComplexUpstream() {
     const state = {
         playlistHits: 0,
-        manifestHits: { alpha: 0, beta: 0 },
-        segmentHits: { alpha: 0, beta: 0 },
-        failManifests: { alpha: 0, beta: 0 },
+        manifestHits: { alpha: 0, beta: 0, gamma: 0 },
+        segmentHits: { alpha: 0, beta: 0, gamma: 0 },
+        failManifests: { alpha: 0, beta: 0, gamma: 0 },
         activeSegments: 0,
         maxActiveSegments: 0,
         userAgents: []
@@ -70,12 +70,14 @@ function createComplexUpstream() {
                 `${origin}/live/alpha.m3u8`,
                 '#EXTINF:-1 group-title="IT | TEST",IT: BETA HD',
                 `${origin}/live/beta.m3u8`,
+                '#EXTINF:-1 group-title="IT | TEST",IT: GAMMA HD',
+                `${origin}/live/gamma.m3u8`,
                 ""
             ].join("\n"));
             return;
         }
 
-        const manifestMatch = url.pathname.match(/^\/live\/(alpha|beta)\.m3u8$/);
+        const manifestMatch = url.pathname.match(/^\/live\/(alpha|beta|gamma)\.m3u8$/);
         if (manifestMatch) {
             if (!browserLike(req)) {
                 res.writeHead(451, { "content-type": "text/plain" });
@@ -113,7 +115,7 @@ function createComplexUpstream() {
             return;
         }
 
-        const segmentMatch = url.pathname.match(/^\/segments\/(alpha|beta)\/([^/]+)\/(\d+)\.ts$/);
+        const segmentMatch = url.pathname.match(/^\/segments\/(alpha|beta|gamma)\/([^/]+)\/(\d+)\.ts$/);
         if (segmentMatch) {
             if (!browserLike(req)) {
                 res.writeHead(451, { "content-type": "text/plain" });
@@ -166,9 +168,11 @@ async function main() {
     const sourceUrl = `${upstreamOrigin}/playlist.m3u`;
     const alphaUrl = `${upstreamOrigin}/live/alpha.m3u8`;
     const betaUrl = `${upstreamOrigin}/live/beta.m3u8`;
+    const gammaUrl = `${upstreamOrigin}/live/gamma.m3u8`;
     const config = encodeConfig({ l: [{ n: "Complex", u: sourceUrl }], g: ["IT | TEST"], gm: "filter" });
     const alphaId = channelId(sourceUrl, alphaUrl);
     const betaId = channelId(sourceUrl, betaUrl);
+    const gammaId = channelId(sourceUrl, gammaUrl);
     const port = 21000 + Math.floor(Math.random() * 1000);
     const kronosOrigin = `http://127.0.0.1:${port}`;
     const logs = [];
@@ -248,6 +252,27 @@ async function main() {
         assert.equal(betaManifestResponse.status, 200, `beta manifest returned ${betaManifestResponse.status}`);
         await betaManifestResponse.text();
 
+        mock.state.failManifests.gamma = 1;
+        const gammaStreamResponse = await request(`${kronosOrigin}/${config}/stream/tv/${gammaId}.json`, {}, 2000);
+        assert.equal(gammaStreamResponse.status, 200, `gamma stream returned ${gammaStreamResponse.status}`);
+        const gammaStream = (await gammaStreamResponse.json()).streams[0];
+        const waitingManifestResponse = await request(gammaStream.url, {}, 3000);
+        assert.equal(waitingManifestResponse.status, 200, `waiting gamma manifest returned ${waitingManifestResponse.status}`);
+        const waitingManifest = await waitingManifestResponse.text();
+        assert(waitingManifest.startsWith("#EXTM3U"), "waiting manifest is not valid HLS");
+        assert.equal(segmentProxyUrls(waitingManifest, kronosOrigin).length, 0, "waiting manifest should not invent segments");
+        assert.equal(mock.state.manifestHits.gamma, 1, "waiting manifest did not exercise the first upstream 403");
+        const gammaHitsDuringBackoff = mock.state.manifestHits.gamma;
+        const waitingBackoffResponse = await request(gammaStream.url, {}, 3000);
+        assert.equal(waitingBackoffResponse.status, 200, `waiting backoff gamma manifest returned ${waitingBackoffResponse.status}`);
+        await waitingBackoffResponse.text();
+        assert.equal(mock.state.manifestHits.gamma, gammaHitsDuringBackoff, "waiting backoff still hit upstream");
+        await sleep(550);
+        const gammaReadyResponse = await request(gammaStream.url, {}, 3000);
+        assert.equal(gammaReadyResponse.status, 200, `gamma ready manifest returned ${gammaReadyResponse.status}`);
+        const gammaReady = await gammaReadyResponse.text();
+        assert(segmentProxyUrls(gammaReady, kronosOrigin).length >= 2, "gamma did not recover to real segments after transient startup 403");
+
         const alphaHitsBeforeStale = mock.state.segmentHits.alpha;
         const staleResponse = await request(alphaSegments[0], {}, 1000);
         assert.equal(staleResponse.status, 409, "old channel segment was not rejected locally after stream switch");
@@ -266,6 +291,7 @@ async function main() {
         const text = logs.join("");
         assert(text.includes("media=2/3 held=1"), "holdback was not visible in HLS logs");
         assert(text.includes("[HLS STALE MANIFEST]"), "stale manifest fallback was not exercised");
+        assert(text.includes("[HLS WAITING MANIFEST]"), "waiting manifest fallback was not exercised");
         assert(text.includes("staleReason=403"), "HLS serve log did not expose the stale manifest reason");
         assert(text.includes("[SEG STALE]"), "stale stream guard was not exercised");
         assert(text.includes("upstreamConcurrency=2"), "segment concurrency setting was not active");
@@ -275,10 +301,11 @@ async function main() {
             ok: true,
             alphaManifests: mock.state.manifestHits.alpha,
             betaManifests: mock.state.manifestHits.beta,
+            gammaManifests: mock.state.manifestHits.gamma,
             alphaSegments: mock.state.segmentHits.alpha,
             maxActiveSegments: mock.state.maxActiveSegments,
             parallelMs: elapsed,
-            exercised: ["cold-live-warmup", "token-rotating-hls", "live-holdback", "stale-manifest-fallback", "forbidden-backoff", "parallel-segments", "stale-stream-guard"]
+            exercised: ["cold-live-warmup", "token-rotating-hls", "live-holdback", "stale-manifest-fallback", "waiting-manifest-fallback", "forbidden-backoff", "parallel-segments", "stale-stream-guard"]
         }, null, 2));
     } catch (err) {
         console.error(logs.join(""));
