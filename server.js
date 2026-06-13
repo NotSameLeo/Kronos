@@ -50,7 +50,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "3.3.10";
+const RELEASE_VERSION = "3.3.11";
 const ADDON_TYPE = "tv";
 const PLAYBACK_MODE = "uhf-direct-relay";
 const CATALOG_TTL = 30 * 60 * 1000;
@@ -85,6 +85,8 @@ const HLS_STALE_MANIFEST_TTL_MS = Math.max(0, Number(process.env.HLS_STALE_MANIF
 const HLS_FORBIDDEN_BACKOFF_MS = Math.max(0, Number(process.env.HLS_FORBIDDEN_BACKOFF_MS || 15000));
 const HLS_WAITING_MANIFEST_ON_ERROR = String(process.env.HLS_WAITING_MANIFEST_ON_ERROR ?? "1") !== "0";
 const HLS_WAITING_TARGET_DURATION = Math.max(1, Number(process.env.HLS_WAITING_TARGET_DURATION || 2));
+const PLAYBACK_ACTIVITY_TTL_MS = Math.max(60 * 1000, Number(process.env.PLAYBACK_ACTIVITY_TTL_MS || 30 * 60 * 1000));
+const PLAYBACK_ACTIVITY_MAX = Math.max(16, Number(process.env.PLAYBACK_ACTIVITY_MAX || 512));
 const UPSTREAM_KEEPALIVE_MAX_SOCKETS = Math.max(1, Number(process.env.UPSTREAM_KEEPALIVE_MAX_SOCKETS || 8));
 const UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS = Math.max(1, Number(process.env.UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS || 4));
 const UPSTREAM_KEEPALIVE_MS = Math.max(1000, Number(process.env.UPSTREAM_KEEPALIVE_MS || 60000));
@@ -1082,6 +1084,63 @@ async function fetchPlayableHLS(sourceUrl, label = "stream", signal = null) {
 
 const hlsWarmups = new Map();
 const activeStreams = new Map();
+const playbackActivities = new Map();
+let playbackRequestCounter = 0;
+
+function nextPlaybackRequestId(prefix) {
+    playbackRequestCounter = (playbackRequestCounter + 1) % 1000000;
+    return `${prefix}${playbackRequestCounter.toString(36)}`;
+}
+
+function playbackActivityKey(configKey, streamKey, sourceUrl) {
+    return `${configKey}:${streamKey || hashKey(sourceUrl)}`;
+}
+
+function prunePlaybackActivities(now = Date.now()) {
+    for (const [key, activity] of playbackActivities.entries()) {
+        if (now - (activity.lastSeenAt || activity.firstSeenAt || 0) > PLAYBACK_ACTIVITY_TTL_MS) {
+            playbackActivities.delete(key);
+        }
+    }
+    if (playbackActivities.size <= PLAYBACK_ACTIVITY_MAX) return;
+    const oldest = [...playbackActivities.entries()]
+        .sort((a, b) => (a[1].lastSeenAt || 0) - (b[1].lastSeenAt || 0));
+    for (const [key] of oldest) {
+        if (playbackActivities.size <= PLAYBACK_ACTIVITY_MAX) break;
+        playbackActivities.delete(key);
+    }
+}
+
+function notePlaybackActivity(key, fields = {}) {
+    if (!key) return null;
+    const now = Date.now();
+    const activity = playbackActivities.get(key) || { firstSeenAt: now };
+    Object.assign(activity, fields, { lastSeenAt: now });
+    playbackActivities.set(key, activity);
+    if (playbackActivities.size > PLAYBACK_ACTIVITY_MAX) prunePlaybackActivities(now);
+    return activity;
+}
+
+function formatIdleMs(value) {
+    return value == null ? "never" : `${Math.max(0, Math.round(value))}ms`;
+}
+
+function playbackGapFields(activity, now = Date.now()) {
+    return {
+        idleHls: activity?.lastManifestRequestAt ? now - activity.lastManifestRequestAt : null,
+        idleHlsServe: activity?.lastManifestServeAt ? now - activity.lastManifestServeAt : null,
+        idleSegReq: activity?.lastSegmentRequestAt ? now - activity.lastSegmentRequestAt : null,
+        idleSegDone: activity?.lastSegmentFinishAt ? now - activity.lastSegmentFinishAt : null
+    };
+}
+
+function formatPlaybackGaps(gaps) {
+    return `idleHls=${formatIdleMs(gaps.idleHls)} idleHlsServe=${formatIdleMs(gaps.idleHlsServe)} idleSegReq=${formatIdleMs(gaps.idleSegReq)} idleSegDone=${formatIdleMs(gaps.idleSegDone)}`;
+}
+
+function playbackClientTag(req) {
+    return hashKey(`${req.ip || req.socket?.remoteAddress || ""}|${req.get("user-agent") || ""}`).slice(0, 10);
+}
 
 async function fetchPlayableHLSShared(sourceUrl, label = "stream") {
     const key = hashKey(sourceUrl);
@@ -1465,11 +1524,11 @@ function setPlaylistHeaders(res) {
     res.setHeader("Pragma", "no-cache");
 }
 
-function sendWaitingManifest(res, label, err, started) {
+function sendWaitingManifest(res, label, err, started, reqId = "n/a", gapLog = "") {
     const status = getErrorStatus(err) || err?.code || "n/a";
     setPlaylistHeaders(res);
     res.setHeader("Retry-After", String(HLS_WAITING_TARGET_DURATION));
-    console.warn(`[HLS WAITING MANIFEST] channel="${label}" status=${status} time=${Date.now() - started}ms reason=${err.message}`);
+    console.warn(`[HLS WAITING MANIFEST] id=${reqId} channel="${label}" ${gapLog} status=${status} time=${Date.now() - started}ms reason=${err.message}`);
     return res.send([
         "#EXTM3U",
         "#EXT-X-VERSION:3",
@@ -1536,33 +1595,71 @@ async function withSegmentSlot(queueKey, signal, fn) {
 app.get("/:base64Config/proxy/live.m3u8", async (req, res) => {
     const started = Date.now();
     const controller = makeAbortController(res);
+    const reqId = nextPlaybackRequestId("h");
     let label = "direct-hls";
+    let activityKey = "";
+    let streamKey = "";
+    let openGapLog = "";
+    let client = "";
     try {
         const configKey = req.params.base64Config;
         decodeConfig(configKey);
         if (!req.query.u) return res.status(400).send("#EXTM3U\n");
         const sourceUrl = decodeProxyUrl(req.query.u);
         label = String(req.query.label || "direct-hls");
-        const streamKey = String(req.query.a || hashKey(sourceUrl));
+        streamKey = String(req.query.a || hashKey(sourceUrl));
         if (req.query.label) setActiveStream(configKey, streamKey, label);
         else if (isStaleStream(configKey, streamKey)) {
             console.warn(`[HLS STALE] channel="${label}" stream=${streamKey}`);
             return res.status(409).type("text/plain").send("Stale HLS stream\n");
         }
+
+        activityKey = playbackActivityKey(configKey, streamKey, sourceUrl);
+        openGapLog = formatPlaybackGaps(playbackGapFields(playbackActivities.get(activityKey), started));
+        client = playbackClientTag(req);
+        notePlaybackActivity(activityKey, {
+            label,
+            sourceHash: hashKey(sourceUrl),
+            lastClient: client,
+            lastManifestRequestAt: started
+        });
+        res.on("close", () => {
+            if (res.writableEnded) return;
+            notePlaybackActivity(activityKey, { lastManifestAbortAt: Date.now() });
+            console.warn(`[HLS CLIENT ABORT] id=${reqId} channel="${label}" stream=${streamKey} client=${client} ${openGapLog} time=${Date.now() - started}ms`);
+        });
+        console.log(`[HLS DIRECT OPEN] id=${reqId} channel="${label}" stream=${streamKey} client=${client} ${openGapLog}`);
+
         const { data, finalUrl, info, attempts, warmupMs, warmupPolls, staleManifestMs, staleManifestReason } = await fetchPlayableHLSShared(sourceUrl, label);
         if (controller.signal.aborted) return;
         const { rewritten, mediaUrls, upstreamMediaUrls, heldBack, firstMedia, lastMedia, queueKey } = rewriteHLSUrlsDirect(data, finalUrl, getPublicHost(req), configKey, streamKey, info);
         setPlaylistHeaders(res);
-        console.log(`[HLS DIRECT SERVE] channel="${label}" master=${info.isMaster ? 1 : 0} media=${mediaUrls}/${upstreamMediaUrls ?? mediaUrls} held=${heldBack || 0} seq=${info.mediaSequence ?? "n/a"} target=${info.targetDuration ?? "n/a"} first=${firstMedia || "n/a"} last=${lastMedia || "n/a"} q=${queueKey} attempts=${attempts} warmup=${warmupMs || 0}ms polls=${warmupPolls || 0} stale=${staleManifestMs || 0}ms staleReason=${staleManifestReason || "n/a"} time=${Date.now() - started}ms`);
+        notePlaybackActivity(activityKey, {
+            lastManifestServeAt: Date.now(),
+            lastManifestSeq: info.mediaSequence,
+            lastManifestTarget: info.targetDuration,
+            lastManifestMedia: mediaUrls,
+            lastManifestUpstreamMedia: upstreamMediaUrls ?? mediaUrls,
+            lastManifestFirst: firstMedia || "",
+            lastManifestLast: lastMedia || "",
+            lastManifestStaleMs: staleManifestMs || 0,
+            lastManifestStaleReason: staleManifestReason || ""
+        });
+        console.log(`[HLS DIRECT SERVE] id=${reqId} channel="${label}" master=${info.isMaster ? 1 : 0} media=${mediaUrls}/${upstreamMediaUrls ?? mediaUrls} held=${heldBack || 0} seq=${info.mediaSequence ?? "n/a"} target=${info.targetDuration ?? "n/a"} first=${firstMedia || "n/a"} last=${lastMedia || "n/a"} q=${queueKey} attempts=${attempts} warmup=${warmupMs || 0}ms polls=${warmupPolls || 0} stale=${staleManifestMs || 0}ms staleReason=${staleManifestReason || "n/a"} ${openGapLog} time=${Date.now() - started}ms`);
         res.send(rewritten);
     } catch (err) {
         if (controller.signal.aborted) return;
+        notePlaybackActivity(activityKey, {
+            lastManifestErrorAt: Date.now(),
+            lastManifestError: err.message
+        });
         if (HLS_WAITING_MANIFEST_ON_ERROR && isStaleHlsEligibleError(err) && !res.headersSent) {
-            return sendWaitingManifest(res, label, err, started);
+            notePlaybackActivity(activityKey, { lastManifestWaitingAt: Date.now() });
+            return sendWaitingManifest(res, label, err, started, reqId, openGapLog);
         }
         const timeout = err?.code === "ECONNABORTED" || /timeout/i.test(String(err?.message || ""));
         const status = timeout ? 504 : 502;
-        console.error(`[HLS DIRECT ERROR] channel="${label}" status=${status} time=${Date.now() - started}ms reason=${err.message}`);
+        console.error(`[HLS DIRECT ERROR] id=${reqId} channel="${label}" ${openGapLog} status=${status} time=${Date.now() - started}ms reason=${err.message}`);
         if (!res.headersSent) res.status(status).type("text/plain").send("Upstream HLS manifest unavailable\n");
     }
 });
@@ -1570,8 +1667,12 @@ app.get("/:base64Config/proxy/live.m3u8", async (req, res) => {
 app.get("/:base64Config/proxy/seg", async (req, res) => {
     const started = Date.now();
     const controller = makeAbortController(res);
+    const reqId = nextPlaybackRequestId("s");
     let sourceUrl = null;
     let queueKey = "";
+    let activityKey = "";
+    let gapLog = "";
+    let client = "";
 
     try {
         const configKey = req.params.base64Config;
@@ -1583,14 +1684,33 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
             console.warn(`[SEG STALE] ${getSegmentLabel(sourceUrl)} stream=${streamKey}`);
             return res.status(409).end();
         }
+        const activityStreamKey = streamKey || hashKey(sourceUrl);
+        activityKey = playbackActivityKey(configKey, activityStreamKey, sourceUrl);
+        gapLog = formatPlaybackGaps(playbackGapFields(playbackActivities.get(activityKey), started));
+        client = playbackClientTag(req);
+        notePlaybackActivity(activityKey, {
+            lastClient: client,
+            lastSegmentRequestAt: started,
+            lastSegmentLabel: getSegmentLabel(sourceUrl)
+        });
         queueKey = req.query.q ? `${configKey}:${String(req.query.q)}` : getSegmentQueueKey(sourceUrl);
-        await withSegmentSlot(queueKey, controller.signal, slot => streamSegment(req, res, sourceUrl, started, controller.signal, slot));
+        await withSegmentSlot(queueKey, controller.signal, slot => streamSegment(req, res, sourceUrl, started, controller.signal, slot, {
+            activityKey,
+            reqId,
+            gapLog,
+            client
+        }));
     } catch (err) {
         if (controller.signal.aborted) {
-            console.warn(`[SEG ABORT] ${getSegmentLabel(sourceUrl)} queue=${queueKey || "n/a"} time=${Date.now() - started}ms`);
+            notePlaybackActivity(activityKey, { lastSegmentAbortAt: Date.now() });
+            console.warn(`[SEG ABORT] id=${reqId} ${getSegmentLabel(sourceUrl)} queue=${queueKey || "n/a"} client=${client || "n/a"} ${gapLog} time=${Date.now() - started}ms`);
             return;
         }
-        console.error(`[SEG ERROR] ${getSegmentLabel(sourceUrl)} ${err.message}`);
+        notePlaybackActivity(activityKey, {
+            lastSegmentErrorAt: Date.now(),
+            lastSegmentError: err.message
+        });
+        console.error(`[SEG ERROR] id=${reqId} ${getSegmentLabel(sourceUrl)} client=${client || "n/a"} ${gapLog} ${err.message}`);
         if (!res.headersSent) res.status(502).end();
         else if (!res.destroyed) res.destroy(err);
     }
@@ -1624,7 +1744,7 @@ async function fetchSegmentResponse(sourceUrl, headers, signal = null) {
     throw lastErr || new Error("Segment fetch failed");
 }
 
-async function streamSegment(req, res, sourceUrl, started, signal = null, slot = null) {
+async function streamSegment(req, res, sourceUrl, started, signal = null, slot = null, telemetry = {}) {
     const headers = { "User-Agent": UPSTREAM_UA, "Accept": "*/*", "Accept-Encoding": "identity", "Connection": "keep-alive" };
     if (req.headers.range) headers.Range = req.headers.range;
 
@@ -1648,10 +1768,28 @@ async function streamSegment(req, res, sourceUrl, started, signal = null, slot =
         const ms = Date.now() - started;
         const waitMs = slot?.waitMs || 0;
         const slow = ms >= SLOW_SEGMENT_MS ? " SLOW" : "";
-        console.log(`[SEG DIRECT] ${getSegmentLabel(sourceUrl)} status=${response.status} bytes=${formatBytes(bytes)} wait=${waitMs}ms time=${ms}ms speed=${formatSpeed(bytes, Math.max(1, ms - waitMs))}${slow}`);
+        notePlaybackActivity(telemetry.activityKey, {
+            lastSegmentFinishAt: Date.now(),
+            lastSegmentLabel: getSegmentLabel(sourceUrl),
+            lastSegmentStatus: response.status,
+            lastSegmentBytes: bytes,
+            lastSegmentMs: ms,
+            lastSegmentWaitMs: waitMs
+        });
+        console.log(`[SEG DIRECT] id=${telemetry.reqId || "n/a"} ${getSegmentLabel(sourceUrl)} status=${response.status} bytes=${formatBytes(bytes)} wait=${waitMs}ms time=${ms}ms speed=${formatSpeed(bytes, Math.max(1, ms - waitMs))} client=${telemetry.client || "n/a"} ${telemetry.gapLog || ""}${slow}`);
     });
 
-    res.on("close", () => { if (!res.writableEnded && upstream?.destroy) upstream.destroy(); });
+    res.on("close", () => {
+        if (!res.writableEnded) {
+            notePlaybackActivity(telemetry.activityKey, {
+                lastSegmentAbortAt: Date.now(),
+                lastSegmentLabel: getSegmentLabel(sourceUrl),
+                lastSegmentBytes: bytes
+            });
+            console.warn(`[SEG CLIENT ABORT] id=${telemetry.reqId || "n/a"} ${getSegmentLabel(sourceUrl)} bytes=${formatBytes(bytes)} wait=${slot?.waitMs || 0}ms time=${Date.now() - started}ms client=${telemetry.client || "n/a"} ${telemetry.gapLog || ""}`);
+            if (upstream?.destroy) upstream.destroy();
+        }
+    });
     await new Promise(resolve => {
         let settled = false;
         const done = () => {
@@ -1704,7 +1842,8 @@ app.get("/:base64Config/stats", (req, res) => {
             hlsWarmups: hlsWarmups.size,
             hlsLastGoodManifests: hlsLastGoodManifests.size,
             hlsManifestBackoffs: hlsManifestBackoffs.size,
-            activeStreams: activeStreams.size
+            activeStreams: activeStreams.size,
+            playbackActivities: playbackActivities.size
         }
     });
 });
@@ -1749,6 +1888,7 @@ app.get("/:base64Config/debug", async (req, res) => {
                 HLS_LIVE_WARMUP_WAIT_MS, HLS_LIVE_WARMUP_POLL_MS,
                 HLS_STALE_MANIFEST_TTL_MS, HLS_FORBIDDEN_BACKOFF_MS,
                 HLS_WAITING_MANIFEST_ON_ERROR, HLS_WAITING_TARGET_DURATION,
+                PLAYBACK_ACTIVITY_TTL_MS, PLAYBACK_ACTIVITY_MAX,
                 ACTIVE_STREAM_TTL_MS,
                 SEGMENT_UPSTREAM_CONCURRENCY, SEGMENT_UPSTREAM_RETRIES, SEGMENT_UPSTREAM_RETRY_DELAY_MS,
                 UPSTREAM_KEEPALIVE_MAX_SOCKETS, UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS, UPSTREAM_KEEPALIVE_MS,
@@ -1768,6 +1908,7 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`🎬 playback=${PLAYBACK_MODE} noBuffer=1 noPrefetch=1 noSegmentCache=1`);
     console.log(`🔁 manifest directFetch=1 timeout=${HLS_REQUEST_TIMEOUT / 1000}s retries=${HLS_UPSTREAM_RETRIES} liveMin=${HLS_LIVE_MIN_SEGMENTS} visible=${HLS_LIVE_MIN_VISIBLE_SEGMENTS} holdback=${HLS_LIVE_HOLDBACK_SEGMENTS} warmupWait=${HLS_LIVE_WARMUP_WAIT_MS / 1000}s staleTTL=${HLS_STALE_MANIFEST_TTL_MS / 1000}s forbiddenBackoff=${HLS_FORBIDDEN_BACKOFF_MS / 1000}s waiting=${HLS_WAITING_MANIFEST_ON_ERROR ? 1 : 0}/${HLS_WAITING_TARGET_DURATION}s activeTtl=${ACTIVE_STREAM_TTL_MS / 1000}s`);
     console.log(`🔌 upstream keepAlive=1 sockets=${UPSTREAM_KEEPALIVE_MAX_SOCKETS} free=${UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS} ms=${UPSTREAM_KEEPALIVE_MS}`);
+    console.log(`🩺 playback telemetry=1 ttl=${PLAYBACK_ACTIVITY_TTL_MS / 1000}s max=${PLAYBACK_ACTIVITY_MAX}`);
     console.log(`📋 playlist retryWindow=${PLAYLIST_RETRY_WINDOW_MS / 1000}s delay=${PLAYLIST_RETRY_DELAY_MS / 1000}s`);
     console.log(`🎞️ segment timeout=${SEG_REQUEST_TIMEOUT / 1000}s rangeForward=1 upstreamConcurrency=${SEGMENT_UPSTREAM_CONCURRENCY} retries=${SEGMENT_UPSTREAM_RETRIES}`);
     console.log(`📺 epg timezone=${EPG_TIME_ZONE} timeout=${EPG_REQUEST_TIMEOUT / 1000}s firstWait=${EPG_FIRST_CATALOG_WAIT_MS / 1000}s retryDelay=${EPG_RETRY_DELAY_MS / 1000}s cacheTTL=${EPG_CACHE_TTL / 1000}s refresh=${EPG_REFRESH_INTERVAL_MS / 1000}s preload=${EPG_PRELOAD_URLS.length} startupWatch=${EPG_STARTUP_WATCH_MS / 1000}s`);

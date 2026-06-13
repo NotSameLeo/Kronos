@@ -289,6 +289,8 @@ async function main() {
         assert(mock.state.userAgents.every(ua => /Chrome\/120/.test(ua)), "upstream did not receive the browser-like IPTV user agent");
 
         const text = logs.join("");
+        assert(text.includes("[HLS DIRECT OPEN]"), "HLS request-open telemetry was not emitted");
+        assert(text.includes("idleHls="), "playback gap telemetry was not emitted");
         assert(text.includes("media=2/3 held=1"), "holdback was not visible in HLS logs");
         assert(text.includes("[HLS STALE MANIFEST]"), "stale manifest fallback was not exercised");
         assert(text.includes("[HLS WAITING MANIFEST]"), "waiting manifest fallback was not exercised");
