@@ -3,6 +3,8 @@ const axios = require("axios");
 const sax = require("sax");
 const zlib = require("zlib");
 const { Readable } = require("stream");
+const http = require("http");
+const https = require("https");
 const path = require("path");
 const crypto = require("crypto");
 
@@ -48,7 +50,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "3.3.8";
+const RELEASE_VERSION = "3.3.9";
 const ADDON_TYPE = "tv";
 const PLAYBACK_MODE = "uhf-direct-relay";
 const CATALOG_TTL = 30 * 60 * 1000;
@@ -79,12 +81,36 @@ const SEG_REQUEST_TIMEOUT = Number(process.env.SEG_REQUEST_TIMEOUT || 45000);
 const SEGMENT_UPSTREAM_CONCURRENCY = Math.max(1, Number(process.env.SEGMENT_UPSTREAM_CONCURRENCY || 2));
 const SEGMENT_UPSTREAM_RETRIES = Math.max(0, Number(process.env.SEGMENT_UPSTREAM_RETRIES || 1));
 const SEGMENT_UPSTREAM_RETRY_DELAY_MS = Math.max(0, Number(process.env.SEGMENT_UPSTREAM_RETRY_DELAY_MS || 250));
+const HLS_STALE_MANIFEST_TTL_MS = Math.max(0, Number(process.env.HLS_STALE_MANIFEST_TTL_MS || 90000));
+const HLS_FORBIDDEN_BACKOFF_MS = Math.max(0, Number(process.env.HLS_FORBIDDEN_BACKOFF_MS || 15000));
+const UPSTREAM_KEEPALIVE_MAX_SOCKETS = Math.max(1, Number(process.env.UPSTREAM_KEEPALIVE_MAX_SOCKETS || 8));
+const UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS = Math.max(1, Number(process.env.UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS || 4));
+const UPSTREAM_KEEPALIVE_MS = Math.max(1000, Number(process.env.UPSTREAM_KEEPALIVE_MS || 60000));
 const PLAYLIST_REQUEST_TIMEOUT = Number(process.env.PLAYLIST_REQUEST_TIMEOUT || 20000);
 const PLAYLIST_RETRY_WINDOW_MS = Number(process.env.PLAYLIST_RETRY_WINDOW_MS || 30000);
 const PLAYLIST_RETRY_DELAY_MS = Number(process.env.PLAYLIST_RETRY_DELAY_MS || 2000);
 const EPG_TIME_ZONE = process.env.EPG_TIME_ZONE || "Europe/Rome";
 
 const SLOW_SEGMENT_MS = Number(process.env.SLOW_SEGMENT_MS || 4000);
+
+const upstreamHttpAgent = new http.Agent({
+    keepAlive: true,
+    keepAliveMsecs: UPSTREAM_KEEPALIVE_MS,
+    maxSockets: UPSTREAM_KEEPALIVE_MAX_SOCKETS,
+    maxFreeSockets: UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS,
+    scheduling: "lifo"
+});
+const upstreamHttpsAgent = new https.Agent({
+    keepAlive: true,
+    keepAliveMsecs: UPSTREAM_KEEPALIVE_MS,
+    maxSockets: UPSTREAM_KEEPALIVE_MAX_SOCKETS,
+    maxFreeSockets: UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS,
+    scheduling: "lifo"
+});
+
+function upstreamAgentOptions() {
+    return { httpAgent: upstreamHttpAgent, httpsAgent: upstreamHttpsAgent };
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // In-memory catalog, EPG and logo caches. Playback is intentionally stateless.
@@ -403,6 +429,7 @@ async function ensureEPGRefresh(epgUrl, options = {}) {
         const response = await axios.get(epgUrl, {
             timeout: EPG_REQUEST_TIMEOUT,
             signal: AbortSignal.timeout(EPG_REQUEST_TIMEOUT),
+            ...upstreamAgentOptions(),
             maxContentLength: EPG_MAX_BYTES,
             responseType: "arraybuffer",
             headers: { "User-Agent": `Kronos/${RELEASE_VERSION}`, "Accept": "application/xml, text/xml, application/gzip, */*" }
@@ -718,6 +745,7 @@ async function fetchPlaylist(sourceUrl, options = {}) {
         try {
             const response = await axios.get(sourceUrl, {
                 timeout: Math.max(1, Math.min(options.timeout || PLAYLIST_REQUEST_TIMEOUT, deadline - Date.now())),
+                ...upstreamAgentOptions(),
                 maxRedirects: 5,
                 headers: {
                     "User-Agent": UPSTREAM_UA,
@@ -907,16 +935,78 @@ async function getChannelById(configKey, config, id) {
 // ─────────────────────────────────────────────────────────────────────────────
 // HLS relay
 // ─────────────────────────────────────────────────────────────────────────────
+const hlsLastGoodManifests = new Map();
+const hlsManifestBackoffs = new Map();
+
+function rememberGoodHLS(sourceUrl, result) {
+    if (!HLS_STALE_MANIFEST_TTL_MS || !result?.info) return;
+    if (!result.info.isMaster && result.info.isLive && result.info.segmentCount < HLS_LIVE_MIN_VISIBLE_SEGMENTS) return;
+    hlsLastGoodManifests.set(hashKey(sourceUrl), { ...result, storedAt: Date.now() });
+    hlsManifestBackoffs.delete(hashKey(sourceUrl));
+}
+
+function isStaleHlsEligibleError(err) {
+    const status = getErrorStatus(err);
+    if (err?.code === "HLS_BACKOFF") return true;
+    if ([403, 408, 425, 429, 500, 502, 503, 504].includes(status)) return true;
+    return ["ECONNRESET", "ECONNABORTED", "ETIMEDOUT", "EPIPE"].includes(err?.code)
+        || /timeout/i.test(String(err?.message || ""));
+}
+
+function getStaleHLS(sourceUrl, label, err, warmupMs = 0, warmupPolls = 0) {
+    if (!HLS_STALE_MANIFEST_TTL_MS || !isStaleHlsEligibleError(err)) return null;
+    const key = hashKey(sourceUrl);
+    const entry = hlsLastGoodManifests.get(key);
+    if (!entry) return null;
+    const age = Date.now() - entry.storedAt;
+    if (age > HLS_STALE_MANIFEST_TTL_MS) {
+        hlsLastGoodManifests.delete(key);
+        return null;
+    }
+    const status = getErrorStatus(err) || err?.code || "n/a";
+    console.warn(`[HLS STALE MANIFEST] channel="${label}" age=${age}ms status=${status} reason=${err.message}`);
+    return {
+        ...entry,
+        attempts: 0,
+        warmupMs,
+        warmupPolls,
+        staleManifestMs: age,
+        staleManifestReason: status
+    };
+}
+
+function noteHlsBackoff(sourceUrl, err) {
+    if (!HLS_FORBIDDEN_BACKOFF_MS || getErrorStatus(err) !== 403) return;
+    hlsManifestBackoffs.set(hashKey(sourceUrl), { until: Date.now() + HLS_FORBIDDEN_BACKOFF_MS, status: 403 });
+}
+
+function assertNoHlsBackoff(sourceUrl) {
+    if (!HLS_FORBIDDEN_BACKOFF_MS) return;
+    const key = hashKey(sourceUrl);
+    const backoff = hlsManifestBackoffs.get(key);
+    if (!backoff) return;
+    if (Date.now() >= backoff.until) {
+        hlsManifestBackoffs.delete(key);
+        return;
+    }
+    const err = new Error(`Upstream HLS manifest temporarily backed off after status ${backoff.status}`);
+    err.code = "HLS_BACKOFF";
+    err.status = backoff.status;
+    throw err;
+}
+
 // Fetch the manifest requested by the player without inventing live state. A
 // short bounded retry absorbs transient Xtream 5xx/timeouts without hiding a
 // genuinely broken upstream behind synthetic playlists.
 async function fetchUpstreamHLS(sourceUrl, label = "stream", signal = null) {
+    assertNoHlsBackoff(sourceUrl);
     let lastErr = null;
     for (let attempt = 1; attempt <= HLS_UPSTREAM_RETRIES + 1; attempt++) {
         try {
             const r = await axios.get(sourceUrl, {
                 timeout: HLS_REQUEST_TIMEOUT,
                 signal,
+                ...upstreamAgentOptions(),
                 maxRedirects: 5,
                 headers: {
                     "User-Agent": UPSTREAM_UA,
@@ -931,10 +1021,15 @@ async function fetchUpstreamHLS(sourceUrl, label = "stream", signal = null) {
             if (!text.startsWith("#EXTM3U")) {
                 throw new Error(`Invalid HLS manifest from upstream for ${label}`);
             }
-            return { data: r.data, finalUrl, info: analyzeHLS(text), attempts: attempt };
+            const result = { data: r.data, finalUrl, info: analyzeHLS(text), attempts: attempt };
+            rememberGoodHLS(sourceUrl, result);
+            return result;
         } catch (err) {
             lastErr = err;
-            if (signal?.aborted || !isRetryableHlsError(err) || attempt > HLS_UPSTREAM_RETRIES) throw err;
+            if (signal?.aborted || !isRetryableHlsError(err) || attempt > HLS_UPSTREAM_RETRIES) {
+                noteHlsBackoff(sourceUrl, err);
+                throw err;
+            }
             console.warn(`[HLS RETRY] channel="${label}" attempt=${attempt} reason=${err.message}`);
             if (HLS_UPSTREAM_RETRY_DELAY_MS > 0) await sleep(HLS_UPSTREAM_RETRY_DELAY_MS);
         }
@@ -950,7 +1045,14 @@ function needsLiveWarmup(info) {
 
 async function fetchPlayableHLS(sourceUrl, label = "stream", signal = null) {
     const started = Date.now();
-    let result = await fetchUpstreamHLS(sourceUrl, label, signal);
+    let result;
+    try {
+        result = await fetchUpstreamHLS(sourceUrl, label, signal);
+    } catch (err) {
+        const stale = getStaleHLS(sourceUrl, label, err);
+        if (stale) return stale;
+        throw err;
+    }
     if (!needsLiveWarmup(result.info) || HLS_LIVE_WARMUP_WAIT_MS <= 0) return { ...result, warmupMs: 0, warmupPolls: 0 };
 
     let polls = 0;
@@ -958,7 +1060,13 @@ async function fetchPlayableHLS(sourceUrl, label = "stream", signal = null) {
     while (!signal?.aborted && Date.now() - started < HLS_LIVE_WARMUP_WAIT_MS) {
         polls++;
         await sleep(HLS_LIVE_WARMUP_POLL_MS);
-        result = await fetchUpstreamHLS(sourceUrl, label, signal);
+        try {
+            result = await fetchUpstreamHLS(sourceUrl, label, signal);
+        } catch (err) {
+            const stale = getStaleHLS(sourceUrl, label, err, Date.now() - started, polls);
+            if (stale) return stale;
+            throw err;
+        }
         if (!needsLiveWarmup(result.info)) {
             const warmupMs = Date.now() - started;
             console.log(`[HLS WARMUP READY] channel="${label}" media=${result.info.segmentCount} seq=${result.info.mediaSequence ?? "n/a"} wait=${warmupMs}ms polls=${polls}`);
@@ -1121,6 +1229,7 @@ async function getLogoDataUri(logoUrl) {
     try {
         const r = await axios.get(logoUrl, {
             responseType: "arraybuffer", timeout: 10000, maxContentLength: 2 * 1024 * 1024,
+            ...upstreamAgentOptions(),
             headers: {
                 "User-Agent": `Kronos/${RELEASE_VERSION}`,
                 "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
@@ -1424,11 +1533,11 @@ app.get("/:base64Config/proxy/live.m3u8", async (req, res) => {
             console.warn(`[HLS STALE] channel="${label}" stream=${streamKey}`);
             return res.status(409).type("text/plain").send("Stale HLS stream\n");
         }
-        const { data, finalUrl, info, attempts, warmupMs, warmupPolls } = await fetchPlayableHLSShared(sourceUrl, label);
+        const { data, finalUrl, info, attempts, warmupMs, warmupPolls, staleManifestMs, staleManifestReason } = await fetchPlayableHLSShared(sourceUrl, label);
         if (controller.signal.aborted) return;
         const { rewritten, mediaUrls, upstreamMediaUrls, heldBack, firstMedia, lastMedia, queueKey } = rewriteHLSUrlsDirect(data, finalUrl, getPublicHost(req), configKey, streamKey, info);
         setPlaylistHeaders(res);
-        console.log(`[HLS DIRECT SERVE] channel="${label}" master=${info.isMaster ? 1 : 0} media=${mediaUrls}/${upstreamMediaUrls ?? mediaUrls} held=${heldBack || 0} seq=${info.mediaSequence ?? "n/a"} target=${info.targetDuration ?? "n/a"} first=${firstMedia || "n/a"} last=${lastMedia || "n/a"} q=${queueKey} attempts=${attempts} warmup=${warmupMs || 0}ms polls=${warmupPolls || 0} time=${Date.now() - started}ms`);
+        console.log(`[HLS DIRECT SERVE] channel="${label}" master=${info.isMaster ? 1 : 0} media=${mediaUrls}/${upstreamMediaUrls ?? mediaUrls} held=${heldBack || 0} seq=${info.mediaSequence ?? "n/a"} target=${info.targetDuration ?? "n/a"} first=${firstMedia || "n/a"} last=${lastMedia || "n/a"} q=${queueKey} attempts=${attempts} warmup=${warmupMs || 0}ms polls=${warmupPolls || 0} stale=${staleManifestMs || 0}ms staleReason=${staleManifestReason || "n/a"} time=${Date.now() - started}ms`);
         res.send(rewritten);
     } catch (err) {
         if (controller.signal.aborted) return;
@@ -1478,6 +1587,7 @@ async function fetchSegmentResponse(sourceUrl, headers, signal = null) {
                 responseType: "stream",
                 timeout: SEG_REQUEST_TIMEOUT,
                 signal,
+                ...upstreamAgentOptions(),
                 maxRedirects: 5,
                 headers,
                 decompress: false,
@@ -1573,6 +1683,8 @@ app.get("/:base64Config/stats", (req, res) => {
             segmentConcurrency: SEGMENT_UPSTREAM_CONCURRENCY,
             segmentQueues: segmentQueues.size,
             hlsWarmups: hlsWarmups.size,
+            hlsLastGoodManifests: hlsLastGoodManifests.size,
+            hlsManifestBackoffs: hlsManifestBackoffs.size,
             activeStreams: activeStreams.size
         }
     });
@@ -1616,8 +1728,10 @@ app.get("/:base64Config/debug", async (req, res) => {
                 HLS_UPSTREAM_RETRIES, HLS_UPSTREAM_RETRY_DELAY_MS,
                 HLS_LIVE_MIN_SEGMENTS, HLS_LIVE_MIN_VISIBLE_SEGMENTS, HLS_LIVE_HOLDBACK_SEGMENTS,
                 HLS_LIVE_WARMUP_WAIT_MS, HLS_LIVE_WARMUP_POLL_MS,
+                HLS_STALE_MANIFEST_TTL_MS, HLS_FORBIDDEN_BACKOFF_MS,
                 ACTIVE_STREAM_TTL_MS,
                 SEGMENT_UPSTREAM_CONCURRENCY, SEGMENT_UPSTREAM_RETRIES, SEGMENT_UPSTREAM_RETRY_DELAY_MS,
+                UPSTREAM_KEEPALIVE_MAX_SOCKETS, UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS, UPSTREAM_KEEPALIVE_MS,
                 PLAYLIST_REQUEST_TIMEOUT, PLAYLIST_RETRY_WINDOW_MS, PLAYLIST_RETRY_DELAY_MS
             }
         });
@@ -1632,7 +1746,8 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`🌐 http://0.0.0.0:${PORT}`);
     console.log(`📦 Node ${process.version}`);
     console.log(`🎬 playback=${PLAYBACK_MODE} noBuffer=1 noPrefetch=1 noSegmentCache=1`);
-    console.log(`🔁 manifest directFetch=1 timeout=${HLS_REQUEST_TIMEOUT / 1000}s retries=${HLS_UPSTREAM_RETRIES} liveMin=${HLS_LIVE_MIN_SEGMENTS} visible=${HLS_LIVE_MIN_VISIBLE_SEGMENTS} holdback=${HLS_LIVE_HOLDBACK_SEGMENTS} warmupWait=${HLS_LIVE_WARMUP_WAIT_MS / 1000}s activeTtl=${ACTIVE_STREAM_TTL_MS / 1000}s`);
+    console.log(`🔁 manifest directFetch=1 timeout=${HLS_REQUEST_TIMEOUT / 1000}s retries=${HLS_UPSTREAM_RETRIES} liveMin=${HLS_LIVE_MIN_SEGMENTS} visible=${HLS_LIVE_MIN_VISIBLE_SEGMENTS} holdback=${HLS_LIVE_HOLDBACK_SEGMENTS} warmupWait=${HLS_LIVE_WARMUP_WAIT_MS / 1000}s staleTTL=${HLS_STALE_MANIFEST_TTL_MS / 1000}s forbiddenBackoff=${HLS_FORBIDDEN_BACKOFF_MS / 1000}s activeTtl=${ACTIVE_STREAM_TTL_MS / 1000}s`);
+    console.log(`🔌 upstream keepAlive=1 sockets=${UPSTREAM_KEEPALIVE_MAX_SOCKETS} free=${UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS} ms=${UPSTREAM_KEEPALIVE_MS}`);
     console.log(`📋 playlist retryWindow=${PLAYLIST_RETRY_WINDOW_MS / 1000}s delay=${PLAYLIST_RETRY_DELAY_MS / 1000}s`);
     console.log(`🎞️ segment timeout=${SEG_REQUEST_TIMEOUT / 1000}s rangeForward=1 upstreamConcurrency=${SEGMENT_UPSTREAM_CONCURRENCY} retries=${SEGMENT_UPSTREAM_RETRIES}`);
     console.log(`📺 epg timezone=${EPG_TIME_ZONE} timeout=${EPG_REQUEST_TIMEOUT / 1000}s firstWait=${EPG_FIRST_CATALOG_WAIT_MS / 1000}s retryDelay=${EPG_RETRY_DELAY_MS / 1000}s cacheTTL=${EPG_CACHE_TTL / 1000}s refresh=${EPG_REFRESH_INTERVAL_MS / 1000}s preload=${EPG_PRELOAD_URLS.length} startupWatch=${EPG_STARTUP_WATCH_MS / 1000}s`);

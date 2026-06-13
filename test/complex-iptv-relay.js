@@ -51,6 +51,7 @@ function createComplexUpstream() {
         playlistHits: 0,
         manifestHits: { alpha: 0, beta: 0 },
         segmentHits: { alpha: 0, beta: 0 },
+        failManifests: { alpha: 0, beta: 0 },
         activeSegments: 0,
         maxActiveSegments: 0,
         userAgents: []
@@ -84,6 +85,12 @@ function createComplexUpstream() {
             const channel = manifestMatch[1];
             state.userAgents.push(String(req.headers["user-agent"] || ""));
             state.manifestHits[channel]++;
+            if (state.failManifests[channel] > 0) {
+                state.failManifests[channel]--;
+                res.writeHead(403, { "content-type": "text/plain" });
+                res.end("token temporarily locked");
+                return;
+            }
             const hit = state.manifestHits[channel];
             const depth = Math.min(3, hit);
             const seq = Math.max(0, hit - 3);
@@ -179,6 +186,8 @@ async function main() {
             HLS_UPSTREAM_RETRIES: "0",
             HLS_LIVE_WARMUP_POLL_MS: "50",
             HLS_LIVE_WARMUP_WAIT_MS: "2000",
+            HLS_STALE_MANIFEST_TTL_MS: "3000",
+            HLS_FORBIDDEN_BACKOFF_MS: "500",
             SEG_REQUEST_TIMEOUT: "2500",
             SEGMENT_UPSTREAM_CONCURRENCY: "2",
             SLOW_SEGMENT_MS: "99999"
@@ -210,6 +219,20 @@ async function main() {
         assert(keyUrl.includes("/proxy/seg?u="), "encryption key URI was not proxied directly");
         assert(upstreamUrlFromProxy(keyUrl).includes("/key/alpha/alpha-token-3.bin"), "encryption key URI lost its tokenized upstream URL");
 
+        mock.state.failManifests.alpha = 1;
+        const alphaHitsBefore403 = mock.state.manifestHits.alpha;
+        const fallbackManifestResponse = await request(alphaStream.url, {}, 3000);
+        assert.equal(fallbackManifestResponse.status, 200, `fallback alpha manifest returned ${fallbackManifestResponse.status}`);
+        const fallbackManifest = await fallbackManifestResponse.text();
+        assert(segmentProxyUrls(fallbackManifest, kronosOrigin).every(url => upstreamUrlFromProxy(url).includes("/alpha/alpha-token-3/")), "fallback manifest did not preserve the last known good tokenized URLs");
+        assert.equal(mock.state.manifestHits.alpha, alphaHitsBefore403 + 1, "first fallback did not exercise the upstream 403");
+
+        const alphaHitsDuringBackoff = mock.state.manifestHits.alpha;
+        const backoffManifestResponse = await request(alphaStream.url, {}, 3000);
+        assert.equal(backoffManifestResponse.status, 200, `backoff alpha manifest returned ${backoffManifestResponse.status}`);
+        await backoffManifestResponse.text();
+        assert.equal(mock.state.manifestHits.alpha, alphaHitsDuringBackoff, "forbidden manifest backoff still hit upstream");
+
         const started = Date.now();
         const segmentResponses = await Promise.all(alphaSegments.map(url => request(url, {}, 3000)));
         const elapsed = Date.now() - started;
@@ -230,18 +253,23 @@ async function main() {
         assert.equal(staleResponse.status, 409, "old channel segment was not rejected locally after stream switch");
         assert.equal(mock.state.segmentHits.alpha, alphaHitsBeforeStale, "stale segment request still hit the upstream provider");
 
+        await sleep(550);
+        const alphaHitsBeforeRefresh = mock.state.manifestHits.alpha;
         const refreshedManifestResponse = await request(alphaStream.url, {}, 3000);
         assert.equal(refreshedManifestResponse.status, 200, `refreshed alpha manifest returned ${refreshedManifestResponse.status}`);
         const refreshedManifest = await refreshedManifestResponse.text();
         const refreshedSegments = segmentProxyUrls(refreshedManifest, kronosOrigin);
         assert(refreshedSegments.length >= 2, "refreshed manifest did not expose playable segments");
-        assert(refreshedSegments.every(url => upstreamUrlFromProxy(url).includes("/alpha/alpha-token-4/")), "refreshed manifest reused stale tokenized segment URLs");
+        assert(refreshedSegments.every(url => upstreamUrlFromProxy(url).includes(`/alpha/alpha-token-${alphaHitsBeforeRefresh + 1}/`)), "refreshed manifest reused stale tokenized segment URLs");
         assert(mock.state.userAgents.every(ua => /Chrome\/120/.test(ua)), "upstream did not receive the browser-like IPTV user agent");
 
         const text = logs.join("");
         assert(text.includes("media=2/3 held=1"), "holdback was not visible in HLS logs");
+        assert(text.includes("[HLS STALE MANIFEST]"), "stale manifest fallback was not exercised");
+        assert(text.includes("staleReason=403"), "HLS serve log did not expose the stale manifest reason");
         assert(text.includes("[SEG STALE]"), "stale stream guard was not exercised");
         assert(text.includes("upstreamConcurrency=2"), "segment concurrency setting was not active");
+        assert(text.includes("upstream keepAlive=1"), "upstream keep-alive setting was not active");
 
         console.log(JSON.stringify({
             ok: true,
@@ -250,7 +278,7 @@ async function main() {
             alphaSegments: mock.state.segmentHits.alpha,
             maxActiveSegments: mock.state.maxActiveSegments,
             parallelMs: elapsed,
-            exercised: ["cold-live-warmup", "token-rotating-hls", "live-holdback", "parallel-segments", "stale-stream-guard"]
+            exercised: ["cold-live-warmup", "token-rotating-hls", "live-holdback", "stale-manifest-fallback", "forbidden-backoff", "parallel-segments", "stale-stream-guard"]
         }, null, 2));
     } catch (err) {
         console.error(logs.join(""));
