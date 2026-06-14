@@ -50,7 +50,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "3.3.12";
+const RELEASE_VERSION = "3.3.13";
 const ADDON_TYPE = "tv";
 const PLAYBACK_MODE = "uhf-direct-relay";
 const CATALOG_TTL = 30 * 60 * 1000;
@@ -85,6 +85,7 @@ const HLS_STALE_MANIFEST_TTL_MS = Math.max(0, Number(process.env.HLS_STALE_MANIF
 const HLS_STALE_LIVE_TARGETS = Math.max(0, Number(process.env.HLS_STALE_LIVE_TARGETS || 2));
 const HLS_STALE_FORBIDDEN_TARGETS = Math.max(0, Number(process.env.HLS_STALE_FORBIDDEN_TARGETS || 1));
 const HLS_FORBIDDEN_BACKOFF_MS = Math.max(0, Number(process.env.HLS_FORBIDDEN_BACKOFF_MS || 15000));
+const HLS_FORBIDDEN_SOURCE_REFRESH = String(process.env.HLS_FORBIDDEN_SOURCE_REFRESH ?? "1") !== "0";
 const HLS_WAITING_MANIFEST_ON_ERROR = String(process.env.HLS_WAITING_MANIFEST_ON_ERROR ?? "1") !== "0";
 const HLS_WAITING_TARGET_DURATION = Math.max(1, Number(process.env.HLS_WAITING_TARGET_DURATION || 2));
 const PLAYBACK_ACTIVITY_TTL_MS = Math.max(60 * 1000, Number(process.env.PLAYBACK_ACTIVITY_TTL_MS || 30 * 60 * 1000));
@@ -938,11 +939,93 @@ async function getChannelById(configKey, config, id) {
     return memoryCache.channelIndex[configKey]?.[id] || null;
 }
 
+function channelNameKey(value) {
+    return normalizeSearchText(stripInitialCountryPrefix(value));
+}
+
+function sourceTailKey(value) {
+    try {
+        const url = new URL(value);
+        return decodeURIComponent(url.pathname.split("/").filter(Boolean).pop() || "").toLowerCase();
+    } catch {
+        return "";
+    }
+}
+
+function findFreshChannel(channels, channelId, sourceUrl, label) {
+    if (!Array.isArray(channels) || !channels.length) return null;
+    if (channelId) {
+        const byId = channels.find(ch => ch.id === channelId);
+        if (byId?.url) return byId;
+    }
+
+    const sourceHash = hashKey(sourceUrl);
+    const byHash = channels.find(ch => ch.url && hashKey(ch.url) === sourceHash);
+    if (byHash?.url) return byHash;
+
+    const labelKey = channelNameKey(label);
+    const tailKey = sourceTailKey(sourceUrl);
+    if (labelKey && tailKey) {
+        const byNameAndTail = channels.find(ch => channelNameKey(ch.name) === labelKey && sourceTailKey(ch.url) === tailKey);
+        if (byNameAndTail?.url) return byNameAndTail;
+    }
+    if (labelKey) {
+        const byName = channels.find(ch => channelNameKey(ch.name) === labelKey);
+        if (byName?.url) return byName;
+    }
+    if (tailKey) {
+        const byTail = channels.find(ch => sourceTailKey(ch.url) === tailKey);
+        if (byTail?.url) return byTail;
+    }
+    return null;
+}
+
+async function recoverHlsSourceAfterForbidden(configKey, config, sourceUrl, label, channelId, err) {
+    if (!HLS_FORBIDDEN_SOURCE_REFRESH || !isForbiddenHlsError(err)) return null;
+    const recoveryKey = `${configKey}:${channelId || hashKey(sourceUrl)}:${hashKey(sourceUrl)}`;
+    if (hlsSourceRecoveries.has(recoveryKey)) return await hlsSourceRecoveries.get(recoveryKey);
+
+    const promise = (async () => {
+        const started = Date.now();
+        let channels = [];
+        try {
+            channels = await fetchAndProcessChannels(configKey, config, { force: true });
+        } catch (refreshErr) {
+            console.warn(`[HLS SOURCE RECOVER FAIL] channel="${label}" stage=playlist reason=${refreshErr.message}`);
+            return null;
+        }
+
+        const fresh = findFreshChannel(channels, channelId, sourceUrl, label);
+        if (!fresh?.url || !isHlsUrl(fresh.url)) {
+            console.warn(`[HLS SOURCE RECOVER MISS] channel="${label}" channelId=${channelId || "n/a"} refresh=${Date.now() - started}ms`);
+            return null;
+        }
+
+        const changed = fresh.url !== sourceUrl;
+        clearHlsBackoff(sourceUrl);
+        if (changed) clearHlsBackoff(fresh.url);
+        console.warn(`[HLS SOURCE RECOVER] channel="${label}" channelId=${channelId || "n/a"} changed=${changed ? 1 : 0} refresh=${Date.now() - started}ms status=${getErrorStatus(err) || err?.code || "n/a"}`);
+
+        try {
+            const result = await fetchPlayableHLS(fresh.url, fresh.name || label);
+            return { sourceUrl: fresh.url, label: fresh.name || label, result };
+        } catch (retryErr) {
+            console.warn(`[HLS SOURCE RECOVER FAIL] channel="${label}" stage=manifest status=${getErrorStatus(retryErr) || retryErr?.code || "n/a"} reason=${retryErr.message}`);
+            return null;
+        }
+    })();
+
+    hlsSourceRecoveries.set(recoveryKey, promise);
+    try { return await promise; }
+    finally { hlsSourceRecoveries.delete(recoveryKey); }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // HLS relay
 // ─────────────────────────────────────────────────────────────────────────────
 const hlsLastGoodManifests = new Map();
 const hlsManifestBackoffs = new Map();
+const hlsSourceRecoveries = new Map();
 
 function rememberGoodHLS(sourceUrl, result) {
     if (!HLS_STALE_MANIFEST_TTL_MS || !result?.info) return;
@@ -992,6 +1075,15 @@ function getStaleHLS(sourceUrl, label, err, warmupMs = 0, warmupPolls = 0) {
 function noteHlsBackoff(sourceUrl, err) {
     if (!HLS_FORBIDDEN_BACKOFF_MS || getErrorStatus(err) !== 403) return;
     hlsManifestBackoffs.set(hashKey(sourceUrl), { until: Date.now() + HLS_FORBIDDEN_BACKOFF_MS, status: 403 });
+}
+
+function clearHlsBackoff(sourceUrl) {
+    hlsManifestBackoffs.delete(hashKey(sourceUrl));
+}
+
+function isForbiddenHlsError(err) {
+    const status = getErrorStatus(err);
+    return status === 403 || err?.code === "HLS_BACKOFF";
 }
 
 function assertNoHlsBackoff(sourceUrl) {
@@ -1243,11 +1335,12 @@ function applyLiveHoldback(playlist, info) {
 // Transparent HLS relay: do not invent media-sequences, segment ids or cache
 // state. This mirrors a normal IPTV player behind the server-side VPN: every
 // refreshed manifest carries the current token-bearing segment URLs.
-function rewriteHLSUrlsDirect(playlist, baseUrl, hostBase, configKey, streamKey, info = null) {
+function rewriteHLSUrlsDirect(playlist, baseUrl, hostBase, configKey, streamKey, info = null, channelId = "") {
     const held = applyLiveHoldback(playlist, info);
     const queueKey = hashKey(baseUrl);
     const activeParam = streamKey ? `&a=${encodeURIComponent(streamKey)}` : "";
-    const plUrl = abs => `${hostBase}/${configKey}/proxy/live.m3u8?u=${encodeProxyUrl(abs)}${activeParam}`;
+    const channelParam = channelId ? `&cid=${encodeURIComponent(channelId)}` : "";
+    const plUrl = abs => `${hostBase}/${configKey}/proxy/live.m3u8?u=${encodeProxyUrl(abs)}${activeParam}${channelParam}`;
     const segUrl = abs => `${hostBase}/${configKey}/proxy/seg?u=${encodeProxyUrl(abs)}&q=${queueKey}${activeParam}`;
     const pick = value => {
         const abs = toAbsoluteUrl(value, baseUrl);
@@ -1317,7 +1410,7 @@ function buildStream(channel, host, configKey) {
     if (isHlsUrl(channel.url)) {
         return {
             title: channel.name, name: "TV",
-            url: `${host}/${configKey}/proxy/live.m3u8?u=${encodeProxyUrl(channel.url)}&label=${encodeURIComponent(channel.name)}`,
+            url: `${host}/${configKey}/proxy/live.m3u8?u=${encodeProxyUrl(channel.url)}&label=${encodeURIComponent(channel.name)}&a=${encodeURIComponent(channel.id)}&cid=${encodeURIComponent(channel.id)}`,
             behaviorHints: { notWebReady: true, bingeGroup: `kronos-${channel.id}` }
         };
     }
@@ -1613,11 +1706,12 @@ app.get("/:base64Config/proxy/live.m3u8", async (req, res) => {
     let client = "";
     try {
         const configKey = req.params.base64Config;
-        decodeConfig(configKey);
+        const config = decodeConfig(configKey);
         if (!req.query.u) return res.status(400).send("#EXTM3U\n");
         const sourceUrl = decodeProxyUrl(req.query.u);
         label = String(req.query.label || "direct-hls");
-        streamKey = String(req.query.a || hashKey(sourceUrl));
+        const channelId = String(req.query.cid || "");
+        streamKey = String(req.query.a || channelId || hashKey(sourceUrl));
         if (req.query.label) setActiveStream(configKey, streamKey, label);
         else if (isStaleStream(configKey, streamKey)) {
             console.warn(`[HLS STALE] channel="${label}" stream=${streamKey}`);
@@ -1640,12 +1734,25 @@ app.get("/:base64Config/proxy/live.m3u8", async (req, res) => {
         });
         console.log(`[HLS DIRECT OPEN] id=${reqId} channel="${label}" stream=${streamKey} client=${client} ${openGapLog}`);
 
-        const { data, finalUrl, info, attempts, warmupMs, warmupPolls, staleManifestMs, staleManifestReason } = await fetchPlayableHLSShared(sourceUrl, label);
+        let manifestSourceUrl = sourceUrl;
+        let result;
+        try {
+            result = await fetchPlayableHLSShared(sourceUrl, label);
+        } catch (err) {
+            const recovered = await recoverHlsSourceAfterForbidden(configKey, config, sourceUrl, label, channelId, err);
+            if (!recovered) throw err;
+            manifestSourceUrl = recovered.sourceUrl;
+            label = recovered.label || label;
+            result = recovered.result;
+        }
+
+        const { data, finalUrl, info, attempts, warmupMs, warmupPolls, staleManifestMs, staleManifestReason } = result;
         if (controller.signal.aborted) return;
-        const { rewritten, mediaUrls, upstreamMediaUrls, heldBack, firstMedia, lastMedia, queueKey } = rewriteHLSUrlsDirect(data, finalUrl, getPublicHost(req), configKey, streamKey, info);
+        const { rewritten, mediaUrls, upstreamMediaUrls, heldBack, firstMedia, lastMedia, queueKey } = rewriteHLSUrlsDirect(data, finalUrl, getPublicHost(req), configKey, streamKey, info, channelId);
         setPlaylistHeaders(res);
         notePlaybackActivity(activityKey, {
             lastManifestServeAt: Date.now(),
+            sourceHash: hashKey(manifestSourceUrl),
             lastManifestSeq: info.mediaSequence,
             lastManifestTarget: info.targetDuration,
             lastManifestMedia: mediaUrls,
@@ -1897,7 +2004,7 @@ app.get("/:base64Config/debug", async (req, res) => {
                 HLS_LIVE_MIN_SEGMENTS, HLS_LIVE_MIN_VISIBLE_SEGMENTS, HLS_LIVE_HOLDBACK_SEGMENTS,
                 HLS_LIVE_WARMUP_WAIT_MS, HLS_LIVE_WARMUP_POLL_MS,
                 HLS_STALE_MANIFEST_TTL_MS, HLS_STALE_LIVE_TARGETS, HLS_STALE_FORBIDDEN_TARGETS,
-                HLS_FORBIDDEN_BACKOFF_MS,
+                HLS_FORBIDDEN_BACKOFF_MS, HLS_FORBIDDEN_SOURCE_REFRESH,
                 HLS_WAITING_MANIFEST_ON_ERROR, HLS_WAITING_TARGET_DURATION,
                 PLAYBACK_ACTIVITY_TTL_MS, PLAYBACK_ACTIVITY_MAX,
                 ACTIVE_STREAM_TTL_MS,
@@ -1917,7 +2024,7 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`🌐 http://0.0.0.0:${PORT}`);
     console.log(`📦 Node ${process.version}`);
     console.log(`🎬 playback=${PLAYBACK_MODE} noBuffer=1 noPrefetch=1 noSegmentCache=1`);
-    console.log(`🔁 manifest directFetch=1 timeout=${HLS_REQUEST_TIMEOUT / 1000}s retries=${HLS_UPSTREAM_RETRIES} liveMin=${HLS_LIVE_MIN_SEGMENTS} visible=${HLS_LIVE_MIN_VISIBLE_SEGMENTS} holdback=${HLS_LIVE_HOLDBACK_SEGMENTS} warmupWait=${HLS_LIVE_WARMUP_WAIT_MS / 1000}s staleTTL=${HLS_STALE_MANIFEST_TTL_MS / 1000}s staleLiveTargets=${HLS_STALE_LIVE_TARGETS} stale403Targets=${HLS_STALE_FORBIDDEN_TARGETS} forbiddenBackoff=${HLS_FORBIDDEN_BACKOFF_MS / 1000}s waiting=${HLS_WAITING_MANIFEST_ON_ERROR ? 1 : 0}/${HLS_WAITING_TARGET_DURATION}s activeTtl=${ACTIVE_STREAM_TTL_MS / 1000}s`);
+    console.log(`🔁 manifest directFetch=1 timeout=${HLS_REQUEST_TIMEOUT / 1000}s retries=${HLS_UPSTREAM_RETRIES} liveMin=${HLS_LIVE_MIN_SEGMENTS} visible=${HLS_LIVE_MIN_VISIBLE_SEGMENTS} holdback=${HLS_LIVE_HOLDBACK_SEGMENTS} warmupWait=${HLS_LIVE_WARMUP_WAIT_MS / 1000}s staleTTL=${HLS_STALE_MANIFEST_TTL_MS / 1000}s staleLiveTargets=${HLS_STALE_LIVE_TARGETS} stale403Targets=${HLS_STALE_FORBIDDEN_TARGETS} forbiddenBackoff=${HLS_FORBIDDEN_BACKOFF_MS / 1000}s sourceRefresh403=${HLS_FORBIDDEN_SOURCE_REFRESH ? 1 : 0} waiting=${HLS_WAITING_MANIFEST_ON_ERROR ? 1 : 0}/${HLS_WAITING_TARGET_DURATION}s activeTtl=${ACTIVE_STREAM_TTL_MS / 1000}s`);
     console.log(`🔌 upstream keepAlive=1 sockets=${UPSTREAM_KEEPALIVE_MAX_SOCKETS} free=${UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS} ms=${UPSTREAM_KEEPALIVE_MS}`);
     console.log(`🩺 playback telemetry=1 ttl=${PLAYBACK_ACTIVITY_TTL_MS / 1000}s max=${PLAYBACK_ACTIVITY_MAX}`);
     console.log(`📋 playlist retryWindow=${PLAYLIST_RETRY_WINDOW_MS / 1000}s delay=${PLAYLIST_RETRY_DELAY_MS / 1000}s`);

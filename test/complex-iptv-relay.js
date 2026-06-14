@@ -208,6 +208,8 @@ async function main() {
         assert.equal(alphaStreamResponse.status, 200, `alpha stream returned ${alphaStreamResponse.status}`);
         const alphaStream = (await alphaStreamResponse.json()).streams[0];
         assert(alphaStream.url.includes("/proxy/live.m3u8?u="), "HLS stream did not use direct live relay");
+        assert(alphaStream.url.includes("&cid="), "HLS stream did not carry a stable channel id for source recovery");
+        assert(alphaStream.url.includes("&a="), "HLS stream did not carry a stable active-stream id");
 
         const coldManifestResponse = await request(alphaStream.url, {}, 3000);
         assert.equal(coldManifestResponse.status, 200, `cold alpha manifest returned ${coldManifestResponse.status}`);
@@ -238,13 +240,13 @@ async function main() {
         assert.equal(mock.state.manifestHits.alpha, alphaHitsDuringBackoff, "forbidden manifest backoff still hit upstream");
 
         await sleep(1100);
-        mock.state.failManifests.alpha = 1;
+        mock.state.failManifests.alpha = 2;
         const alphaHitsBeforeExpiredStale = mock.state.manifestHits.alpha;
         const expiredStaleResponse = await request(alphaStream.url, {}, 3000);
         assert.equal(expiredStaleResponse.status, 200, `expired stale alpha manifest returned ${expiredStaleResponse.status}`);
         const expiredStaleManifest = await expiredStaleResponse.text();
         assert.equal(segmentProxyUrls(expiredStaleManifest, kronosOrigin).length, 0, "expired 403 stale manifest should not keep old live segments alive");
-        assert.equal(mock.state.manifestHits.alpha, alphaHitsBeforeExpiredStale + 1, "expired stale request did not re-check upstream");
+        assert.equal(mock.state.manifestHits.alpha, alphaHitsBeforeExpiredStale + 2, "expired stale request did not re-check and recover against upstream");
 
         const started = Date.now();
         const segmentResponses = await Promise.all(alphaSegments.map(url => request(url, {}, 3000)));
@@ -254,14 +256,18 @@ async function main() {
         assert(mock.state.maxActiveSegments >= 2, "segment relay still serialized player catch-up requests");
         assert(elapsed < 580, `parallel segment relay was too slow (${elapsed}ms)`);
 
+        mock.state.failManifests.beta = 1;
+        const playlistHitsBeforeRecovery = mock.state.playlistHits;
         const betaStreamResponse = await request(`${kronosOrigin}/${config}/stream/tv/${betaId}.json`, {}, 2000);
         assert.equal(betaStreamResponse.status, 200, `beta stream returned ${betaStreamResponse.status}`);
         const betaStream = (await betaStreamResponse.json()).streams[0];
         const betaManifestResponse = await request(betaStream.url, {}, 3000);
         assert.equal(betaManifestResponse.status, 200, `beta manifest returned ${betaManifestResponse.status}`);
-        await betaManifestResponse.text();
+        const betaManifest = await betaManifestResponse.text();
+        assert(segmentProxyUrls(betaManifest, kronosOrigin).length >= 2, "beta did not recover from a transient startup 403 to real segments");
+        assert(mock.state.playlistHits > playlistHitsBeforeRecovery, "source recovery did not force-refresh the playlist");
 
-        mock.state.failManifests.gamma = 1;
+        mock.state.failManifests.gamma = 4;
         const gammaStreamResponse = await request(`${kronosOrigin}/${config}/stream/tv/${gammaId}.json`, {}, 2000);
         assert.equal(gammaStreamResponse.status, 200, `gamma stream returned ${gammaStreamResponse.status}`);
         const gammaStream = (await gammaStreamResponse.json()).streams[0];
@@ -270,12 +276,13 @@ async function main() {
         const waitingManifest = await waitingManifestResponse.text();
         assert(waitingManifest.startsWith("#EXTM3U"), "waiting manifest is not valid HLS");
         assert.equal(segmentProxyUrls(waitingManifest, kronosOrigin).length, 0, "waiting manifest should not invent segments");
-        assert.equal(mock.state.manifestHits.gamma, 1, "waiting manifest did not exercise the first upstream 403");
-        const gammaHitsDuringBackoff = mock.state.manifestHits.gamma;
+        assert.equal(mock.state.manifestHits.gamma, 2, "waiting manifest did not exercise upstream 403 recovery failure");
+        const gammaHitsBeforeRetryRecovery = mock.state.manifestHits.gamma;
         const waitingBackoffResponse = await request(gammaStream.url, {}, 3000);
-        assert.equal(waitingBackoffResponse.status, 200, `waiting backoff gamma manifest returned ${waitingBackoffResponse.status}`);
-        await waitingBackoffResponse.text();
-        assert.equal(mock.state.manifestHits.gamma, gammaHitsDuringBackoff, "waiting backoff still hit upstream");
+        assert.equal(waitingBackoffResponse.status, 200, `waiting retry gamma manifest returned ${waitingBackoffResponse.status}`);
+        const waitingRetryManifest = await waitingBackoffResponse.text();
+        assert.equal(segmentProxyUrls(waitingRetryManifest, kronosOrigin).length, 0, "persistent 403 recovery retry should still return waiting manifest");
+        assert(mock.state.manifestHits.gamma > gammaHitsBeforeRetryRecovery, "startup 403 recovery retry did not re-check upstream");
         await sleep(550);
         const gammaReadyResponse = await request(gammaStream.url, {}, 3000);
         assert.equal(gammaReadyResponse.status, 200, `gamma ready manifest returned ${gammaReadyResponse.status}`);
@@ -303,6 +310,8 @@ async function main() {
         assert(text.includes("media=2/3 held=1"), "holdback was not visible in HLS logs");
         assert(text.includes("[HLS STALE MANIFEST]"), "stale manifest fallback was not exercised");
         assert(text.includes("[HLS STALE EXPIRED]"), "expired stale manifest guard was not exercised");
+        assert(text.includes("[HLS SOURCE RECOVER]"), "403 source recovery was not exercised");
+        assert(text.includes("[HLS SOURCE RECOVER FAIL]"), "persistent 403 recovery failure was not exercised");
         assert(text.includes("[HLS WAITING MANIFEST]"), "waiting manifest fallback was not exercised");
         assert(text.includes("staleReason=403"), "HLS serve log did not expose the stale manifest reason");
         assert(text.includes("[SEG STALE]"), "stale stream guard was not exercised");
@@ -317,7 +326,7 @@ async function main() {
             alphaSegments: mock.state.segmentHits.alpha,
             maxActiveSegments: mock.state.maxActiveSegments,
             parallelMs: elapsed,
-            exercised: ["cold-live-warmup", "token-rotating-hls", "live-holdback", "stale-manifest-fallback", "waiting-manifest-fallback", "forbidden-backoff", "parallel-segments", "stale-stream-guard"]
+            exercised: ["cold-live-warmup", "token-rotating-hls", "live-holdback", "stale-manifest-fallback", "source-recovery-403", "waiting-manifest-fallback", "forbidden-backoff", "parallel-segments", "stale-stream-guard"]
         }, null, 2));
     } catch (err) {
         console.error(logs.join(""));
