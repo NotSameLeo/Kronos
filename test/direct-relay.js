@@ -97,6 +97,8 @@ async function main() {
             PLAYLIST_RETRY_WINDOW_MS: "1000",
             PLAYLIST_RETRY_DELAY_MS: "40",
             HLS_REQUEST_TIMEOUT: "700",
+            HLS_COLD_START_WAIT_MS: "500",
+            HLS_COLD_START_RETRY_MS: "50",
             HLS_LIVE_MIN_VISIBLE_SEGMENTS: "1",
             HLS_LIVE_MIN_SEGMENTS: "1",
             HLS_LIVE_HOLDBACK_SEGMENTS: "0",

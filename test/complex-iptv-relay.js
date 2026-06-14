@@ -188,6 +188,8 @@ async function main() {
             PLAYLIST_RETRY_DELAY_MS: "40",
             HLS_REQUEST_TIMEOUT: "1000",
             HLS_UPSTREAM_RETRIES: "0",
+            HLS_COLD_START_WAIT_MS: "700",
+            HLS_COLD_START_RETRY_MS: "100",
             HLS_LIVE_WARMUP_POLL_MS: "50",
             HLS_LIVE_WARMUP_WAIT_MS: "2000",
             HLS_STALE_MANIFEST_TTL_MS: "3000",
@@ -245,8 +247,8 @@ async function main() {
         const expiredStaleResponse = await request(alphaStream.url, {}, 3000);
         assert.equal(expiredStaleResponse.status, 200, `expired stale alpha manifest returned ${expiredStaleResponse.status}`);
         const expiredStaleManifest = await expiredStaleResponse.text();
-        assert.equal(segmentProxyUrls(expiredStaleManifest, kronosOrigin).length, 0, "expired 403 stale manifest should not keep old live segments alive");
-        assert.equal(mock.state.manifestHits.alpha, alphaHitsBeforeExpiredStale + 2, "expired stale request did not re-check and recover against upstream");
+        assert(segmentProxyUrls(expiredStaleManifest, kronosOrigin).length >= 2, "expired 403 stale manifest did not cold-retry to real segments");
+        assert(mock.state.manifestHits.alpha >= alphaHitsBeforeExpiredStale + 2, "expired stale request did not re-check and recover against upstream");
 
         const started = Date.now();
         const segmentResponses = await Promise.all(alphaSegments.map(url => request(url, {}, 3000)));
@@ -265,25 +267,26 @@ async function main() {
         assert.equal(betaManifestResponse.status, 200, `beta manifest returned ${betaManifestResponse.status}`);
         const betaManifest = await betaManifestResponse.text();
         assert(segmentProxyUrls(betaManifest, kronosOrigin).length >= 2, "beta did not recover from a transient startup 403 to real segments");
-        assert(mock.state.playlistHits > playlistHitsBeforeRecovery, "source recovery did not force-refresh the playlist");
+        assert.equal(mock.state.playlistHits, playlistHitsBeforeRecovery, "transient startup 403 should cold-retry without forcing a playlist refresh");
 
-        mock.state.failManifests.gamma = 4;
+        mock.state.failManifests.gamma = 20;
         const gammaStreamResponse = await request(`${kronosOrigin}/${config}/stream/tv/${gammaId}.json`, {}, 2000);
         assert.equal(gammaStreamResponse.status, 200, `gamma stream returned ${gammaStreamResponse.status}`);
         const gammaStream = (await gammaStreamResponse.json()).streams[0];
-        const waitingManifestResponse = await request(gammaStream.url, {}, 3000);
+        const waitingManifestResponse = await request(gammaStream.url, {}, 5000);
         assert.equal(waitingManifestResponse.status, 200, `waiting gamma manifest returned ${waitingManifestResponse.status}`);
         const waitingManifest = await waitingManifestResponse.text();
         assert(waitingManifest.startsWith("#EXTM3U"), "waiting manifest is not valid HLS");
         assert.equal(segmentProxyUrls(waitingManifest, kronosOrigin).length, 0, "waiting manifest should not invent segments");
-        assert.equal(mock.state.manifestHits.gamma, 2, "waiting manifest did not exercise upstream 403 recovery failure");
+        assert(mock.state.manifestHits.gamma >= 6, "waiting manifest did not exhaust cold retries and source recovery");
         const gammaHitsBeforeRetryRecovery = mock.state.manifestHits.gamma;
-        const waitingBackoffResponse = await request(gammaStream.url, {}, 3000);
+        const waitingBackoffResponse = await request(gammaStream.url, {}, 5000);
         assert.equal(waitingBackoffResponse.status, 200, `waiting retry gamma manifest returned ${waitingBackoffResponse.status}`);
         const waitingRetryManifest = await waitingBackoffResponse.text();
         assert.equal(segmentProxyUrls(waitingRetryManifest, kronosOrigin).length, 0, "persistent 403 recovery retry should still return waiting manifest");
         assert(mock.state.manifestHits.gamma > gammaHitsBeforeRetryRecovery, "startup 403 recovery retry did not re-check upstream");
         await sleep(550);
+        mock.state.failManifests.gamma = 0;
         const gammaReadyResponse = await request(gammaStream.url, {}, 3000);
         assert.equal(gammaReadyResponse.status, 200, `gamma ready manifest returned ${gammaReadyResponse.status}`);
         const gammaReady = await gammaReadyResponse.text();

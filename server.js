@@ -65,9 +65,11 @@ const EPG_PRELOAD_URL = String(process.env.EPG_PRELOAD_URL || DEFAULT_EPG_PRELOA
 const EPG_PRELOAD_URLS = parseUrlList(process.env.EPG_PRELOAD_URLS || EPG_PRELOAD_URL);
 const EPG_STARTUP_WATCH_MS = Number(process.env.EPG_STARTUP_WATCH_MS || 30000);
 const CATALOG_PRELOAD_CONFIGS = parseCatalogPreloadConfigs(process.env.CATALOG_PRELOAD_CONFIGS || process.env.KRONOS_PRELOAD_CONFIGS || "");
-const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 10000);
-const HLS_UPSTREAM_RETRIES = Math.max(0, Number(process.env.HLS_UPSTREAM_RETRIES || 1));
-const HLS_UPSTREAM_RETRY_DELAY_MS = Math.max(0, Number(process.env.HLS_UPSTREAM_RETRY_DELAY_MS || 250));
+const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 15000);
+const HLS_UPSTREAM_RETRIES = Math.max(0, Number(process.env.HLS_UPSTREAM_RETRIES || 2));
+const HLS_UPSTREAM_RETRY_DELAY_MS = Math.max(0, Number(process.env.HLS_UPSTREAM_RETRY_DELAY_MS || 1000));
+const HLS_COLD_START_WAIT_MS = Math.max(0, Number(process.env.HLS_COLD_START_WAIT_MS || 25000));
+const HLS_COLD_START_RETRY_MS = Math.max(250, Number(process.env.HLS_COLD_START_RETRY_MS || 1000));
 const HLS_LIVE_MIN_VISIBLE_SEGMENTS = Math.max(1, Number(process.env.HLS_LIVE_MIN_VISIBLE_SEGMENTS || 2));
 const HLS_LIVE_HOLDBACK_SEGMENTS = Math.max(0, Number(process.env.HLS_LIVE_HOLDBACK_SEGMENTS ?? 1));
 const HLS_LIVE_MIN_SEGMENTS = Math.max(
@@ -301,7 +303,7 @@ function isRetryableSegmentError(err) {
 function isRetryableHlsError(err) {
     const status = getErrorStatus(err);
     if ([408, 425, 429, 500, 502, 503, 504].includes(status)) return true;
-    return ["ECONNRESET", "ECONNABORTED", "ETIMEDOUT", "EPIPE"].includes(err?.code)
+    return ["ECONNRESET", "ECONNABORTED", "ETIMEDOUT", "EPIPE", "INVALID_HLS"].includes(err?.code)
         || /timeout/i.test(String(err?.message || ""));
 }
 
@@ -1038,8 +1040,12 @@ function isStaleHlsEligibleError(err) {
     const status = getErrorStatus(err);
     if (err?.code === "HLS_BACKOFF") return true;
     if ([403, 408, 425, 429, 500, 502, 503, 504].includes(status)) return true;
-    return ["ECONNRESET", "ECONNABORTED", "ETIMEDOUT", "EPIPE"].includes(err?.code)
+    return ["ECONNRESET", "ECONNABORTED", "ETIMEDOUT", "EPIPE", "INVALID_HLS"].includes(err?.code)
         || /timeout/i.test(String(err?.message || ""));
+}
+
+function isColdStartHlsRetryable(err) {
+    return isStaleHlsEligibleError(err);
 }
 
 function getStaleHLS(sourceUrl, label, err, warmupMs = 0, warmupPolls = 0) {
@@ -1125,7 +1131,10 @@ async function fetchUpstreamHLS(sourceUrl, label = "stream", signal = null) {
             const finalUrl = r.request?.res?.responseUrl || sourceUrl;
             const text = String(r.data || "").trim();
             if (!text.startsWith("#EXTM3U")) {
-                throw new Error(`Invalid HLS manifest from upstream for ${label}`);
+                const err = new Error(`Invalid HLS manifest from upstream for ${label}`);
+                err.code = "INVALID_HLS";
+                err.status = getErrorStatus({ response: r }) || r.status;
+                throw err;
             }
             const result = { data: r.data, finalUrl, info: analyzeHLS(text), attempts: attempt };
             rememberGoodHLS(sourceUrl, result);
@@ -1149,6 +1158,37 @@ function needsLiveWarmup(info) {
     return (info.mediaSequence ?? 0) <= 1;
 }
 
+async function waitForColdStartHLS(sourceUrl, label, firstErr, started, signal = null) {
+    if (!HLS_COLD_START_WAIT_MS || !isColdStartHlsRetryable(firstErr)) return null;
+    const deadline = started + HLS_COLD_START_WAIT_MS;
+    let polls = 0;
+    let lastErr = firstErr;
+    console.warn(`[HLS COLD WAIT] channel="${label}" status=${getErrorStatus(firstErr) || firstErr?.code || "n/a"} wait=${HLS_COLD_START_WAIT_MS}ms reason=${firstErr.message}`);
+
+    while (!signal?.aborted && Date.now() < deadline) {
+        const delay = Math.min(HLS_COLD_START_RETRY_MS, Math.max(0, deadline - Date.now()));
+        if (delay > 0) await sleep(delay);
+        if (signal?.aborted) break;
+        polls++;
+        clearHlsBackoff(sourceUrl);
+        try {
+            const result = await fetchUpstreamHLS(sourceUrl, label, signal);
+            const waited = Date.now() - started;
+            console.log(`[HLS COLD READY] channel="${label}" media=${result.info.segmentCount} seq=${result.info.mediaSequence ?? "n/a"} wait=${waited}ms polls=${polls}`);
+            return { ...result, coldStartMs: waited, coldStartPolls: polls };
+        } catch (err) {
+            lastErr = err;
+            const stale = getStaleHLS(sourceUrl, label, err, Date.now() - started, polls);
+            if (stale) return stale;
+            if (!isColdStartHlsRetryable(err)) break;
+            console.warn(`[HLS COLD RETRY] channel="${label}" poll=${polls} status=${getErrorStatus(err) || err?.code || "n/a"} reason=${err.message}`);
+        }
+    }
+
+    console.warn(`[HLS COLD GIVEUP] channel="${label}" wait=${Date.now() - started}ms polls=${polls} status=${getErrorStatus(lastErr) || lastErr?.code || "n/a"} reason=${lastErr.message}`);
+    throw lastErr;
+}
+
 async function fetchPlayableHLS(sourceUrl, label = "stream", signal = null) {
     const started = Date.now();
     let result;
@@ -1157,7 +1197,8 @@ async function fetchPlayableHLS(sourceUrl, label = "stream", signal = null) {
     } catch (err) {
         const stale = getStaleHLS(sourceUrl, label, err);
         if (stale) return stale;
-        throw err;
+        result = await waitForColdStartHLS(sourceUrl, label, err, started, signal);
+        if (!result) throw err;
     }
     if (!needsLiveWarmup(result.info) || HLS_LIVE_WARMUP_WAIT_MS <= 0) return { ...result, warmupMs: 0, warmupPolls: 0 };
 
@@ -2001,6 +2042,7 @@ app.get("/:base64Config/debug", async (req, res) => {
             constants: {
                 ADDON_TYPE, RELEASE_VERSION, PLAYBACK_MODE, HLS_REQUEST_TIMEOUT, SEG_REQUEST_TIMEOUT,
                 HLS_UPSTREAM_RETRIES, HLS_UPSTREAM_RETRY_DELAY_MS,
+                HLS_COLD_START_WAIT_MS, HLS_COLD_START_RETRY_MS,
                 HLS_LIVE_MIN_SEGMENTS, HLS_LIVE_MIN_VISIBLE_SEGMENTS, HLS_LIVE_HOLDBACK_SEGMENTS,
                 HLS_LIVE_WARMUP_WAIT_MS, HLS_LIVE_WARMUP_POLL_MS,
                 HLS_STALE_MANIFEST_TTL_MS, HLS_STALE_LIVE_TARGETS, HLS_STALE_FORBIDDEN_TARGETS,
@@ -2024,7 +2066,7 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`🌐 http://0.0.0.0:${PORT}`);
     console.log(`📦 Node ${process.version}`);
     console.log(`🎬 playback=${PLAYBACK_MODE} noBuffer=1 noPrefetch=1 noSegmentCache=1`);
-    console.log(`🔁 manifest directFetch=1 timeout=${HLS_REQUEST_TIMEOUT / 1000}s retries=${HLS_UPSTREAM_RETRIES} liveMin=${HLS_LIVE_MIN_SEGMENTS} visible=${HLS_LIVE_MIN_VISIBLE_SEGMENTS} holdback=${HLS_LIVE_HOLDBACK_SEGMENTS} warmupWait=${HLS_LIVE_WARMUP_WAIT_MS / 1000}s staleTTL=${HLS_STALE_MANIFEST_TTL_MS / 1000}s staleLiveTargets=${HLS_STALE_LIVE_TARGETS} stale403Targets=${HLS_STALE_FORBIDDEN_TARGETS} forbiddenBackoff=${HLS_FORBIDDEN_BACKOFF_MS / 1000}s sourceRefresh403=${HLS_FORBIDDEN_SOURCE_REFRESH ? 1 : 0} waiting=${HLS_WAITING_MANIFEST_ON_ERROR ? 1 : 0}/${HLS_WAITING_TARGET_DURATION}s activeTtl=${ACTIVE_STREAM_TTL_MS / 1000}s`);
+    console.log(`🔁 manifest directFetch=1 timeout=${HLS_REQUEST_TIMEOUT / 1000}s retries=${HLS_UPSTREAM_RETRIES} retryDelay=${HLS_UPSTREAM_RETRY_DELAY_MS / 1000}s coldWait=${HLS_COLD_START_WAIT_MS / 1000}s coldRetry=${HLS_COLD_START_RETRY_MS / 1000}s liveMin=${HLS_LIVE_MIN_SEGMENTS} visible=${HLS_LIVE_MIN_VISIBLE_SEGMENTS} holdback=${HLS_LIVE_HOLDBACK_SEGMENTS} warmupWait=${HLS_LIVE_WARMUP_WAIT_MS / 1000}s staleTTL=${HLS_STALE_MANIFEST_TTL_MS / 1000}s staleLiveTargets=${HLS_STALE_LIVE_TARGETS} stale403Targets=${HLS_STALE_FORBIDDEN_TARGETS} forbiddenBackoff=${HLS_FORBIDDEN_BACKOFF_MS / 1000}s sourceRefresh403=${HLS_FORBIDDEN_SOURCE_REFRESH ? 1 : 0} waiting=${HLS_WAITING_MANIFEST_ON_ERROR ? 1 : 0}/${HLS_WAITING_TARGET_DURATION}s activeTtl=${ACTIVE_STREAM_TTL_MS / 1000}s`);
     console.log(`🔌 upstream keepAlive=1 sockets=${UPSTREAM_KEEPALIVE_MAX_SOCKETS} free=${UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS} ms=${UPSTREAM_KEEPALIVE_MS}`);
     console.log(`🩺 playback telemetry=1 ttl=${PLAYBACK_ACTIVITY_TTL_MS / 1000}s max=${PLAYBACK_ACTIVITY_MAX}`);
     console.log(`📋 playlist retryWindow=${PLAYLIST_RETRY_WINDOW_MS / 1000}s delay=${PLAYLIST_RETRY_DELAY_MS / 1000}s`);
