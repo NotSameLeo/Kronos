@@ -50,7 +50,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "3.3.13";
+const RELEASE_VERSION = "3.3.14";
 const ADDON_TYPE = "tv";
 const PLAYBACK_MODE = "uhf-direct-relay";
 const CATALOG_TTL = 30 * 60 * 1000;
@@ -117,6 +117,23 @@ const upstreamHttpsAgent = new https.Agent({
 
 function upstreamAgentOptions() {
     return { httpAgent: upstreamHttpAgent, httpsAgent: upstreamHttpsAgent };
+}
+
+function redactUrlForLog(value) {
+    const raw = String(value || "");
+    try {
+        const url = new URL(raw);
+        if (url.username) url.username = "redacted";
+        if (url.password) url.password = "redacted";
+        for (const key of url.searchParams.keys()) {
+            if (/^(username|user|password|pass|token|key|api_?key|auth|authorization|access_token)$/i.test(key)) {
+                url.searchParams.set(key, "redacted");
+            }
+        }
+        return url.toString();
+    } catch (_) {
+        return raw.replace(/((?:username|user|password|pass|token|key|api_?key|auth|authorization|access_token)=)[^&\s]+/gi, "$1redacted");
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -743,7 +760,8 @@ function getConfiguredLists(config) {
 }
 
 async function fetchPlaylist(sourceUrl, options = {}) {
-    console.log("[FETCH PLAYLIST]", sourceUrl);
+    const logUrl = redactUrlForLog(sourceUrl);
+    console.log("[FETCH PLAYLIST]", logUrl);
     const deadline = Date.now() + (options.retryWindow || PLAYLIST_RETRY_WINDOW_MS);
     let attempt = 0;
     let lastErr = null;
@@ -764,7 +782,7 @@ async function fetchPlaylist(sourceUrl, options = {}) {
             });
             const data = String(response.data || "");
             if (!data.trimStart().startsWith("#EXTM3U")) throw new Error("Invalid M3U playlist from upstream");
-            console.log("[FETCH PLAYLIST OK]", sourceUrl, "size=" + data.length, "attempt=" + attempt);
+            console.log("[FETCH PLAYLIST OK]", logUrl, "size=" + data.length, "attempt=" + attempt);
             return response.data;
         } catch (err) {
             lastErr = err;
