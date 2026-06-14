@@ -237,6 +237,15 @@ async function main() {
         await backoffManifestResponse.text();
         assert.equal(mock.state.manifestHits.alpha, alphaHitsDuringBackoff, "forbidden manifest backoff still hit upstream");
 
+        await sleep(1100);
+        mock.state.failManifests.alpha = 1;
+        const alphaHitsBeforeExpiredStale = mock.state.manifestHits.alpha;
+        const expiredStaleResponse = await request(alphaStream.url, {}, 3000);
+        assert.equal(expiredStaleResponse.status, 200, `expired stale alpha manifest returned ${expiredStaleResponse.status}`);
+        const expiredStaleManifest = await expiredStaleResponse.text();
+        assert.equal(segmentProxyUrls(expiredStaleManifest, kronosOrigin).length, 0, "expired 403 stale manifest should not keep old live segments alive");
+        assert.equal(mock.state.manifestHits.alpha, alphaHitsBeforeExpiredStale + 1, "expired stale request did not re-check upstream");
+
         const started = Date.now();
         const segmentResponses = await Promise.all(alphaSegments.map(url => request(url, {}, 3000)));
         const elapsed = Date.now() - started;
@@ -293,6 +302,7 @@ async function main() {
         assert(text.includes("idleHls="), "playback gap telemetry was not emitted");
         assert(text.includes("media=2/3 held=1"), "holdback was not visible in HLS logs");
         assert(text.includes("[HLS STALE MANIFEST]"), "stale manifest fallback was not exercised");
+        assert(text.includes("[HLS STALE EXPIRED]"), "expired stale manifest guard was not exercised");
         assert(text.includes("[HLS WAITING MANIFEST]"), "waiting manifest fallback was not exercised");
         assert(text.includes("staleReason=403"), "HLS serve log did not expose the stale manifest reason");
         assert(text.includes("[SEG STALE]"), "stale stream guard was not exercised");

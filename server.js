@@ -82,6 +82,8 @@ const SEGMENT_UPSTREAM_CONCURRENCY = Math.max(1, Number(process.env.SEGMENT_UPST
 const SEGMENT_UPSTREAM_RETRIES = Math.max(0, Number(process.env.SEGMENT_UPSTREAM_RETRIES || 1));
 const SEGMENT_UPSTREAM_RETRY_DELAY_MS = Math.max(0, Number(process.env.SEGMENT_UPSTREAM_RETRY_DELAY_MS || 250));
 const HLS_STALE_MANIFEST_TTL_MS = Math.max(0, Number(process.env.HLS_STALE_MANIFEST_TTL_MS || 90000));
+const HLS_STALE_LIVE_TARGETS = Math.max(0, Number(process.env.HLS_STALE_LIVE_TARGETS || 2));
+const HLS_STALE_FORBIDDEN_TARGETS = Math.max(0, Number(process.env.HLS_STALE_FORBIDDEN_TARGETS || 1));
 const HLS_FORBIDDEN_BACKOFF_MS = Math.max(0, Number(process.env.HLS_FORBIDDEN_BACKOFF_MS || 15000));
 const HLS_WAITING_MANIFEST_ON_ERROR = String(process.env.HLS_WAITING_MANIFEST_ON_ERROR ?? "1") !== "0";
 const HLS_WAITING_TARGET_DURATION = Math.max(1, Number(process.env.HLS_WAITING_TARGET_DURATION || 2));
@@ -963,11 +965,19 @@ function getStaleHLS(sourceUrl, label, err, warmupMs = 0, warmupPolls = 0) {
     const entry = hlsLastGoodManifests.get(key);
     if (!entry) return null;
     const age = Date.now() - entry.storedAt;
-    if (age > HLS_STALE_MANIFEST_TTL_MS) {
+    const status = getErrorStatus(err) || err?.code || "n/a";
+    const isForbidden = status === 403 || String(status) === "HLS_BACKOFF";
+    const targetMs = Math.max(0, Number(entry.info?.targetDuration || 0) * 1000);
+    const liveTargets = isForbidden ? HLS_STALE_FORBIDDEN_TARGETS : HLS_STALE_LIVE_TARGETS;
+    const liveCapMs = entry.info?.isLive && targetMs > 0 && liveTargets > 0
+        ? targetMs * liveTargets
+        : HLS_STALE_MANIFEST_TTL_MS;
+    const maxAge = Math.max(0, Math.min(HLS_STALE_MANIFEST_TTL_MS, liveCapMs));
+    if (age > maxAge) {
+        console.warn(`[HLS STALE EXPIRED] channel="${label}" age=${age}ms max=${maxAge}ms status=${status} reason=${err.message}`);
         hlsLastGoodManifests.delete(key);
         return null;
     }
-    const status = getErrorStatus(err) || err?.code || "n/a";
     console.warn(`[HLS STALE MANIFEST] channel="${label}" age=${age}ms status=${status} reason=${err.message}`);
     return {
         ...entry,
@@ -1886,7 +1896,8 @@ app.get("/:base64Config/debug", async (req, res) => {
                 HLS_UPSTREAM_RETRIES, HLS_UPSTREAM_RETRY_DELAY_MS,
                 HLS_LIVE_MIN_SEGMENTS, HLS_LIVE_MIN_VISIBLE_SEGMENTS, HLS_LIVE_HOLDBACK_SEGMENTS,
                 HLS_LIVE_WARMUP_WAIT_MS, HLS_LIVE_WARMUP_POLL_MS,
-                HLS_STALE_MANIFEST_TTL_MS, HLS_FORBIDDEN_BACKOFF_MS,
+                HLS_STALE_MANIFEST_TTL_MS, HLS_STALE_LIVE_TARGETS, HLS_STALE_FORBIDDEN_TARGETS,
+                HLS_FORBIDDEN_BACKOFF_MS,
                 HLS_WAITING_MANIFEST_ON_ERROR, HLS_WAITING_TARGET_DURATION,
                 PLAYBACK_ACTIVITY_TTL_MS, PLAYBACK_ACTIVITY_MAX,
                 ACTIVE_STREAM_TTL_MS,
@@ -1906,7 +1917,7 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`🌐 http://0.0.0.0:${PORT}`);
     console.log(`📦 Node ${process.version}`);
     console.log(`🎬 playback=${PLAYBACK_MODE} noBuffer=1 noPrefetch=1 noSegmentCache=1`);
-    console.log(`🔁 manifest directFetch=1 timeout=${HLS_REQUEST_TIMEOUT / 1000}s retries=${HLS_UPSTREAM_RETRIES} liveMin=${HLS_LIVE_MIN_SEGMENTS} visible=${HLS_LIVE_MIN_VISIBLE_SEGMENTS} holdback=${HLS_LIVE_HOLDBACK_SEGMENTS} warmupWait=${HLS_LIVE_WARMUP_WAIT_MS / 1000}s staleTTL=${HLS_STALE_MANIFEST_TTL_MS / 1000}s forbiddenBackoff=${HLS_FORBIDDEN_BACKOFF_MS / 1000}s waiting=${HLS_WAITING_MANIFEST_ON_ERROR ? 1 : 0}/${HLS_WAITING_TARGET_DURATION}s activeTtl=${ACTIVE_STREAM_TTL_MS / 1000}s`);
+    console.log(`🔁 manifest directFetch=1 timeout=${HLS_REQUEST_TIMEOUT / 1000}s retries=${HLS_UPSTREAM_RETRIES} liveMin=${HLS_LIVE_MIN_SEGMENTS} visible=${HLS_LIVE_MIN_VISIBLE_SEGMENTS} holdback=${HLS_LIVE_HOLDBACK_SEGMENTS} warmupWait=${HLS_LIVE_WARMUP_WAIT_MS / 1000}s staleTTL=${HLS_STALE_MANIFEST_TTL_MS / 1000}s staleLiveTargets=${HLS_STALE_LIVE_TARGETS} stale403Targets=${HLS_STALE_FORBIDDEN_TARGETS} forbiddenBackoff=${HLS_FORBIDDEN_BACKOFF_MS / 1000}s waiting=${HLS_WAITING_MANIFEST_ON_ERROR ? 1 : 0}/${HLS_WAITING_TARGET_DURATION}s activeTtl=${ACTIVE_STREAM_TTL_MS / 1000}s`);
     console.log(`🔌 upstream keepAlive=1 sockets=${UPSTREAM_KEEPALIVE_MAX_SOCKETS} free=${UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS} ms=${UPSTREAM_KEEPALIVE_MS}`);
     console.log(`🩺 playback telemetry=1 ttl=${PLAYBACK_ACTIVITY_TTL_MS / 1000}s max=${PLAYBACK_ACTIVITY_MAX}`);
     console.log(`📋 playlist retryWindow=${PLAYLIST_RETRY_WINDOW_MS / 1000}s delay=${PLAYLIST_RETRY_DELAY_MS / 1000}s`);
