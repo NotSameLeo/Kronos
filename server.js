@@ -115,13 +115,30 @@ const FFMPEG_BIN = process.env.FFMPEG_BIN || "ffmpeg";
 const INGEST_ROOT = process.env.INGEST_ROOT || "/tmp/kronos-ingest";
 const INGEST_SEGMENT_SECONDS = Math.max(1, Number(process.env.INGEST_SEGMENT_SECONDS || 4));
 const INGEST_WINDOW_SEGMENTS = Math.max(6, Number(process.env.INGEST_WINDOW_SEGMENTS || 36));
-const INGEST_LIVE_OFFSET_SECONDS = Math.max(0, Number(process.env.INGEST_LIVE_OFFSET_SECONDS || 45));
-const INGEST_IDLE_TIMEOUT_MS = Math.max(10000, Number(process.env.INGEST_IDLE_TIMEOUT_MS || 60000));
+// Live cushion: the player is told (via EXT-X-START) to sit this many seconds
+// behind the ingest edge, and we prebuffer at least this much before the first
+// serve, so the player has real runway to absorb upstream stalls / weak wifi.
+const INGEST_LIVE_OFFSET_SECONDS = Math.max(0, Number(process.env.INGEST_LIVE_OFFSET_SECONDS || 20));
+const INGEST_PREBUFFER_SECONDS = Math.max(0, Number(process.env.INGEST_PREBUFFER_SECONDS ?? INGEST_LIVE_OFFSET_SECONDS));
+const INGEST_IDLE_TIMEOUT_MS = Math.max(10000, Number(process.env.INGEST_IDLE_TIMEOUT_MS || 45000));
 const INGEST_FIRST_SEGMENT_TIMEOUT_MS = Math.max(5000, Number(process.env.INGEST_FIRST_SEGMENT_TIMEOUT_MS || 30000));
-const INGEST_REAP_INTERVAL_MS = Math.max(5000, Number(process.env.INGEST_REAP_INTERVAL_MS || 15000));
+const INGEST_REAP_INTERVAL_MS = Math.max(5000, Number(process.env.INGEST_REAP_INTERVAL_MS || 10000));
 const INGEST_RECONNECT_DELAY_MAX = Math.max(1, Number(process.env.INGEST_RECONNECT_DELAY_MAX || 5));
 const INGEST_READ_TIMEOUT_US = Math.max(1000000, Number(process.env.INGEST_READ_TIMEOUT_US || 15000000));
-const INGEST_PREFLIGHT = String(process.env.INGEST_PREFLIGHT ?? "1") !== "0";
+// One upstream connection at a time by default — these IPTV accounts usually cap
+// concurrent streams (a 2nd stream 403s). Opening a channel stops the others, so
+// zapping never overlaps and never trips the upstream's connection limit.
+const INGEST_MAX_CONCURRENT = Math.max(1, Number(process.env.INGEST_MAX_CONCURRENT || 1));
+// ffmpeg sometimes exits on a transient upstream blip ("Failed to reload
+// playlist"). Respawn while the channel is still wanted, with backoff, and a
+// longer backoff on 403 so we never hammer the upstream into a temp ban.
+const INGEST_RESTART_BACKOFF_MS = Math.max(250, Number(process.env.INGEST_RESTART_BACKOFF_MS || 1500));
+const INGEST_RESTART_BACKOFF_MAX_MS = Math.max(2000, Number(process.env.INGEST_RESTART_BACKOFF_MAX_MS || 15000));
+const INGEST_FORBIDDEN_BACKOFF_MS = Math.max(2000, Number(process.env.INGEST_FORBIDDEN_BACKOFF_MS || 20000));
+const INGEST_HEALTHY_RUN_MS = Math.max(5000, Number(process.env.INGEST_HEALTHY_RUN_MS || 25000));
+const INGEST_MAX_RESTARTS = Math.max(1, Number(process.env.INGEST_MAX_RESTARTS || 10));
+const INGEST_HTTP_RETRY_CODES = String(process.env.INGEST_HTTP_RETRY_CODES || "429,500,502,503,504,520,521,522,524");
+const INGEST_PREFLIGHT = String(process.env.INGEST_PREFLIGHT ?? "0") !== "0";
 
 const upstreamHttpAgent = new http.Agent({
     keepAlive: true,
@@ -1766,8 +1783,12 @@ function ffmpegArgs(url, dir) {
     return [
         "-nostdin", "-hide_banner", "-loglevel", "warning",
         "-user_agent", UPSTREAM_UA,
+        // Survive transient upstream blips on both the byte stream AND the HLS
+        // playlist reloads (the latter is what was killing ffmpeg before).
         "-reconnect", "1",
         "-reconnect_streamed", "1",
+        "-reconnect_on_network_error", "1",
+        "-reconnect_on_http_error", INGEST_HTTP_RETRY_CODES,
         "-reconnect_delay_max", String(INGEST_RECONNECT_DELAY_MAX),
         "-rw_timeout", String(INGEST_READ_TIMEOUT_US),
         "-i", url,
@@ -1804,6 +1825,7 @@ function spawnIngest(ingest) {
     ingest.firstSegmentAt = 0;
     ingest.exited = false;
     ingest.stopping = false;
+    ingest.served = false; // fresh process -> re-prebuffer the cushion before serving
     ingest.stderrTail = "";
 
     proc.stderr.on("data", chunk => {
@@ -1812,10 +1834,11 @@ function spawnIngest(ingest) {
     proc.on("exit", (code, signal) => {
         ingest.exited = true;
         ingest.exitCode = code;
-        if (!ingest.stopping) {
-            const ranMs = Date.now() - ingest.startedAt;
-            console.warn(`[INGEST EXIT] channel="${ingest.label}" key=${ingest.shortKey} pid=${ingest.pid} code=${code} signal=${signal || "none"} ran=${ranMs}ms tail=${(ingest.stderrTail || "").trim().split("\n").pop() || ""}`);
-        }
+        if (ingest.stopping) return;
+        const ranMs = Date.now() - ingest.startedAt;
+        const tail = (ingest.stderrTail || "").trim().split("\n").pop() || "";
+        console.warn(`[INGEST EXIT] channel="${ingest.label}" key=${ingest.shortKey} pid=${ingest.pid} code=${code} signal=${signal || "none"} ran=${ranMs}ms tail=${tail}`);
+        scheduleRespawn(ingest, ranMs, tail);
     });
     proc.on("error", err => {
         ingest.exited = true;
@@ -1823,7 +1846,45 @@ function spawnIngest(ingest) {
         console.error(`[INGEST SPAWN ERROR] channel="${ingest.label}" key=${ingest.shortKey} reason=${err.message}`);
     });
 
-    console.log(`[INGEST START] channel="${ingest.label}" key=${ingest.shortKey} pid=${ingest.pid} restarts=${ingest.restarts} seg=${INGEST_SEGMENT_SECONDS}s window=${INGEST_WINDOW_SEGMENTS} offset=${INGEST_LIVE_OFFSET_SECONDS}s`);
+    console.log(`[INGEST START] channel="${ingest.label}" key=${ingest.shortKey} pid=${ingest.pid} restarts=${ingest.restarts} seg=${INGEST_SEGMENT_SECONDS}s window=${INGEST_WINDOW_SEGMENTS} cushion=${INGEST_LIVE_OFFSET_SECONDS}s`);
+}
+
+// Keep a wanted channel alive across ffmpeg deaths, but with backoff so we never
+// hammer the upstream (which would turn a transient error into a 403 temp-ban).
+function scheduleRespawn(ingest, ranMs, tail) {
+    if (!ingests.has(ingest.key)) return; // stopped/zapped away
+    if (Date.now() - ingest.lastAccess > INGEST_IDLE_TIMEOUT_MS) return; // nobody watching
+
+    if (ranMs >= INGEST_HEALTHY_RUN_MS) ingest.failures = 0; // it ran fine, just hiccuped
+    ingest.failures = (ingest.failures || 0) + 1;
+
+    if (ingest.failures > INGEST_MAX_RESTARTS) {
+        console.error(`[INGEST GIVEUP] channel="${ingest.label}" key=${ingest.shortKey} failures=${ingest.failures} lastTail=${tail}`);
+        stopIngest(ingest, `giveup after ${ingest.failures} failures`);
+        return;
+    }
+
+    const forbidden = /403|Forbidden|access denied/i.test(tail);
+    const base = forbidden ? INGEST_FORBIDDEN_BACKOFF_MS : INGEST_RESTART_BACKOFF_MS;
+    const delay = Math.min(base * ingest.failures, INGEST_RESTART_BACKOFF_MAX_MS + (forbidden ? INGEST_FORBIDDEN_BACKOFF_MS : 0));
+    ingest.restarts++;
+    console.log(`[INGEST RESPAWN] channel="${ingest.label}" key=${ingest.shortKey} in=${delay}ms failures=${ingest.failures} forbidden=${forbidden ? 1 : 0}`);
+    ingest.respawnTimer = setTimeout(() => {
+        if (!ingests.has(ingest.key)) return;
+        if (Date.now() - ingest.lastAccess > INGEST_IDLE_TIMEOUT_MS) { stopIngest(ingest, "idle before respawn"); return; }
+        spawnIngest(ingest);
+    }, delay);
+    ingest.respawnTimer.unref?.();
+}
+
+// Enforce the upstream's concurrent-connection budget: stop the least-recently
+// used OTHER ingests so we never hold more than INGEST_MAX_CONCURRENT at once.
+function enforceConcurrency(keepKey) {
+    const others = [...ingests.values()].filter(i => i.key !== keepKey);
+    if (others.length + 1 <= INGEST_MAX_CONCURRENT) return;
+    others.sort((a, b) => a.lastAccess - b.lastAccess); // oldest first
+    const toStop = others.length + 1 - INGEST_MAX_CONCURRENT;
+    for (let i = 0; i < toStop; i++) stopIngest(others[i], "freeing connection slot (zap)");
 }
 
 function ensureIngest(ingestKey, url, label) {
@@ -1842,15 +1903,16 @@ function ensureIngest(ingestKey, url, label) {
             label: label || "live",
             dir: ingestDirFor(ingestKey),
             lastAccess: Date.now(),
-            restarts: 0
+            restarts: 0,
+            failures: 0
         };
         ingests.set(ingestKey, ingest);
     } else {
         ingest.url = url;
         if (label) ingest.label = label;
-        ingest.restarts++;
         ingest.lastAccess = Date.now();
     }
+    enforceConcurrency(ingestKey);
     spawnIngest(ingest);
     startIngestReaper();
     return ingest;
@@ -1865,46 +1927,64 @@ function readIngestPlaylist(ingest) {
     }
 }
 
-async function waitForPlaylist(ingest, timeoutMs) {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-        const raw = readIngestPlaylist(ingest);
-        if (raw) {
-            if (!ingest.firstSegmentAt) ingest.firstSegmentAt = Date.now();
-            return raw;
-        }
-        if (ingest.exited) return null;
-        await sleep(200);
-    }
-    return null;
+function playlistDurationSeconds(raw) {
+    let total = 0;
+    const re = /#EXTINF:([0-9.]+)/g;
+    let m;
+    while ((m = re.exec(raw))) total += parseFloat(m[1]) || 0;
+    return total;
 }
 
-// Inject a live-edge cushion so the player sits INGEST_LIVE_OFFSET_SECONDS behind
-// the ingest edge, giving runway to absorb upstream stalls. Segment URIs stay
-// relative (resolved against the manifest path -> our segment route).
+// Block the first serve until we have a real cushion of locally-ingested content
+// (or we hit the timeout). This is what gives the player runway from frame one,
+// instead of starting glued to the live edge and micro-buffering. Stremio
+// tolerates a slow first manifest. Later requests return immediately.
+async function waitForPrebuffer(ingest, targetSeconds, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    let raw = null;
+    while (Date.now() < deadline) {
+        raw = readIngestPlaylist(ingest);
+        if (raw) {
+            if (!ingest.firstSegmentAt) ingest.firstSegmentAt = Date.now();
+            if (playlistDurationSeconds(raw) >= targetSeconds) return raw;
+        } else if (ingest.exited && !ingest.respawnTimer) {
+            return null;
+        }
+        await sleep(250);
+    }
+    return raw; // serve whatever we managed to buffer
+}
+
+// Inject a live-edge cushion (EXT-X-START + SERVER-CONTROL) so the player sits
+// INGEST_LIVE_OFFSET_SECONDS behind the ingest edge and buffers that runway
+// forward. Segment URIs stay relative -> resolved against our segment route.
 function buildServedPlaylist(rawPlaylist) {
     if (!INGEST_LIVE_OFFSET_SECONDS) return rawPlaylist;
-    const startTag = `#EXT-X-START:TIME-OFFSET=-${INGEST_LIVE_OFFSET_SECONDS},PRECISE=YES`;
+    const tags = [
+        `#EXT-X-SERVER-CONTROL:HOLD-BACK=${INGEST_LIVE_OFFSET_SECONDS}`,
+        `#EXT-X-START:TIME-OFFSET=-${INGEST_LIVE_OFFSET_SECONDS},PRECISE=YES`
+    ];
     const lines = rawPlaylist.split(/\r?\n/);
     const out = [];
     let injected = false;
     for (const line of lines) {
         out.push(line);
         if (!injected && /^#EXT-X-MEDIA-SEQUENCE:/i.test(line)) {
-            out.push(startTag);
+            out.push(...tags);
             injected = true;
         }
     }
     if (!injected) {
         const idx = out.findIndex(l => /^#EXTM3U/i.test(l));
-        if (idx >= 0) out.splice(idx + 1, 0, startTag);
-        else out.unshift(startTag);
+        if (idx >= 0) out.splice(idx + 1, 0, ...tags);
+        else out.unshift(...tags);
     }
     return out.join("\n");
 }
 
 function stopIngest(ingest, reason) {
     ingest.stopping = true;
+    if (ingest.respawnTimer) { clearTimeout(ingest.respawnTimer); ingest.respawnTimer = null; }
     const proc = ingest.proc;
     try { if (proc && !ingest.exited) proc.kill("SIGTERM"); } catch {}
     setTimeout(() => { try { if (proc && !ingest.exited) proc.kill("SIGKILL"); } catch {} }, 4000);
@@ -1927,8 +2007,8 @@ function startIngestReaper() {
     timer.unref?.();
 }
 
-// Player fetches the channel manifest -> ensure ffmpeg is ingesting, wait for the
-// first local segment, then serve a clean local playlist with a live cushion.
+// Player fetches the channel manifest -> ensure ffmpeg is ingesting (stopping any
+// other channel), prebuffer the cushion, then serve a clean local playlist.
 app.get("/:base64Config/live/:cid/index.m3u8", async (req, res) => {
     const started = Date.now();
     const reqId = nextPlaybackRequestId("L");
@@ -1945,24 +2025,27 @@ app.get("/:base64Config/live/:cid/index.m3u8", async (req, res) => {
         const ingest = ensureIngest(ingestKey, ch.url, label);
         ingest.lastAccess = Date.now();
 
+        // Already warmed (steady-state request): serve immediately.
         let raw = readIngestPlaylist(ingest);
         let warmupMs = 0;
-        if (!raw) {
+        const needPrebuffer = !ingest.served || !raw;
+        if (needPrebuffer) {
             const w0 = Date.now();
-            raw = await waitForPlaylist(ingest, INGEST_FIRST_SEGMENT_TIMEOUT_MS);
+            raw = await waitForPrebuffer(ingest, INGEST_PREBUFFER_SECONDS, INGEST_FIRST_SEGMENT_TIMEOUT_MS);
             warmupMs = Date.now() - w0;
+            ingest.lastAccess = Date.now();
         }
         if (!raw) {
             console.error(`[LIVE TIMEOUT] id=${reqId} channel="${label}" key=${ingest.shortKey} warmup=${warmupMs}ms exited=${ingest.exited ? 1 : 0} tail=${(ingest.stderrTail || "").trim().split("\n").pop() || ""}`);
-            if (ingest.exited) ensureIngest(ingestKey, ch.url, label); // respawn for next attempt
             return res.status(504).type("text/plain").send("#EXTM3U\n");
         }
+        ingest.served = true;
         const served = buildServedPlaylist(raw);
         setPlaylistHeaders(res);
         res.send(served);
         const segCount = (raw.match(/seg_\d+\.ts/g) || []).length;
-        const ageMs = ingest.firstSegmentAt ? Date.now() - ingest.firstSegmentAt : 0;
-        console.log(`[LIVE SERVE] id=${reqId} channel="${label}" key=${ingest.shortKey} segs=${segCount} warmup=${warmupMs}ms ingestAge=${ageMs}ms client=${client} time=${Date.now() - started}ms`);
+        const bufSec = playlistDurationSeconds(raw).toFixed(0);
+        console.log(`[LIVE SERVE] id=${reqId} channel="${label}" key=${ingest.shortKey} segs=${segCount} buffer=${bufSec}s warmup=${warmupMs}ms client=${client} time=${Date.now() - started}ms`);
     } catch (err) {
         console.error(`[LIVE ERROR] id=${reqId} channel="${label}" cid=${cid} reason=${err.message}`);
         if (!res.headersSent) res.status(502).type("text/plain").send("#EXTM3U\n");
@@ -2091,7 +2174,8 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`🌐 http://0.0.0.0:${PORT}`);
     console.log(`📦 Node ${process.version}`);
     console.log(`🎬 playback=${PLAYBACK_MODE} engine=ffmpeg(-c copy) bin=${FFMPEG_BIN}`);
-    console.log(`🎥 ingest seg=${INGEST_SEGMENT_SECONDS}s window=${INGEST_WINDOW_SEGMENTS} liveOffset=${INGEST_LIVE_OFFSET_SECONDS}s idle=${INGEST_IDLE_TIMEOUT_MS / 1000}s firstSegTimeout=${INGEST_FIRST_SEGMENT_TIMEOUT_MS / 1000}s preflight=${INGEST_PREFLIGHT ? 1 : 0} root=${INGEST_ROOT}`);
+    console.log(`🎥 ingest seg=${INGEST_SEGMENT_SECONDS}s window=${INGEST_WINDOW_SEGMENTS} cushion=${INGEST_LIVE_OFFSET_SECONDS}s prebuffer=${INGEST_PREBUFFER_SECONDS}s maxConcurrent=${INGEST_MAX_CONCURRENT} idle=${INGEST_IDLE_TIMEOUT_MS / 1000}s firstSegTimeout=${INGEST_FIRST_SEGMENT_TIMEOUT_MS / 1000}s preflight=${INGEST_PREFLIGHT ? 1 : 0}`);
+    console.log(`🔁 ingest respawn backoff=${INGEST_RESTART_BACKOFF_MS}-${INGEST_RESTART_BACKOFF_MAX_MS}ms forbidden=${INGEST_FORBIDDEN_BACKOFF_MS}ms healthyRun=${INGEST_HEALTHY_RUN_MS / 1000}s maxRestarts=${INGEST_MAX_RESTARTS} httpRetry=${INGEST_HTTP_RETRY_CODES}`);
     console.log(`🔌 upstream keepAlive=1 sockets=${UPSTREAM_KEEPALIVE_MAX_SOCKETS} free=${UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS} ms=${UPSTREAM_KEEPALIVE_MS}`);
     console.log(`🩺 playback telemetry=1 ttl=${PLAYBACK_ACTIVITY_TTL_MS / 1000}s max=${PLAYBACK_ACTIVITY_MAX}`);
     console.log(`📋 playlist retryWindow=${PLAYLIST_RETRY_WINDOW_MS / 1000}s delay=${PLAYLIST_RETRY_DELAY_MS / 1000}s`);
