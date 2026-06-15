@@ -116,7 +116,7 @@ const INGEST_WINDOW_SEGMENTS = Math.max(6, Number(process.env.INGEST_WINDOW_SEGM
 // Live cushion: the player is told (via EXT-X-START) to sit this many seconds
 // behind the ingest edge, and we prebuffer at least this much before the first
 // serve, so the player has real runway to absorb upstream stalls / weak wifi.
-const INGEST_LIVE_OFFSET_SECONDS = Math.max(0, Number(process.env.INGEST_LIVE_OFFSET_SECONDS || 20));
+const INGEST_LIVE_OFFSET_SECONDS = Math.max(0, Number(process.env.INGEST_LIVE_OFFSET_SECONDS || 15));
 const INGEST_PREBUFFER_SECONDS = Math.max(0, Number(process.env.INGEST_PREBUFFER_SECONDS ?? INGEST_LIVE_OFFSET_SECONDS));
 const INGEST_IDLE_TIMEOUT_MS = Math.max(10000, Number(process.env.INGEST_IDLE_TIMEOUT_MS || 45000));
 const INGEST_FIRST_SEGMENT_TIMEOUT_MS = Math.max(5000, Number(process.env.INGEST_FIRST_SEGMENT_TIMEOUT_MS || 30000));
