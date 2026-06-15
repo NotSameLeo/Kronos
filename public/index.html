@@ -1442,6 +1442,18 @@
             resultSection.classList.add('is-visible');
         }
 
+        async function rememberPreloadConfig(token, config) {
+            try {
+                await fetch('/api/preload-config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ token, config })
+                });
+            } catch (err) {
+                // Il link resta valido anche se il salvataggio preload fallisce.
+            }
+        }
+
         function applyConfig(config, token = '') {
             const lists = getListsFromConfig(config);
             playlistList.innerHTML = '';
@@ -1531,6 +1543,7 @@
 
             const base64Config = toBase64Url(JSON.stringify(config));
             currentManifestUrl = `${window.location.origin}/${base64Config}/manifest.json`;
+            rememberPreloadConfig(base64Config, config);
 
             stremioLink.href = getStremioInstallUrl(currentManifestUrl);
             stremioLink.textContent = 'Installa in Stremio';

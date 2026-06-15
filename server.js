@@ -5,6 +5,7 @@ const zlib = require("zlib");
 const { Readable } = require("stream");
 const http = require("http");
 const https = require("https");
+const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
@@ -50,7 +51,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "3.3.19";
+const RELEASE_VERSION = "3.3.20";
 const ADDON_TYPE = "tv";
 const PLAYBACK_MODE = "uhf-direct-relay";
 const CATALOG_TTL = 30 * 60 * 1000;
@@ -65,6 +66,7 @@ const EPG_PRELOAD_URL = String(process.env.EPG_PRELOAD_URL || DEFAULT_EPG_PRELOA
 const EPG_PRELOAD_URLS = parseUrlList(process.env.EPG_PRELOAD_URLS || EPG_PRELOAD_URL);
 const EPG_STARTUP_WATCH_MS = Number(process.env.EPG_STARTUP_WATCH_MS || 30000);
 const CATALOG_PRELOAD_CONFIGS = parseCatalogPreloadConfigs(process.env.CATALOG_PRELOAD_CONFIGS || process.env.KRONOS_PRELOAD_CONFIGS || "");
+const FRONTEND_PRELOAD_FILE = String(process.env.FRONTEND_PRELOAD_FILE || "").trim();
 const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 15000);
 const HLS_UPSTREAM_RETRIES = Math.max(0, Number(process.env.HLS_UPSTREAM_RETRIES || 2));
 const HLS_UPSTREAM_RETRY_DELAY_MS = Math.max(0, Number(process.env.HLS_UPSTREAM_RETRY_DELAY_MS || 1000));
@@ -155,11 +157,58 @@ function decodeConfig(configKey) {
     }
 }
 
+function encodeConfig(config) {
+    return Buffer.from(JSON.stringify(config), "utf8").toString("base64url");
+}
+
 function parseCatalogPreloadConfigs(raw) {
     return String(raw || "")
         .split(/[,\s]+/)
         .map(extractConfigKey)
         .filter(Boolean);
+}
+
+function readFrontendPreloadConfigKey() {
+    if (!FRONTEND_PRELOAD_FILE) return "";
+    try {
+        const payload = JSON.parse(fs.readFileSync(FRONTEND_PRELOAD_FILE, "utf8"));
+        const configKey = extractConfigKey(payload.configKey || payload.manifestUrl || "");
+        if (!configKey) return "";
+        decodeConfig(configKey);
+        return configKey;
+    } catch (err) {
+        if (err?.code !== "ENOENT") console.warn(`[FRONTEND PRELOAD READ] ${err.message}`);
+        return "";
+    }
+}
+
+function saveFrontendPreloadConfig(configKey, config, reason = "frontend") {
+    if (!FRONTEND_PRELOAD_FILE || !configKey) return false;
+    const lists = getConfiguredLists(config);
+    if (!lists.length) return false;
+    const payload = {
+        configKey,
+        savedAt: new Date().toISOString(),
+        reason,
+        lists: lists.map(list => ({ name: list.name, url: list.url }))
+    };
+    try {
+        fs.mkdirSync(path.dirname(FRONTEND_PRELOAD_FILE), { recursive: true });
+        const tmp = `${FRONTEND_PRELOAD_FILE}.tmp`;
+        fs.writeFileSync(tmp, JSON.stringify(payload, null, 2));
+        fs.renameSync(tmp, FRONTEND_PRELOAD_FILE);
+        console.log(`[FRONTEND PRELOAD SAVE] reason=${reason} lists=${lists.length} config=${hashKey(configKey)}`);
+        return true;
+    } catch (err) {
+        console.warn(`[FRONTEND PRELOAD SAVE ERROR] ${err.message}`);
+        return false;
+    }
+}
+
+function getStartupPreloadConfigs() {
+    const frontendConfig = readFrontendPreloadConfigKey();
+    if (frontendConfig) return { source: "frontend", configs: [frontendConfig] };
+    return { source: "env", configs: CATALOG_PRELOAD_CONFIGS };
 }
 
 function parseUrlList(raw) {
@@ -398,9 +447,10 @@ function startEPGStartupPreload() {
 }
 
 function startCatalogStartupPreload() {
-    if (!CATALOG_PRELOAD_CONFIGS.length) return;
-    console.log(`[CATALOG PRELOAD] configs=${CATALOG_PRELOAD_CONFIGS.length}`);
-    CATALOG_PRELOAD_CONFIGS.forEach(configKey => {
+    const preload = getStartupPreloadConfigs();
+    if (!preload.configs.length) return;
+    console.log(`[CATALOG PRELOAD] source=${preload.source} configs=${preload.configs.length}`);
+    preload.configs.forEach(configKey => {
         try {
             const config = decodeConfig(configKey);
             fetchAndProcessChannels(configKey, config)
@@ -1610,6 +1660,7 @@ app.get("/:base64Config/manifest.json", async (req, res) => {
     try {
         const configKey = req.params.base64Config;
         const config = decodeConfig(configKey);
+        saveFrontendPreloadConfig(configKey, config, "manifest");
         const channels = await getChannelsFromCache(configKey, config);
         const host = getPublicHost(req);
 
@@ -1643,6 +1694,21 @@ app.get("/:base64Config/manifest.json", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // Configurator API (used by public/index.html)
 // ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/preload-config", async (req, res) => {
+    try {
+        const configKey = extractConfigKey(req.body.token || req.body.configKey || req.body.manifestUrl || "");
+        const config = req.body.config || (configKey ? decodeConfig(configKey) : null);
+        if (!config || typeof config !== "object") throw new Error("Missing config");
+        const effectiveKey = configKey || encodeConfig(config);
+        decodeConfig(effectiveKey);
+        const saved = saveFrontendPreloadConfig(effectiveKey, config, "frontend");
+        fetchAndProcessChannels(effectiveKey, config).catch(err => console.error("[FRONTEND PRELOAD WARM]", err.message));
+        res.json({ ok: true, saved });
+    } catch (err) {
+        res.status(400).json({ ok: false, error: "Configurazione non valida" });
+    }
+});
+
 app.post("/api/analyze-link", async (req, res) => {
     try {
         const data = await fetchPlaylist(req.body.url);
