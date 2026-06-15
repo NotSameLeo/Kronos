@@ -50,7 +50,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "3.3.17";
+const RELEASE_VERSION = "3.3.18";
 const ADDON_TYPE = "tv";
 const PLAYBACK_MODE = "uhf-direct-relay";
 const CATALOG_TTL = 30 * 60 * 1000;
@@ -1203,6 +1203,7 @@ async function fetchPlayableHLS(sourceUrl, label = "stream", signal = null) {
     if (!needsLiveWarmup(result.info) || HLS_LIVE_WARMUP_WAIT_MS <= 0) return { ...result, warmupMs: 0, warmupPolls: 0 };
 
     let polls = 0;
+    let lastWarmupErr = null;
     console.warn(`[HLS WARMUP] channel="${label}" media=${result.info.segmentCount}/${HLS_LIVE_MIN_SEGMENTS} seq=${result.info.mediaSequence ?? "n/a"} target=${result.info.targetDuration ?? "n/a"}`);
     while (!signal?.aborted && Date.now() - started < HLS_LIVE_WARMUP_WAIT_MS) {
         polls++;
@@ -1212,6 +1213,11 @@ async function fetchPlayableHLS(sourceUrl, label = "stream", signal = null) {
         } catch (err) {
             const stale = getStaleHLS(sourceUrl, label, err, Date.now() - started, polls);
             if (stale) return stale;
+            if (isColdStartHlsRetryable(err) && Date.now() - started < HLS_LIVE_WARMUP_WAIT_MS) {
+                lastWarmupErr = err;
+                console.warn(`[HLS WARMUP RETRY] channel="${label}" poll=${polls} status=${getErrorStatus(err) || err?.code || "n/a"} reason=${err.message}`);
+                continue;
+            }
             throw err;
         }
         if (!needsLiveWarmup(result.info)) {
@@ -1221,7 +1227,7 @@ async function fetchPlayableHLS(sourceUrl, label = "stream", signal = null) {
         }
     }
 
-    console.warn(`[HLS WARMUP GIVEUP] channel="${label}" media=${result.info.segmentCount}/${HLS_LIVE_MIN_SEGMENTS} seq=${result.info.mediaSequence ?? "n/a"} wait=${Date.now() - started}ms polls=${polls}`);
+    console.warn(`[HLS WARMUP GIVEUP] channel="${label}" media=${result.info.segmentCount}/${HLS_LIVE_MIN_SEGMENTS} seq=${result.info.mediaSequence ?? "n/a"} wait=${Date.now() - started}ms polls=${polls} lastError=${lastWarmupErr?.message || "n/a"}`);
     return { ...result, warmupMs: Date.now() - started, warmupPolls: polls };
 }
 
