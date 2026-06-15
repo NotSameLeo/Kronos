@@ -116,10 +116,10 @@ const INGEST_WINDOW_SEGMENTS = Math.max(6, Number(process.env.INGEST_WINDOW_SEGM
 // Live cushion: the player is told (via EXT-X-START) to sit this many seconds
 // behind the ingest edge, and we prebuffer at least this much before the first
 // serve, so the player has real runway to absorb upstream stalls / weak wifi.
-const INGEST_LIVE_OFFSET_SECONDS = Math.max(0, Number(process.env.INGEST_LIVE_OFFSET_SECONDS || 15));
+const INGEST_LIVE_OFFSET_SECONDS = Math.max(0, Number(process.env.INGEST_LIVE_OFFSET_SECONDS || 12));
 const INGEST_PREBUFFER_SECONDS = Math.max(0, Number(process.env.INGEST_PREBUFFER_SECONDS ?? INGEST_LIVE_OFFSET_SECONDS));
 const INGEST_IDLE_TIMEOUT_MS = Math.max(10000, Number(process.env.INGEST_IDLE_TIMEOUT_MS || 45000));
-const INGEST_FIRST_SEGMENT_TIMEOUT_MS = Math.max(5000, Number(process.env.INGEST_FIRST_SEGMENT_TIMEOUT_MS || 30000));
+const INGEST_FIRST_SEGMENT_TIMEOUT_MS = Math.max(5000, Number(process.env.INGEST_FIRST_SEGMENT_TIMEOUT_MS || 25000));
 const INGEST_REAP_INTERVAL_MS = Math.max(5000, Number(process.env.INGEST_REAP_INTERVAL_MS || 10000));
 const INGEST_RECONNECT_DELAY_MAX = Math.max(1, Number(process.env.INGEST_RECONNECT_DELAY_MAX || 5));
 const INGEST_READ_TIMEOUT_US = Math.max(1000000, Number(process.env.INGEST_READ_TIMEOUT_US || 15000000));
@@ -130,17 +130,19 @@ const INGEST_MAX_CONCURRENT = Math.max(1, Number(process.env.INGEST_MAX_CONCURRE
 // ffmpeg sometimes exits on a transient upstream blip ("Failed to reload
 // playlist"). Respawn while the channel is still wanted, with backoff, and a
 // longer backoff on 403 so we never hammer the upstream into a temp ban.
-// Respawn quickly on a transient exit. The upstream frees its single connection
-// slot a few seconds after the previous channel disconnects, so a fast fixed
-// retry reconnects as soon as the slot is free (instead of a slow escalating
-// backoff that would blow the manifest timeout on a zap).
-const INGEST_RESPAWN_DELAY_MS = Math.max(500, Number(process.env.INGEST_RESPAWN_DELAY_MS || 2500));
+// Respawn after a transient exit. On a 403 the upstream is briefly refusing a
+// new connection (its single slot from the previous channel hasn't been freed):
+// retry GENTLY so we don't keep its anti-abuse lock alive (hammering livelocks
+// it). On other errors retry fast. Keep retrying while the channel is wanted —
+// the idle reaper stops it once nobody is watching.
+const INGEST_RESPAWN_DELAY_MS = Math.max(500, Number(process.env.INGEST_RESPAWN_DELAY_MS || 2000));
+const INGEST_FORBIDDEN_RESPAWN_DELAY_MS = Math.max(2000, Number(process.env.INGEST_FORBIDDEN_RESPAWN_DELAY_MS || 5000));
 // When zapping, wait for the previous channel's ffmpeg to fully close before
 // connecting the new one, to minimise the upstream connection-limit 403.
 const INGEST_DRAIN_TIMEOUT_MS = Math.max(500, Number(process.env.INGEST_DRAIN_TIMEOUT_MS || 4000));
-const INGEST_DRAIN_GRACE_MS = Math.max(0, Number(process.env.INGEST_DRAIN_GRACE_MS || 1500));
+const INGEST_DRAIN_GRACE_MS = Math.max(0, Number(process.env.INGEST_DRAIN_GRACE_MS || 3000));
 const INGEST_HEALTHY_RUN_MS = Math.max(5000, Number(process.env.INGEST_HEALTHY_RUN_MS || 25000));
-const INGEST_MAX_RESTARTS = Math.max(1, Number(process.env.INGEST_MAX_RESTARTS || 12));
+const INGEST_MAX_RESTARTS = Math.max(1, Number(process.env.INGEST_MAX_RESTARTS || 100));
 const INGEST_HTTP_RETRY_CODES = String(process.env.INGEST_HTTP_RETRY_CODES || "429,500,502,503,504,520,521,522,524");
 const INGEST_PREFLIGHT = String(process.env.INGEST_PREFLIGHT ?? "0") !== "0";
 
@@ -1362,7 +1364,7 @@ function scheduleRespawn(ingest, ranMs, tail) {
     }
 
     const forbidden = /403|Forbidden|access denied/i.test(tail);
-    const delay = INGEST_RESPAWN_DELAY_MS;
+    const delay = forbidden ? INGEST_FORBIDDEN_RESPAWN_DELAY_MS : INGEST_RESPAWN_DELAY_MS;
     ingest.restarts++;
     console.log(`[INGEST RESPAWN] channel="${ingest.label}" key=${ingest.shortKey} in=${delay}ms failures=${ingest.failures} forbidden=${forbidden ? 1 : 0}`);
     ingest.respawnTimer = setTimeout(() => {
@@ -1683,7 +1685,7 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`📦 Node ${process.version}`);
     console.log(`🎬 playback=${PLAYBACK_MODE} engine=ffmpeg(-c copy) bin=${FFMPEG_BIN}`);
     console.log(`🎥 ingest seg=${INGEST_SEGMENT_SECONDS}s window=${INGEST_WINDOW_SEGMENTS} cushion=${INGEST_LIVE_OFFSET_SECONDS}s prebuffer=${INGEST_PREBUFFER_SECONDS}s maxConcurrent=${INGEST_MAX_CONCURRENT} idle=${INGEST_IDLE_TIMEOUT_MS / 1000}s firstSegTimeout=${INGEST_FIRST_SEGMENT_TIMEOUT_MS / 1000}s preflight=${INGEST_PREFLIGHT ? 1 : 0}`);
-    console.log(`🔁 ingest respawn=${INGEST_RESPAWN_DELAY_MS}ms drain=${INGEST_DRAIN_GRACE_MS}ms healthyRun=${INGEST_HEALTHY_RUN_MS / 1000}s maxRestarts=${INGEST_MAX_RESTARTS} httpRetry=${INGEST_HTTP_RETRY_CODES}`);
+    console.log(`🔁 ingest respawn=${INGEST_RESPAWN_DELAY_MS}ms forbidden=${INGEST_FORBIDDEN_RESPAWN_DELAY_MS}ms drain=${INGEST_DRAIN_GRACE_MS}ms healthyRun=${INGEST_HEALTHY_RUN_MS / 1000}s maxRestarts=${INGEST_MAX_RESTARTS} httpRetry=${INGEST_HTTP_RETRY_CODES}`);
     console.log(`🔌 upstream keepAlive=1 sockets=${UPSTREAM_KEEPALIVE_MAX_SOCKETS} free=${UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS} ms=${UPSTREAM_KEEPALIVE_MS}`);
     console.log(`🩺 playback telemetry=1 ttl=${PLAYBACK_ACTIVITY_TTL_MS / 1000}s max=${PLAYBACK_ACTIVITY_MAX}`);
     console.log(`📋 playlist retryWindow=${PLAYLIST_RETRY_WINDOW_MS / 1000}s delay=${PLAYLIST_RETRY_DELAY_MS / 1000}s`);
