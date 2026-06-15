@@ -56,6 +56,9 @@ const RELEASE_VERSION = "4.0.0";
 const ADDON_TYPE = "tv";
 const PLAYBACK_MODE = "ffmpeg-restream";
 const CATALOG_TTL = 30 * 60 * 1000;
+// Periodically re-fetch the preloaded (frontend) playlist so the catalog stays
+// warm even with no requests, and so frontend changes are picked up. 0 disables.
+const CATALOG_REFRESH_INTERVAL_MS = Math.max(0, Number(process.env.CATALOG_REFRESH_INTERVAL_MS || CATALOG_TTL));
 const EPG_CACHE_TTL = Number(process.env.EPG_CACHE_TTL || 6 * 60 * 60 * 1000);
 const EPG_REQUEST_TIMEOUT = Number(process.env.EPG_REQUEST_TIMEOUT || 20000);
 const EPG_MAX_BYTES = Number(process.env.EPG_MAX_BYTES || 160 * 1024 * 1024);
@@ -68,6 +71,17 @@ const EPG_PRELOAD_URLS = parseUrlList(process.env.EPG_PRELOAD_URLS || EPG_PRELOA
 const EPG_STARTUP_WATCH_MS = Number(process.env.EPG_STARTUP_WATCH_MS || 30000);
 const CATALOG_PRELOAD_CONFIGS = parseCatalogPreloadConfigs(process.env.CATALOG_PRELOAD_CONFIGS || process.env.KRONOS_PRELOAD_CONFIGS || "");
 const FRONTEND_PRELOAD_FILE = String(process.env.FRONTEND_PRELOAD_FILE || "").trim();
+// Denylist of upstream playlists (substring match on the URL, e.g. an old host).
+// Blocked playlists are filtered out everywhere — never fetched, never saved as
+// the frontend preload, never shown — so a stale client that still references an
+// old playlist can't resurrect it. Set via KRONOS_BLOCKED_PLAYLISTS (comma/space).
+const BLOCKED_PLAYLISTS = String(process.env.KRONOS_BLOCKED_PLAYLISTS || "")
+    .split(/[\s,]+/).map(s => s.trim().toLowerCase()).filter(Boolean);
+function isBlockedPlaylist(url) {
+    if (!url || !BLOCKED_PLAYLISTS.length) return false;
+    const u = String(url).toLowerCase();
+    return BLOCKED_PLAYLISTS.some(b => u.includes(b));
+}
 const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 15000);
 const HLS_UPSTREAM_RETRIES = Math.max(0, Number(process.env.HLS_UPSTREAM_RETRIES || 2));
 const HLS_UPSTREAM_RETRY_DELAY_MS = Math.max(0, Number(process.env.HLS_UPSTREAM_RETRY_DELAY_MS || 1000));
@@ -113,11 +127,16 @@ const FFMPEG_BIN = process.env.FFMPEG_BIN || "ffmpeg";
 const INGEST_ROOT = process.env.INGEST_ROOT || "/tmp/kronos-ingest";
 const INGEST_SEGMENT_SECONDS = Math.max(1, Number(process.env.INGEST_SEGMENT_SECONDS || 4));
 const INGEST_WINDOW_SEGMENTS = Math.max(6, Number(process.env.INGEST_WINDOW_SEGMENTS || 36));
-// Live cushion: the player is told (via EXT-X-START) to sit this many seconds
-// behind the ingest edge, and we prebuffer at least this much before the first
-// serve, so the player has real runway to absorb upstream stalls / weak wifi.
-const INGEST_LIVE_OFFSET_SECONDS = Math.max(0, Number(process.env.INGEST_LIVE_OFFSET_SECONDS || 12));
-const INGEST_PREBUFFER_SECONDS = Math.max(0, Number(process.env.INGEST_PREBUFFER_SECONDS ?? INGEST_LIVE_OFFSET_SECONDS));
+// Live cushion: the served edge is held this many seconds behind ffmpeg's real
+// edge. This local reserve absorbs ffmpeg bursts (it grows) and stalls (it
+// shrinks) so the player timeline stays smooth and never starves on a short
+// upstream hiccup. We also prebuffer at least this much before the first serve.
+const INGEST_LIVE_OFFSET_SECONDS = Math.max(0, Number(process.env.INGEST_LIVE_OFFSET_SECONDS || 20));
+const INGEST_PREBUFFER_SECONDS = Math.max(0, Number(process.env.INGEST_PREBUFFER_SECONDS ?? (INGEST_LIVE_OFFSET_SECONDS + 6)));
+// How many segments to list in the served playlist (a sliding DVR window) and
+// the max reserve before we force a catch-up (bounds latency; rarely hit).
+const INGEST_VISIBLE_SEGMENTS = Math.max(4, Number(process.env.INGEST_VISIBLE_SEGMENTS || 20));
+const INGEST_MAX_RESERVE_SECONDS = Math.max(INGEST_LIVE_OFFSET_SECONDS + 10, Number(process.env.INGEST_MAX_RESERVE_SECONDS || 45));
 const INGEST_IDLE_TIMEOUT_MS = Math.max(10000, Number(process.env.INGEST_IDLE_TIMEOUT_MS || 45000));
 const INGEST_FIRST_SEGMENT_TIMEOUT_MS = Math.max(5000, Number(process.env.INGEST_FIRST_SEGMENT_TIMEOUT_MS || 25000));
 const INGEST_REAP_INTERVAL_MS = Math.max(5000, Number(process.env.INGEST_REAP_INTERVAL_MS || 10000));
@@ -438,6 +457,28 @@ function startCatalogStartupPreload() {
             console.error(`[CATALOG PRELOAD ERROR] invalid config: ${err.message}`);
         }
     });
+}
+
+// Keep the preloaded (frontend) catalog warm: re-fetch it on a timer, independent
+// of incoming requests, and re-read the frontend config each time so a playlist
+// changed on the website is picked up automatically.
+function startCatalogPeriodicRefresh() {
+    if (CATALOG_REFRESH_INTERVAL_MS <= 0) return;
+    console.log(`[CATALOG REFRESH SCHEDULED] interval=${CATALOG_REFRESH_INTERVAL_MS / 1000}s`);
+    const timer = setInterval(() => {
+        const preload = getStartupPreloadConfigs();
+        preload.configs.forEach(configKey => {
+            try {
+                const config = decodeConfig(configKey);
+                fetchAndProcessChannels(configKey, config, { force: true })
+                    .then(channels => console.log(`[CATALOG REFRESH OK] channels=${channels.length}`))
+                    .catch(err => console.error(`[CATALOG REFRESH] ${err.message}`));
+            } catch (err) {
+                console.error(`[CATALOG REFRESH] invalid config: ${err.message}`);
+            }
+        });
+    }, CATALOG_REFRESH_INTERVAL_MS);
+    timer.unref?.();
 }
 
 function attachEPGToChannels(channels, epgData) {
@@ -778,15 +819,19 @@ function getConfiguredLists(config) {
                 name: String(list.n || `Lista ${i + 1}`).trim() || `Lista ${i + 1}`,
                 url: String(list.u || "").trim()
             }))
-            .filter(l => l.url);
+            .filter(l => l.url && !isBlockedPlaylist(l.url));
     }
     return [{
         name: String(config.ln || "Canali TV").trim() || "Canali TV",
         url: String(config.u || "").trim()
-    }].filter(l => l.url);
+    }].filter(l => l.url && !isBlockedPlaylist(l.url));
 }
 
 async function fetchPlaylist(sourceUrl, options = {}) {
+    if (isBlockedPlaylist(sourceUrl)) {
+        console.warn("[PLAYLIST BLOCKED]", sourceUrl);
+        throw new Error("Playlist is blocked");
+    }
     console.log("[FETCH PLAYLIST]", sourceUrl);
     const deadline = Date.now() + (options.retryWindow || PLAYLIST_RETRY_WINDOW_MS);
     let attempt = 0;
@@ -1278,7 +1323,7 @@ function ingestIndexPath(ingest) {
     return path.join(ingest.dir, "index.m3u8");
 }
 
-function ffmpegArgs(url, dir) {
+function ffmpegArgs(url, dir, startNumber = 0) {
     return [
         "-nostdin", "-hide_banner", "-loglevel", "warning",
         "-user_agent", UPSTREAM_UA,
@@ -1300,6 +1345,7 @@ function ffmpegArgs(url, dir) {
         "-hls_flags", "delete_segments+omit_endlist+independent_segments+temp_file",
         "-hls_segment_type", "mpegts",
         "-hls_allow_cache", "0",
+        "-start_number", String(startNumber),
         "-hls_segment_filename", path.join(dir, "seg_%05d.ts"),
         path.join(dir, "index.m3u8")
     ];
@@ -1307,24 +1353,52 @@ function ffmpegArgs(url, dir) {
 
 function spawnIngest(ingest) {
     const dir = ingest.dir;
+    // Cancel any pending respawn so we never end up with two ffmpeg (two upstream
+    // connections) for the same channel.
+    if (ingest.respawnTimer) { clearTimeout(ingest.respawnTimer); ingest.respawnTimer = null; }
+    if (ingest.proc && !ingest.exited) return; // already running
     try { fs.mkdirSync(dir, { recursive: true }); } catch {}
-    // Clear leftovers so ffmpeg starts a fresh, monotonic sequence.
-    try {
-        for (const f of fs.readdirSync(dir)) {
-            if (f === "index.m3u8" || /^seg_\d+\.ts/.test(f) || f.endsWith(".tmp")) {
-                try { fs.unlinkSync(path.join(dir, f)); } catch {}
-            }
-        }
-    } catch {}
 
-    const proc = spawn(FFMPEG_BIN, ffmpegArgs(ingest.url, dir), { stdio: ["ignore", "ignore", "pipe"] });
+    // Seamless if we've produced segments before (regardless of whether the
+    // respawn was triggered by the backoff timer or by a fresh request).
+    const respawn = (ingest.lastSegNumber || 0) > 0;
+    let startNumber = 0;
+    if (respawn) {
+        // Seamless respawn: continue segment numbering forward (no backward
+        // MEDIA-SEQUENCE reset) and KEEP the existing reserve files on disk so the
+        // player keeps playing through the ~few-second restart. A small index gap
+        // marks a discontinuity in the served playlist. Base the new number on the
+        // highest file actually on disk to avoid colliding with straggler segments.
+        let maxIdx = ingest.lastSegNumber || 0;
+        try {
+            for (const f of fs.readdirSync(dir)) {
+                const m = f.match(/^seg_(\d+)\.ts$/);
+                if (m) maxIdx = Math.max(maxIdx, parseInt(m[1], 10));
+            }
+        } catch {}
+        startNumber = maxIdx + 5;
+    } else {
+        // First start: clean slate.
+        try {
+            for (const f of fs.readdirSync(dir)) {
+                if (f === "index.m3u8" || /^seg_\d+\.ts/.test(f) || f.endsWith(".tmp")) {
+                    try { fs.unlinkSync(path.join(dir, f)); } catch {}
+                }
+            }
+        } catch {}
+        ingest.served = false; // first start -> prebuffer the cushion before serving
+        ingest.pace = null;
+        ingest.segDur = new Map();
+        ingest.lastSegNumber = 0;
+    }
+
+    const proc = spawn(FFMPEG_BIN, ffmpegArgs(ingest.url, dir, startNumber), { stdio: ["ignore", "ignore", "pipe"] });
     ingest.proc = proc;
     ingest.pid = proc.pid;
     ingest.startedAt = Date.now();
     ingest.firstSegmentAt = 0;
     ingest.exited = false;
     ingest.stopping = false;
-    ingest.served = false; // fresh process -> re-prebuffer the cushion before serving
     ingest.stderrTail = "";
 
     proc.stderr.on("data", chunk => {
@@ -1368,7 +1442,9 @@ function scheduleRespawn(ingest, ranMs, tail) {
     ingest.restarts++;
     console.log(`[INGEST RESPAWN] channel="${ingest.label}" key=${ingest.shortKey} in=${delay}ms failures=${ingest.failures} forbidden=${forbidden ? 1 : 0}`);
     ingest.respawnTimer = setTimeout(() => {
+        ingest.respawnTimer = null;
         if (!ingests.has(ingest.key)) return;
+        if (ingest.proc && !ingest.exited) return; // already respawned (e.g. by a request)
         if (Date.now() - ingest.lastAccess > INGEST_IDLE_TIMEOUT_MS) { stopIngest(ingest, "idle before respawn"); return; }
         spawnIngest(ingest);
     }, delay);
@@ -1456,31 +1532,116 @@ async function waitForPrebuffer(ingest, targetSeconds, timeoutMs) {
     return raw; // serve whatever we managed to buffer
 }
 
-// Inject a live-edge cushion (EXT-X-START + SERVER-CONTROL) so the player sits
-// INGEST_LIVE_OFFSET_SECONDS behind the ingest edge and buffers that runway
-// forward. Segment URIs stay relative -> resolved against our segment route.
-function buildServedPlaylist(rawPlaylist) {
-    if (!INGEST_LIVE_OFFSET_SECONDS) return rawPlaylist;
-    const tags = [
-        `#EXT-X-SERVER-CONTROL:HOLD-BACK=${INGEST_LIVE_OFFSET_SECONDS}`,
-        `#EXT-X-START:TIME-OFFSET=-${INGEST_LIVE_OFFSET_SECONDS},PRECISE=YES`
-    ];
-    const lines = rawPlaylist.split(/\r?\n/);
-    const out = [];
-    let injected = false;
-    for (const line of lines) {
-        out.push(line);
-        if (!injected && /^#EXT-X-MEDIA-SEQUENCE:/i.test(line)) {
-            out.push(...tags);
-            injected = true;
+// Record each segment's real duration from ffmpeg's index into a per-ingest
+// registry, so we keep accurate durations even across ffmpeg respawns (whose
+// fresh index only lists the new run's segments).
+function refreshSegDurations(ingest) {
+    if (!ingest.segDur) ingest.segDur = new Map();
+    let raw;
+    try { raw = fs.readFileSync(ingestIndexPath(ingest), "utf8"); } catch { return; }
+    let dur = INGEST_SEGMENT_SECONDS;
+    for (const line of raw.split(/\r?\n/)) {
+        const m = line.match(/^#EXTINF:([0-9.]+)/);
+        if (m) { dur = parseFloat(m[1]) || INGEST_SEGMENT_SECONDS; continue; }
+        const s = line.match(/^seg_(\d+)\.ts/);
+        if (s) { const idx = parseInt(s[1], 10); ingest.segDur.set(idx, dur); if (idx > (ingest.lastSegNumber || 0)) ingest.lastSegNumber = idx; dur = INGEST_SEGMENT_SECONDS; }
+    }
+}
+
+// List the actual segment files on disk (survives ffmpeg respawns), newest last.
+function listSegFiles(ingest) {
+    let files;
+    try { files = fs.readdirSync(ingest.dir); } catch { return []; }
+    const segs = [];
+    for (const f of files) {
+        const m = f.match(/^seg_(\d+)\.ts$/);
+        if (m) { const idx = parseInt(m[1], 10); segs.push({ idx, name: f, dur: (ingest.segDur && ingest.segDur.get(idx)) || INGEST_SEGMENT_SECONDS }); }
+    }
+    segs.sort((a, b) => a.idx - b.idx);
+    return segs;
+}
+
+// Pace the served live edge so it advances at ~real time and NEVER jumps forward,
+// regardless of how bursty ffmpeg's output is, or whether ffmpeg just respawned.
+// ffmpeg produces in bursts (stall, then catch-up) and on a transient upstream
+// error it exits and we respawn it; if we exposed that raw edge the player would
+// skip on the jumps and stall on the gaps. Instead we keep the served edge
+// INGEST_LIVE_OFFSET behind the newest local segment: that reserve grows on
+// bursts and is spent on stalls/respawns, keeping the player's timeline smooth.
+// We read the segment FILES on disk (which survive a respawn) so the reserve is
+// never wiped, and mark any index gap (a respawn boundary) with a DISCONTINUITY.
+function buildPacedPlaylist(ingest) {
+    refreshSegDurations(ingest);
+    const segs = listSegFiles(ingest);
+    if (!segs.length) return null;
+    pruneOldSegFiles(ingest, segs);
+
+    const lastPos = segs.length - 1;
+    const realEdge = segs[lastPos].idx;
+    const durAt = p => (segs[p]?.dur || INGEST_SEGMENT_SECONDS);
+    const reserveFromPos = p => { let s = 0; for (let i = p + 1; i <= lastPos; i++) s += durAt(i); return s; };
+    const posBehind = seconds => { let acc = 0, p = lastPos; while (p > 0 && acc < seconds) { acc += durAt(p); p--; } return p; };
+
+    // Resolve our current edge (stored as an absolute segment index) to a position.
+    let curPos;
+    if (ingest.pace == null) curPos = posBehind(INGEST_LIVE_OFFSET_SECONDS);
+    else {
+        curPos = segs.findIndex(s => s.idx >= ingest.pace.edgeIdx);
+        if (curPos < 0) curPos = lastPos;
+    }
+
+    const now = Date.now();
+    let jumped = false;
+    if (ingest.pace == null) {
+        ingest.pace = { edgeIdx: segs[curPos].idx, at: now };
+    } else if (reserveFromPos(curPos) > INGEST_MAX_RESERVE_SECONDS) {
+        curPos = posBehind(INGEST_LIVE_OFFSET_SECONDS); // latency too high -> snap back
+        ingest.pace = { edgeIdx: segs[curPos].idx, at: now };
+        jumped = true;
+    } else {
+        let budget = now - ingest.pace.at;
+        let at = ingest.pace.at;
+        while (curPos < lastPos) {
+            const dms = durAt(curPos + 1) * 1000;
+            if (budget >= dms) { curPos++; budget -= dms; at += dms; } else break;
         }
+        ingest.pace = { edgeIdx: segs[curPos].idx, at };
     }
-    if (!injected) {
-        const idx = out.findIndex(l => /^#EXTM3U/i.test(l));
-        if (idx >= 0) out.splice(idx + 1, 0, ...tags);
-        else out.unshift(...tags);
+
+    const startPos = Math.max(0, curPos - INGEST_VISIBLE_SEGMENTS + 1);
+    let maxDur = 0;
+    const body = [];
+    for (let p = startPos; p <= curPos; p++) {
+        const s = segs[p];
+        if (p > startPos && s.idx !== segs[p - 1].idx + 1) body.push("#EXT-X-DISCONTINUITY"); // respawn gap
+        if (s.dur > maxDur) maxDur = s.dur;
+        body.push(`#EXTINF:${s.dur.toFixed(3)},`, s.name);
     }
-    return out.join("\n");
+    if (!body.length) return null;
+    const playlist = [
+        "#EXTM3U",
+        "#EXT-X-VERSION:6",
+        `#EXT-X-TARGETDURATION:${Math.max(1, Math.ceil(maxDur || INGEST_SEGMENT_SECONDS))}`,
+        `#EXT-X-MEDIA-SEQUENCE:${segs[startPos].idx}`,
+        "#EXT-X-DISCONTINUITY-SEQUENCE:0",
+        "#EXT-X-INDEPENDENT-SEGMENTS",
+        ...body,
+        ""
+    ].join("\n");
+    return { playlist, shown: curPos - startPos + 1, edge: segs[curPos].idx, realEdge, reserveSec: reserveFromPos(curPos), jumped };
+}
+
+// Delete segment files (and registry entries) well below the served window. Needed
+// because after a respawn the previous run's files are no longer managed by
+// ffmpeg's own delete_segments.
+function pruneOldSegFiles(ingest, segs) {
+    const keep = INGEST_VISIBLE_SEGMENTS + INGEST_WINDOW_SEGMENTS;
+    if (segs.length <= keep) return;
+    const cutoff = segs.length - keep;
+    for (let i = 0; i < cutoff; i++) {
+        try { fs.unlinkSync(path.join(ingest.dir, segs[i].name)); } catch {}
+        if (ingest.segDur) ingest.segDur.delete(segs[i].idx);
+    }
 }
 
 function stopIngest(ingest, reason) {
@@ -1529,27 +1690,28 @@ app.get("/:base64Config/live/:cid/index.m3u8", async (req, res) => {
         const ingest = ensureIngest(ingestKey, ch.url, label);
         ingest.lastAccess = Date.now();
 
-        // Already warmed (steady-state request): serve immediately.
-        let raw = readIngestPlaylist(ingest);
+        // First serve: prebuffer the cushion. Afterwards (incl. across a seamless
+        // respawn) serve straight from the reserve files on disk.
         let warmupMs = 0;
-        const needPrebuffer = !ingest.served || !raw;
-        if (needPrebuffer) {
+        if (!ingest.served) {
             const w0 = Date.now();
-            raw = await waitForPrebuffer(ingest, INGEST_PREBUFFER_SECONDS, INGEST_FIRST_SEGMENT_TIMEOUT_MS);
+            const pre = await waitForPrebuffer(ingest, INGEST_PREBUFFER_SECONDS, INGEST_FIRST_SEGMENT_TIMEOUT_MS);
             warmupMs = Date.now() - w0;
             ingest.lastAccess = Date.now();
+            if (!pre && !listSegFiles(ingest).length) {
+                console.error(`[LIVE TIMEOUT] id=${reqId} channel="${label}" key=${ingest.shortKey} warmup=${warmupMs}ms exited=${ingest.exited ? 1 : 0} tail=${(ingest.stderrTail || "").trim().split("\n").pop() || ""}`);
+                return res.status(504).type("text/plain").send("#EXTM3U\n");
+            }
+            ingest.served = true;
         }
-        if (!raw) {
-            console.error(`[LIVE TIMEOUT] id=${reqId} channel="${label}" key=${ingest.shortKey} warmup=${warmupMs}ms exited=${ingest.exited ? 1 : 0} tail=${(ingest.stderrTail || "").trim().split("\n").pop() || ""}`);
+        const paced = buildPacedPlaylist(ingest);
+        if (!paced) {
+            console.error(`[LIVE EMPTY] id=${reqId} channel="${label}" key=${ingest.shortKey} warmup=${warmupMs}ms`);
             return res.status(504).type("text/plain").send("#EXTM3U\n");
         }
-        ingest.served = true;
-        const served = buildServedPlaylist(raw);
         setPlaylistHeaders(res);
-        res.send(served);
-        const segCount = (raw.match(/seg_\d+\.ts/g) || []).length;
-        const bufSec = playlistDurationSeconds(raw).toFixed(0);
-        console.log(`[LIVE SERVE] id=${reqId} channel="${label}" key=${ingest.shortKey} segs=${segCount} buffer=${bufSec}s warmup=${warmupMs}ms client=${client} time=${Date.now() - started}ms`);
+        res.send(paced.playlist);
+        console.log(`[LIVE SERVE] id=${reqId} channel="${label}" key=${ingest.shortKey} shown=${paced.shown} edge=${paced.edge}/${paced.realEdge} reserve=${paced.reserveSec.toFixed(0)}s${paced.jumped ? " JUMP" : ""} warmup=${warmupMs}ms client=${client} time=${Date.now() - started}ms`);
     } catch (err) {
         console.error(`[LIVE ERROR] id=${reqId} channel="${label}" cid=${cid} reason=${err.message}`);
         if (!res.headersSent) res.status(502).type("text/plain").send("#EXTM3U\n");
@@ -1684,7 +1846,7 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`🌐 http://0.0.0.0:${PORT}`);
     console.log(`📦 Node ${process.version}`);
     console.log(`🎬 playback=${PLAYBACK_MODE} engine=ffmpeg(-c copy) bin=${FFMPEG_BIN}`);
-    console.log(`🎥 ingest seg=${INGEST_SEGMENT_SECONDS}s window=${INGEST_WINDOW_SEGMENTS} cushion=${INGEST_LIVE_OFFSET_SECONDS}s prebuffer=${INGEST_PREBUFFER_SECONDS}s maxConcurrent=${INGEST_MAX_CONCURRENT} idle=${INGEST_IDLE_TIMEOUT_MS / 1000}s firstSegTimeout=${INGEST_FIRST_SEGMENT_TIMEOUT_MS / 1000}s preflight=${INGEST_PREFLIGHT ? 1 : 0}`);
+    console.log(`🎥 ingest seg=${INGEST_SEGMENT_SECONDS}s window=${INGEST_WINDOW_SEGMENTS} cushion=${INGEST_LIVE_OFFSET_SECONDS}s prebuffer=${INGEST_PREBUFFER_SECONDS}s visible=${INGEST_VISIBLE_SEGMENTS} maxReserve=${INGEST_MAX_RESERVE_SECONDS}s paced=1 maxConcurrent=${INGEST_MAX_CONCURRENT} idle=${INGEST_IDLE_TIMEOUT_MS / 1000}s firstSegTimeout=${INGEST_FIRST_SEGMENT_TIMEOUT_MS / 1000}s preflight=${INGEST_PREFLIGHT ? 1 : 0}`);
     console.log(`🔁 ingest respawn=${INGEST_RESPAWN_DELAY_MS}ms forbidden=${INGEST_FORBIDDEN_RESPAWN_DELAY_MS}ms drain=${INGEST_DRAIN_GRACE_MS}ms healthyRun=${INGEST_HEALTHY_RUN_MS / 1000}s maxRestarts=${INGEST_MAX_RESTARTS} httpRetry=${INGEST_HTTP_RETRY_CODES}`);
     console.log(`🔌 upstream keepAlive=1 sockets=${UPSTREAM_KEEPALIVE_MAX_SOCKETS} free=${UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS} ms=${UPSTREAM_KEEPALIVE_MS}`);
     console.log(`🩺 playback telemetry=1 ttl=${PLAYBACK_ACTIVITY_TTL_MS / 1000}s max=${PLAYBACK_ACTIVITY_MAX}`);
@@ -1695,4 +1857,5 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log("=".repeat(60) + "\n");
     startEPGStartupPreload();
     startCatalogStartupPreload();
+    startCatalogPeriodicRefresh();
 });
