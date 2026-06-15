@@ -8,6 +8,7 @@ const https = require("https");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { spawn } = require("child_process");
 
 const app = express();
 const PORT = process.env.PORT || 7000;
@@ -51,9 +52,9 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "3.3.20";
+const RELEASE_VERSION = "4.0.0";
 const ADDON_TYPE = "tv";
-const PLAYBACK_MODE = "uhf-direct-relay";
+const PLAYBACK_MODE = "ffmpeg-restream";
 const CATALOG_TTL = 30 * 60 * 1000;
 const EPG_CACHE_TTL = Number(process.env.EPG_CACHE_TTL || 6 * 60 * 60 * 1000);
 const EPG_REQUEST_TIMEOUT = Number(process.env.EPG_REQUEST_TIMEOUT || 20000);
@@ -103,6 +104,24 @@ const PLAYLIST_RETRY_DELAY_MS = Number(process.env.PLAYLIST_RETRY_DELAY_MS || 20
 const EPG_TIME_ZONE = process.env.EPG_TIME_ZONE || "Europe/Rome";
 
 const SLOW_SEGMENT_MS = Number(process.env.SLOW_SEGMENT_MS || 4000);
+
+// ── ffmpeg live ingest configuration ──────────────────────────────────────────
+// We run one ffmpeg per active channel. ffmpeg behaves like a real IPTV client
+// (like UHF): it follows token rotation, reconnects on upstream errors, and
+// remuxes (-c copy, NO transcode -> ~0 CPU, safe on a GPU-less VPS) into a clean
+// local rolling HLS playlist. The player only ever reads stable local files,
+// decoupled from upstream instability, sitting a cushion behind the live edge.
+const FFMPEG_BIN = process.env.FFMPEG_BIN || "ffmpeg";
+const INGEST_ROOT = process.env.INGEST_ROOT || "/tmp/kronos-ingest";
+const INGEST_SEGMENT_SECONDS = Math.max(1, Number(process.env.INGEST_SEGMENT_SECONDS || 4));
+const INGEST_WINDOW_SEGMENTS = Math.max(6, Number(process.env.INGEST_WINDOW_SEGMENTS || 36));
+const INGEST_LIVE_OFFSET_SECONDS = Math.max(0, Number(process.env.INGEST_LIVE_OFFSET_SECONDS || 45));
+const INGEST_IDLE_TIMEOUT_MS = Math.max(10000, Number(process.env.INGEST_IDLE_TIMEOUT_MS || 60000));
+const INGEST_FIRST_SEGMENT_TIMEOUT_MS = Math.max(5000, Number(process.env.INGEST_FIRST_SEGMENT_TIMEOUT_MS || 30000));
+const INGEST_REAP_INTERVAL_MS = Math.max(5000, Number(process.env.INGEST_REAP_INTERVAL_MS || 15000));
+const INGEST_RECONNECT_DELAY_MAX = Math.max(1, Number(process.env.INGEST_RECONNECT_DELAY_MAX || 5));
+const INGEST_READ_TIMEOUT_US = Math.max(1000000, Number(process.env.INGEST_READ_TIMEOUT_US || 15000000));
+const INGEST_PREFLIGHT = String(process.env.INGEST_PREFLIGHT ?? "1") !== "0";
 
 const upstreamHttpAgent = new http.Agent({
     keepAlive: true,
@@ -1400,157 +1419,6 @@ function isStaleStream(configKey, streamKey) {
     return current.streamKey !== streamKey;
 }
 
-const HLS_SEGMENT_SCOPED_TAGS = [
-    "#EXTINF",
-    "#EXT-X-BITRATE",
-    "#EXT-X-BYTERANGE",
-    "#EXT-X-DISCONTINUITY",
-    "#EXT-X-GAP",
-    "#EXT-X-KEY",
-    "#EXT-X-MAP",
-    "#EXT-X-PROGRAM-DATE-TIME"
-];
-
-function isSegmentScopedHlsTag(line) {
-    return HLS_SEGMENT_SCOPED_TAGS.some(prefix => line.startsWith(prefix));
-}
-
-function splitHlsMediaPlaylist(playlist) {
-    const head = [];
-    const items = [];
-    let pending = [];
-    let seenMedia = false;
-
-    for (const line of String(playlist || "").split(/\r?\n/)) {
-        const t = line.trim();
-        if (!t) {
-            if (seenMedia || pending.length) pending.push(line);
-            else head.push(line);
-            continue;
-        }
-        if (t.startsWith("#")) {
-            if (isSegmentScopedHlsTag(t) || pending.length || seenMedia) pending.push(line);
-            else head.push(line);
-            continue;
-        }
-        items.push({ pre: pending, uri: line });
-        pending = [];
-        seenMedia = true;
-    }
-
-    return { head, items, trailer: pending };
-}
-
-function applyLiveHoldback(playlist, info) {
-    const sourceMedia = info?.segmentCount ?? 0;
-    if (!info || info.isMaster || !info.isLive || HLS_LIVE_HOLDBACK_SEGMENTS <= 0) {
-        return { playlist, heldBack: 0, sourceMedia, releasedHoldback: 0 };
-    }
-
-    const parsed = splitHlsMediaPlaylist(playlist);
-    const maxHoldback = Math.max(0, parsed.items.length - HLS_LIVE_MIN_VISIBLE_SEGMENTS);
-    const heldBack = Math.min(HLS_LIVE_HOLDBACK_SEGMENTS, maxHoldback);
-    if (heldBack <= 0) return { playlist, heldBack: 0, sourceMedia: parsed.items.length || sourceMedia, releasedHoldback: 0 };
-
-    const kept = parsed.items.slice(0, parsed.items.length - heldBack);
-    const lines = [...parsed.head];
-    for (const item of kept) lines.push(...item.pre, item.uri);
-    return {
-        playlist: lines.join("\n").replace(/\n+$/g, "") + "\n",
-        heldBack,
-        sourceMedia: parsed.items.length,
-        releasedHoldback: 0
-    };
-}
-
-function applyLiveStartHint(playlist, info) {
-    if (!info || info.isMaster || !info.isLive || HLS_START_OFFSET_TARGETS <= 0) return playlist;
-    if (!Number.isFinite(info.targetDuration) || info.targetDuration <= 0) return playlist;
-    const lines = String(playlist || "").split(/\r?\n/);
-    if (lines.some(line => line.trim().startsWith("#EXT-X-START:"))) return playlist;
-    const offset = Math.max(1, Math.round(info.targetDuration * HLS_START_OFFSET_TARGETS));
-    const insertAt = Math.max(1, lines.findIndex(line => line.trim().startsWith("#EXT-X-TARGETDURATION:")) + 1);
-    lines.splice(insertAt, 0, `#EXT-X-START:TIME-OFFSET=-${offset},PRECISE=NO`);
-    return lines.join("\n");
-}
-
-function releaseStaleHoldback(held, info, staleManifestMs = 0) {
-    if (!held?.heldBack || !staleManifestMs || !info?.targetDuration) return held;
-    const releaseEveryMs = Math.max(1, info.targetDuration * 1000 * HLS_STALE_HOLDBACK_RELEASE_TARGETS);
-    const releaseCount = Math.min(held.heldBack, Math.floor(staleManifestMs / releaseEveryMs));
-    if (releaseCount <= 0) return held;
-
-    const parsed = splitHlsMediaPlaylist(held.originalPlaylist || held.playlist);
-    const targetHoldback = Math.max(0, held.heldBack - releaseCount);
-    const kept = targetHoldback > 0 ? parsed.items.slice(0, parsed.items.length - targetHoldback) : parsed.items;
-    const lines = [...parsed.head];
-    for (const item of kept) lines.push(...item.pre, item.uri);
-    return {
-        playlist: lines.join("\n").replace(/\n+$/g, "") + "\n",
-        heldBack: targetHoldback,
-        sourceMedia: parsed.items.length,
-        releasedHoldback: releaseCount
-    };
-}
-
-// Transparent HLS relay: do not invent media-sequences, segment ids or cache
-// state. This mirrors a normal IPTV player behind the server-side VPN: every
-// refreshed manifest carries the current token-bearing segment URLs.
-function rewriteHLSUrlsDirect(playlist, baseUrl, hostBase, configKey, streamKey, info = null, channelId = "", staleManifestMs = 0) {
-    let held = applyLiveHoldback(playlist, info);
-    held = releaseStaleHoldback({ ...held, originalPlaylist: playlist }, info, staleManifestMs);
-    held.playlist = applyLiveStartHint(held.playlist, info);
-    const queueKey = hashKey(baseUrl);
-    const activeParam = streamKey ? `&a=${encodeURIComponent(streamKey)}` : "";
-    const channelParam = channelId ? `&cid=${encodeURIComponent(channelId)}` : "";
-    const plUrl = abs => `${hostBase}/${configKey}/proxy/live.m3u8?u=${encodeProxyUrl(abs)}${activeParam}${channelParam}`;
-    const segUrl = abs => `${hostBase}/${configKey}/proxy/seg?u=${encodeProxyUrl(abs)}&q=${queueKey}${activeParam}`;
-    const pick = value => {
-        const abs = toAbsoluteUrl(value, baseUrl);
-        if (!isHttpUrl(abs)) return value;
-        return isHlsUrl(abs) ? plUrl(abs) : segUrl(abs);
-    };
-    let mediaUrls = 0;
-    let firstMedia = "";
-    let lastMedia = "";
-
-    const rewritten = String(held.playlist || "").split(/\r?\n/).map(line => {
-        const t = line.trim();
-        if (!t) return line;
-        if (t.startsWith("#")) {
-            return line.replace(/URI=("([^"]+)"|'([^']+)')/g, (_, quoted, d, s) => {
-                const uri = d || s;
-                const q = quoted.startsWith("'") ? "'" : '"';
-                return `URI=${q}${pick(uri)}${q}`;
-            });
-        }
-        mediaUrls++;
-        if (!firstMedia) firstMedia = getSegmentLabel(toAbsoluteUrl(t, baseUrl));
-        lastMedia = getSegmentLabel(toAbsoluteUrl(t, baseUrl));
-        return pick(t);
-    }).join("\n");
-
-    return {
-        rewritten,
-        mediaUrls,
-        upstreamMediaUrls: held.sourceMedia,
-        heldBack: held.heldBack,
-        releasedHoldback: held.releasedHoldback || 0,
-        firstMedia,
-        lastMedia,
-        queueKey
-    };
-}
-
-function formatSpeed(bytes, ms) {
-    if (!ms) return "n/a";
-    const mbps = (bytes * 8 / 1e6) / (ms / 1000);
-    return `${mbps.toFixed(1)}Mbps`;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Logo helpers + stream/meta builders
-// ─────────────────────────────────────────────────────────────────────────────
 async function getLogoDataUri(logoUrl) {
     if (!isHttpUrl(logoUrl)) return "";
     if (memoryCache.logoData[logoUrl]) return memoryCache.logoData[logoUrl];
@@ -1571,33 +1439,26 @@ async function getLogoDataUri(logoUrl) {
 }
 
 function buildStream(channel, host, configKey) {
-    if (isHlsUrl(channel.url)) {
+    if (isHlsUrl(channel.url) || isPlayableHttpUrl(channel.url)) {
         return {
             title: channel.name, name: "TV",
-            url: `${host}/${configKey}/proxy/live.m3u8?u=${encodeProxyUrl(channel.url)}&label=${encodeURIComponent(channel.name)}&a=${encodeURIComponent(channel.id)}&cid=${encodeURIComponent(channel.id)}`,
-            behaviorHints: { notWebReady: true, bingeGroup: `kronos-${channel.id}` }
-        };
-    }
-    if (isPlayableHttpUrl(channel.url)) {
-        return {
-            title: channel.name, name: "TV",
-            url: `${host}/${configKey}/proxy/seg?u=${encodeProxyUrl(channel.url)}`,
+            url: `${host}/${configKey}/live/${encodeURIComponent(channel.id)}/index.m3u8`,
             behaviorHints: { notWebReady: true, bingeGroup: `kronos-${channel.id}` }
         };
     }
     return { title: `${channel.name} - sorgente web`, name: "TV", externalUrl: channel.url };
 }
 
-function preflightHLSStream(channel) {
-    if (!HLS_STREAM_PREFLIGHT || !channel?.url || !isHlsUrl(channel.url)) return;
-    fetchPlayableHLSShared(channel.url, channel.name)
-        .then(result => {
-            const info = result?.info || {};
-            console.log(`[HLS PREFLIGHT READY] channel="${channel.name}" media=${info.segmentCount ?? "n/a"} seq=${info.mediaSequence ?? "n/a"} target=${info.targetDuration ?? "n/a"} warmup=${result?.warmupMs || 0}ms stale=${result?.staleManifestMs || 0}ms`);
-        })
-        .catch(err => {
-            console.warn(`[HLS PREFLIGHT FAIL] channel="${channel.name}" status=${getErrorStatus(err) || err?.code || "n/a"} reason=${err.message}`);
-        });
+// Pre-warm the ffmpeg ingest as soon as Stremio asks for the stream list, so the
+// first segment is usually ready by the time the user presses play.
+function preflightHLSStream(channel, configKey) {
+    if (!INGEST_PREFLIGHT || !configKey || !channel?.url || !channel?.id) return;
+    if (!(isHlsUrl(channel.url) || isPlayableHttpUrl(channel.url))) return;
+    try {
+        ensureIngest(`${configKey}:${channel.id}`, channel.url, channel.name);
+    } catch (err) {
+        console.warn(`[INGEST PREFLIGHT FAIL] channel="${channel.name}" reason=${err.message}`);
+    }
 }
 
 function toMeta(channel, host, configKey = "") {
@@ -1887,245 +1748,246 @@ async function withSegmentSlot(queueKey, signal, fn) {
     finally { slot.release(); }
 }
 
-app.get("/:base64Config/proxy/live.m3u8", async (req, res) => {
-    const started = Date.now();
-    const controller = makeAbortController(res);
-    const reqId = nextPlaybackRequestId("h");
-    let label = "direct-hls";
-    let activityKey = "";
-    let streamKey = "";
-    let openGapLog = "";
-    let client = "";
+// ─────────────────────────────────────────────────────────────────────────────
+// ffmpeg live ingest manager
+// ─────────────────────────────────────────────────────────────────────────────
+const ingests = new Map(); // ingestKey -> ingest record
+let ingestReaperStarted = false;
+
+function ingestDirFor(ingestKey) {
+    return path.join(INGEST_ROOT, hashKey(ingestKey));
+}
+
+function ingestIndexPath(ingest) {
+    return path.join(ingest.dir, "index.m3u8");
+}
+
+function ffmpegArgs(url, dir) {
+    return [
+        "-nostdin", "-hide_banner", "-loglevel", "warning",
+        "-user_agent", UPSTREAM_UA,
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", String(INGEST_RECONNECT_DELAY_MAX),
+        "-rw_timeout", String(INGEST_READ_TIMEOUT_US),
+        "-i", url,
+        "-map", "0:v:0", "-map", "0:a?",
+        "-c", "copy",
+        "-sn", "-dn",
+        "-f", "hls",
+        "-hls_time", String(INGEST_SEGMENT_SECONDS),
+        "-hls_list_size", String(INGEST_WINDOW_SEGMENTS),
+        "-hls_flags", "delete_segments+omit_endlist+independent_segments+temp_file",
+        "-hls_segment_type", "mpegts",
+        "-hls_allow_cache", "0",
+        "-hls_segment_filename", path.join(dir, "seg_%05d.ts"),
+        path.join(dir, "index.m3u8")
+    ];
+}
+
+function spawnIngest(ingest) {
+    const dir = ingest.dir;
+    try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+    // Clear leftovers so ffmpeg starts a fresh, monotonic sequence.
     try {
-        const configKey = req.params.base64Config;
-        const config = decodeConfig(configKey);
-        if (!req.query.u) return res.status(400).send("#EXTM3U\n");
-        const sourceUrl = decodeProxyUrl(req.query.u);
-        label = String(req.query.label || "direct-hls");
-        const channelId = String(req.query.cid || "");
-        streamKey = String(req.query.a || channelId || hashKey(sourceUrl));
-        if (req.query.label) setActiveStream(configKey, streamKey, label);
-        else if (isStaleStream(configKey, streamKey)) {
-            console.warn(`[HLS STALE] channel="${label}" stream=${streamKey}`);
-            return res.status(409).type("text/plain").send("Stale HLS stream\n");
-        }
-
-        activityKey = playbackActivityKey(configKey, streamKey, sourceUrl);
-        openGapLog = formatPlaybackGaps(playbackGapFields(playbackActivities.get(activityKey), started));
-        client = playbackClientTag(req);
-        notePlaybackActivity(activityKey, {
-            label,
-            sourceHash: hashKey(sourceUrl),
-            lastClient: client,
-            lastManifestRequestAt: started
-        });
-        res.on("close", () => {
-            if (res.writableEnded) return;
-            notePlaybackActivity(activityKey, { lastManifestAbortAt: Date.now() });
-            console.warn(`[HLS CLIENT ABORT] id=${reqId} channel="${label}" stream=${streamKey} client=${client} ${openGapLog} time=${Date.now() - started}ms`);
-        });
-        console.log(`[HLS DIRECT OPEN] id=${reqId} channel="${label}" stream=${streamKey} client=${client} ${openGapLog}`);
-
-        let manifestSourceUrl = sourceUrl;
-        let result;
-        try {
-            result = await fetchPlayableHLSShared(sourceUrl, label);
-        } catch (err) {
-            const recovered = await recoverHlsSourceAfterForbidden(configKey, config, sourceUrl, label, channelId, err);
-            if (!recovered) throw err;
-            manifestSourceUrl = recovered.sourceUrl;
-            label = recovered.label || label;
-            result = recovered.result;
-        }
-
-        const { data, finalUrl, info, attempts, warmupMs, warmupPolls, staleManifestMs, staleManifestReason } = result;
-        if (controller.signal.aborted) return;
-        const { rewritten, mediaUrls, upstreamMediaUrls, heldBack, releasedHoldback, firstMedia, lastMedia, queueKey } = rewriteHLSUrlsDirect(data, finalUrl, getPublicHost(req), configKey, streamKey, info, channelId, staleManifestMs || 0);
-        setPlaylistHeaders(res);
-        notePlaybackActivity(activityKey, {
-            lastManifestServeAt: Date.now(),
-            sourceHash: hashKey(manifestSourceUrl),
-            lastManifestSeq: info.mediaSequence,
-            lastManifestTarget: info.targetDuration,
-            lastManifestMedia: mediaUrls,
-            lastManifestUpstreamMedia: upstreamMediaUrls ?? mediaUrls,
-            lastManifestFirst: firstMedia || "",
-            lastManifestLast: lastMedia || "",
-            lastManifestStaleMs: staleManifestMs || 0,
-            lastManifestStaleReason: staleManifestReason || ""
-        });
-        console.log(`[HLS DIRECT SERVE] id=${reqId} channel="${label}" master=${info.isMaster ? 1 : 0} media=${mediaUrls}/${upstreamMediaUrls ?? mediaUrls} held=${heldBack || 0} released=${releasedHoldback || 0} seq=${info.mediaSequence ?? "n/a"} target=${info.targetDuration ?? "n/a"} first=${firstMedia || "n/a"} last=${lastMedia || "n/a"} q=${queueKey} attempts=${attempts} warmup=${warmupMs || 0}ms polls=${warmupPolls || 0} stale=${staleManifestMs || 0}ms staleReason=${staleManifestReason || "n/a"} ${openGapLog} time=${Date.now() - started}ms`);
-        res.send(rewritten);
-    } catch (err) {
-        if (controller.signal.aborted) return;
-        notePlaybackActivity(activityKey, {
-            lastManifestErrorAt: Date.now(),
-            lastManifestError: err.message
-        });
-        if (HLS_WAITING_MANIFEST_ON_ERROR && isStaleHlsEligibleError(err) && !res.headersSent) {
-            notePlaybackActivity(activityKey, { lastManifestWaitingAt: Date.now() });
-            return sendWaitingManifest(res, label, err, started, reqId, openGapLog);
-        }
-        const timeout = err?.code === "ECONNABORTED" || /timeout/i.test(String(err?.message || ""));
-        const status = timeout ? 504 : 502;
-        console.error(`[HLS DIRECT ERROR] id=${reqId} channel="${label}" ${openGapLog} status=${status} time=${Date.now() - started}ms reason=${err.message}`);
-        if (!res.headersSent) res.status(status).type("text/plain").send("Upstream HLS manifest unavailable\n");
-    }
-});
-
-app.get("/:base64Config/proxy/seg", async (req, res) => {
-    const started = Date.now();
-    const controller = makeAbortController(res);
-    const reqId = nextPlaybackRequestId("s");
-    let sourceUrl = null;
-    let queueKey = "";
-    let activityKey = "";
-    let gapLog = "";
-    let client = "";
-
-    try {
-        const configKey = req.params.base64Config;
-        decodeConfig(configKey);
-        if (!req.query.u) return res.status(400).end();
-        sourceUrl = decodeProxyUrl(req.query.u);
-        const streamKey = String(req.query.a || "");
-        if (streamKey && isStaleStream(configKey, streamKey)) {
-            console.warn(`[SEG STALE] ${getSegmentLabel(sourceUrl)} stream=${streamKey}`);
-            return res.status(409).end();
-        }
-        const activityStreamKey = streamKey || hashKey(sourceUrl);
-        activityKey = playbackActivityKey(configKey, activityStreamKey, sourceUrl);
-        gapLog = formatPlaybackGaps(playbackGapFields(playbackActivities.get(activityKey), started));
-        client = playbackClientTag(req);
-        notePlaybackActivity(activityKey, {
-            lastClient: client,
-            lastSegmentRequestAt: started,
-            lastSegmentLabel: getSegmentLabel(sourceUrl)
-        });
-        queueKey = req.query.q ? `${configKey}:${String(req.query.q)}` : getSegmentQueueKey(sourceUrl);
-        await withSegmentSlot(queueKey, controller.signal, slot => streamSegment(req, res, sourceUrl, started, controller.signal, slot, {
-            activityKey,
-            reqId,
-            gapLog,
-            client
-        }));
-    } catch (err) {
-        if (controller.signal.aborted) {
-            notePlaybackActivity(activityKey, { lastSegmentAbortAt: Date.now() });
-            console.warn(`[SEG ABORT] id=${reqId} ${getSegmentLabel(sourceUrl)} queue=${queueKey || "n/a"} client=${client || "n/a"} ${gapLog} time=${Date.now() - started}ms`);
-            return;
-        }
-        notePlaybackActivity(activityKey, {
-            lastSegmentErrorAt: Date.now(),
-            lastSegmentError: err.message
-        });
-        console.error(`[SEG ERROR] id=${reqId} ${getSegmentLabel(sourceUrl)} client=${client || "n/a"} ${gapLog} ${err.message}`);
-        if (!res.headersSent) res.status(502).end();
-        else if (!res.destroyed) res.destroy(err);
-    }
-});
-
-// Stream a segment straight through. Kronos must behave like a normal IPTV
-// client behind the server-side VPN: no segment cache, no synthetic ids.
-async function fetchSegmentResponse(sourceUrl, headers, signal = null) {
-    let lastErr = null;
-    let requestUrl = sourceUrl;
-    let usedHttpFallback = false;
-    for (let attempt = 1; attempt <= SEGMENT_UPSTREAM_RETRIES + 1; attempt++) {
-        try {
-            return await axios.get(requestUrl, {
-                responseType: "stream",
-                timeout: SEG_REQUEST_TIMEOUT,
-                signal,
-                ...upstreamAgentOptions(),
-                maxRedirects: 5,
-                headers,
-                decompress: false,
-                maxBodyLength: Infinity,
-                maxContentLength: Infinity,
-                validateStatus: s => s >= 200 && s < 400
-            });
-        } catch (err) {
-            lastErr = err;
-            const fallbackUrl = !usedHttpFallback && isHttpsPlainHttpError(err) ? getHttpFallbackUrl(requestUrl) : "";
-            if (fallbackUrl) {
-                usedHttpFallback = true;
-                requestUrl = fallbackUrl;
-                console.warn(`[SEG HTTP FALLBACK] ${getSegmentLabel(sourceUrl)} -> ${getSegmentLabel(fallbackUrl)} reason=${err.message}`);
-                attempt--;
-                continue;
+        for (const f of fs.readdirSync(dir)) {
+            if (f === "index.m3u8" || /^seg_\d+\.ts/.test(f) || f.endsWith(".tmp")) {
+                try { fs.unlinkSync(path.join(dir, f)); } catch {}
             }
-            if (signal?.aborted || !isRetryableSegmentError(err) || attempt > SEGMENT_UPSTREAM_RETRIES) throw err;
-            console.warn(`[SEG RETRY] ${getSegmentLabel(sourceUrl)} attempt=${attempt} reason=${err.message}`);
-            if (SEGMENT_UPSTREAM_RETRY_DELAY_MS > 0) await sleep(SEGMENT_UPSTREAM_RETRY_DELAY_MS);
+        }
+    } catch {}
+
+    const proc = spawn(FFMPEG_BIN, ffmpegArgs(ingest.url, dir), { stdio: ["ignore", "ignore", "pipe"] });
+    ingest.proc = proc;
+    ingest.pid = proc.pid;
+    ingest.startedAt = Date.now();
+    ingest.firstSegmentAt = 0;
+    ingest.exited = false;
+    ingest.stopping = false;
+    ingest.stderrTail = "";
+
+    proc.stderr.on("data", chunk => {
+        ingest.stderrTail = (ingest.stderrTail + String(chunk)).slice(-2000);
+    });
+    proc.on("exit", (code, signal) => {
+        ingest.exited = true;
+        ingest.exitCode = code;
+        if (!ingest.stopping) {
+            const ranMs = Date.now() - ingest.startedAt;
+            console.warn(`[INGEST EXIT] channel="${ingest.label}" key=${ingest.shortKey} pid=${ingest.pid} code=${code} signal=${signal || "none"} ran=${ranMs}ms tail=${(ingest.stderrTail || "").trim().split("\n").pop() || ""}`);
+        }
+    });
+    proc.on("error", err => {
+        ingest.exited = true;
+        ingest.spawnError = err.message;
+        console.error(`[INGEST SPAWN ERROR] channel="${ingest.label}" key=${ingest.shortKey} reason=${err.message}`);
+    });
+
+    console.log(`[INGEST START] channel="${ingest.label}" key=${ingest.shortKey} pid=${ingest.pid} restarts=${ingest.restarts} seg=${INGEST_SEGMENT_SECONDS}s window=${INGEST_WINDOW_SEGMENTS} offset=${INGEST_LIVE_OFFSET_SECONDS}s`);
+}
+
+function ensureIngest(ingestKey, url, label) {
+    let ingest = ingests.get(ingestKey);
+    if (ingest && !ingest.exited && ingest.proc) {
+        ingest.lastAccess = Date.now();
+        ingest.url = url;
+        if (label) ingest.label = label;
+        return ingest;
+    }
+    if (!ingest) {
+        ingest = {
+            key: ingestKey,
+            shortKey: hashKey(ingestKey).slice(0, 10),
+            url,
+            label: label || "live",
+            dir: ingestDirFor(ingestKey),
+            lastAccess: Date.now(),
+            restarts: 0
+        };
+        ingests.set(ingestKey, ingest);
+    } else {
+        ingest.url = url;
+        if (label) ingest.label = label;
+        ingest.restarts++;
+        ingest.lastAccess = Date.now();
+    }
+    spawnIngest(ingest);
+    startIngestReaper();
+    return ingest;
+}
+
+function readIngestPlaylist(ingest) {
+    try {
+        const raw = fs.readFileSync(ingestIndexPath(ingest), "utf8");
+        return /seg_\d+\.ts/.test(raw) ? raw : null;
+    } catch {
+        return null;
+    }
+}
+
+async function waitForPlaylist(ingest, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        const raw = readIngestPlaylist(ingest);
+        if (raw) {
+            if (!ingest.firstSegmentAt) ingest.firstSegmentAt = Date.now();
+            return raw;
+        }
+        if (ingest.exited) return null;
+        await sleep(200);
+    }
+    return null;
+}
+
+// Inject a live-edge cushion so the player sits INGEST_LIVE_OFFSET_SECONDS behind
+// the ingest edge, giving runway to absorb upstream stalls. Segment URIs stay
+// relative (resolved against the manifest path -> our segment route).
+function buildServedPlaylist(rawPlaylist) {
+    if (!INGEST_LIVE_OFFSET_SECONDS) return rawPlaylist;
+    const startTag = `#EXT-X-START:TIME-OFFSET=-${INGEST_LIVE_OFFSET_SECONDS},PRECISE=YES`;
+    const lines = rawPlaylist.split(/\r?\n/);
+    const out = [];
+    let injected = false;
+    for (const line of lines) {
+        out.push(line);
+        if (!injected && /^#EXT-X-MEDIA-SEQUENCE:/i.test(line)) {
+            out.push(startTag);
+            injected = true;
         }
     }
-    throw lastErr || new Error("Segment fetch failed");
+    if (!injected) {
+        const idx = out.findIndex(l => /^#EXTM3U/i.test(l));
+        if (idx >= 0) out.splice(idx + 1, 0, startTag);
+        else out.unshift(startTag);
+    }
+    return out.join("\n");
 }
 
-async function streamSegment(req, res, sourceUrl, started, signal = null, slot = null, telemetry = {}) {
-    const headers = { "User-Agent": UPSTREAM_UA, "Accept": "*/*", "Accept-Encoding": "identity", "Connection": "keep-alive" };
-    if (req.headers.range) headers.Range = req.headers.range;
+function stopIngest(ingest, reason) {
+    ingest.stopping = true;
+    const proc = ingest.proc;
+    try { if (proc && !ingest.exited) proc.kill("SIGTERM"); } catch {}
+    setTimeout(() => { try { if (proc && !ingest.exited) proc.kill("SIGKILL"); } catch {} }, 4000);
+    ingests.delete(ingest.key);
+    setTimeout(() => { try { fs.rmSync(ingest.dir, { recursive: true, force: true }); } catch {} }, 5000);
+    console.log(`[INGEST STOP] channel="${ingest.label}" key=${ingest.shortKey} reason=${reason}`);
+}
 
-    const response = await fetchSegmentResponse(sourceUrl, headers, signal);
-
-    const upstream = response.data;
-    ["content-type", "content-length", "content-range", "accept-ranges",
-     "last-modified", "etag", "cache-control", "expires"].forEach(h => {
-        if (response.headers[h]) res.setHeader(h, response.headers[h]);
-    });
-    res.setHeader("X-Kronos-Relay", "1");
-    res.status(response.status);
-
-    let bytes = 0;
-
-    upstream.on("data", chunk => {
-        bytes += chunk.length;
-    });
-
-    res.on("finish", () => {
-        const ms = Date.now() - started;
-        const waitMs = slot?.waitMs || 0;
-        const slow = ms >= SLOW_SEGMENT_MS ? " SLOW" : "";
-        notePlaybackActivity(telemetry.activityKey, {
-            lastSegmentFinishAt: Date.now(),
-            lastSegmentLabel: getSegmentLabel(sourceUrl),
-            lastSegmentStatus: response.status,
-            lastSegmentBytes: bytes,
-            lastSegmentMs: ms,
-            lastSegmentWaitMs: waitMs
-        });
-        console.log(`[SEG DIRECT] id=${telemetry.reqId || "n/a"} ${getSegmentLabel(sourceUrl)} status=${response.status} bytes=${formatBytes(bytes)} wait=${waitMs}ms time=${ms}ms speed=${formatSpeed(bytes, Math.max(1, ms - waitMs))} client=${telemetry.client || "n/a"} ${telemetry.gapLog || ""}${slow}`);
-    });
-
-    res.on("close", () => {
-        if (!res.writableEnded) {
-            notePlaybackActivity(telemetry.activityKey, {
-                lastSegmentAbortAt: Date.now(),
-                lastSegmentLabel: getSegmentLabel(sourceUrl),
-                lastSegmentBytes: bytes
-            });
-            console.warn(`[SEG CLIENT ABORT] id=${telemetry.reqId || "n/a"} ${getSegmentLabel(sourceUrl)} bytes=${formatBytes(bytes)} wait=${slot?.waitMs || 0}ms time=${Date.now() - started}ms client=${telemetry.client || "n/a"} ${telemetry.gapLog || ""}`);
-            if (upstream?.destroy) upstream.destroy();
+function startIngestReaper() {
+    if (ingestReaperStarted) return;
+    ingestReaperStarted = true;
+    const timer = setInterval(() => {
+        const now = Date.now();
+        for (const ingest of [...ingests.values()]) {
+            if (now - ingest.lastAccess > INGEST_IDLE_TIMEOUT_MS) {
+                stopIngest(ingest, `idle ${Math.round((now - ingest.lastAccess) / 1000)}s`);
+            }
         }
-    });
-    await new Promise(resolve => {
-        let settled = false;
-        const done = () => {
-            if (settled) return;
-            settled = true;
-            resolve();
-        };
-        res.once("finish", done);
-        res.once("close", done);
-        upstream.on("error", err => {
-            if (!res.headersSent) res.status(502).end();
-            else res.destroy(err);
-            done();
-        });
-        upstream.pipe(res);
-    });
+    }, INGEST_REAP_INTERVAL_MS);
+    timer.unref?.();
 }
+
+// Player fetches the channel manifest -> ensure ffmpeg is ingesting, wait for the
+// first local segment, then serve a clean local playlist with a live cushion.
+app.get("/:base64Config/live/:cid/index.m3u8", async (req, res) => {
+    const started = Date.now();
+    const reqId = nextPlaybackRequestId("L");
+    const configKey = req.params.base64Config;
+    const cid = req.params.cid;
+    const client = playbackClientTag(req);
+    let label = "live";
+    try {
+        const config = decodeConfig(configKey);
+        const ch = await getChannelById(configKey, config, cid);
+        if (!ch || !ch.url) return res.status(404).type("text/plain").send("#EXTM3U\n");
+        label = ch.name || "live";
+        const ingestKey = `${configKey}:${cid}`;
+        const ingest = ensureIngest(ingestKey, ch.url, label);
+        ingest.lastAccess = Date.now();
+
+        let raw = readIngestPlaylist(ingest);
+        let warmupMs = 0;
+        if (!raw) {
+            const w0 = Date.now();
+            raw = await waitForPlaylist(ingest, INGEST_FIRST_SEGMENT_TIMEOUT_MS);
+            warmupMs = Date.now() - w0;
+        }
+        if (!raw) {
+            console.error(`[LIVE TIMEOUT] id=${reqId} channel="${label}" key=${ingest.shortKey} warmup=${warmupMs}ms exited=${ingest.exited ? 1 : 0} tail=${(ingest.stderrTail || "").trim().split("\n").pop() || ""}`);
+            if (ingest.exited) ensureIngest(ingestKey, ch.url, label); // respawn for next attempt
+            return res.status(504).type("text/plain").send("#EXTM3U\n");
+        }
+        const served = buildServedPlaylist(raw);
+        setPlaylistHeaders(res);
+        res.send(served);
+        const segCount = (raw.match(/seg_\d+\.ts/g) || []).length;
+        const ageMs = ingest.firstSegmentAt ? Date.now() - ingest.firstSegmentAt : 0;
+        console.log(`[LIVE SERVE] id=${reqId} channel="${label}" key=${ingest.shortKey} segs=${segCount} warmup=${warmupMs}ms ingestAge=${ageMs}ms client=${client} time=${Date.now() - started}ms`);
+    } catch (err) {
+        console.error(`[LIVE ERROR] id=${reqId} channel="${label}" cid=${cid} reason=${err.message}`);
+        if (!res.headersSent) res.status(502).type("text/plain").send("#EXTM3U\n");
+    }
+});
+
+// Serve a locally-produced segment file. No upstream contact here: ffmpeg already
+// pulled it via the VPN and remuxed it.
+app.get("/:base64Config/live/:cid/:seg", (req, res) => {
+    const { base64Config: configKey, cid, seg } = req.params;
+    if (!/^seg_\d+\.ts$/.test(seg)) return res.status(400).end();
+    const ingestKey = `${configKey}:${cid}`;
+    const ingest = ingests.get(ingestKey);
+    if (ingest) ingest.lastAccess = Date.now();
+    const file = path.join(ingestDirFor(ingestKey), seg);
+    fs.stat(file, (err, st) => {
+        if (err || !st.isFile()) return res.status(404).end();
+        res.setHeader("Content-Type", "video/mp2t");
+        res.setHeader("Cache-Control", "no-store");
+        res.setHeader("Content-Length", st.size);
+        const stream = fs.createReadStream(file);
+        stream.on("error", () => { if (!res.headersSent) res.status(404).end(); else res.destroy(); });
+        stream.pipe(res);
+    });
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Stream + stats + debug
@@ -2136,7 +1998,7 @@ app.get("/:base64Config/stream/:type/:id.json", async (req, res) => {
         const config = decodeConfig(configKey);
         const ch = await getChannelById(configKey, config, req.params.id);
         if (!ch) return res.status(404).json({ streams: [] });
-        preflightHLSStream(ch);
+        preflightHLSStream(ch, configKey);
         res.json({ streams: [buildStream(ch, getPublicHost(req), configKey)] });
     } catch (err) {
         console.error("[STREAM ERROR]", err.message);
@@ -2228,8 +2090,8 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log("=".repeat(60));
     console.log(`🌐 http://0.0.0.0:${PORT}`);
     console.log(`📦 Node ${process.version}`);
-    console.log(`🎬 playback=${PLAYBACK_MODE} noBuffer=1 noPrefetch=1 noSegmentCache=1`);
-    console.log(`🔁 manifest directFetch=1 timeout=${HLS_REQUEST_TIMEOUT / 1000}s retries=${HLS_UPSTREAM_RETRIES} retryDelay=${HLS_UPSTREAM_RETRY_DELAY_MS / 1000}s coldWait=${HLS_COLD_START_WAIT_MS / 1000}s coldRetry=${HLS_COLD_START_RETRY_MS / 1000}s liveMin=${HLS_LIVE_MIN_SEGMENTS} visible=${HLS_LIVE_MIN_VISIBLE_SEGMENTS} holdback=${HLS_LIVE_HOLDBACK_SEGMENTS} startOffset=${HLS_START_OFFSET_TARGETS} staleReleaseTargets=${HLS_STALE_HOLDBACK_RELEASE_TARGETS} preflight=${HLS_STREAM_PREFLIGHT ? 1 : 0} warmupWait=${HLS_LIVE_WARMUP_WAIT_MS / 1000}s staleTTL=${HLS_STALE_MANIFEST_TTL_MS / 1000}s staleLiveTargets=${HLS_STALE_LIVE_TARGETS} stale403Targets=${HLS_STALE_FORBIDDEN_TARGETS} forbiddenBackoff=${HLS_FORBIDDEN_BACKOFF_MS / 1000}s sourceRefresh403=${HLS_FORBIDDEN_SOURCE_REFRESH ? 1 : 0} waiting=${HLS_WAITING_MANIFEST_ON_ERROR ? 1 : 0}/${HLS_WAITING_TARGET_DURATION}s activeTtl=${ACTIVE_STREAM_TTL_MS / 1000}s`);
+    console.log(`🎬 playback=${PLAYBACK_MODE} engine=ffmpeg(-c copy) bin=${FFMPEG_BIN}`);
+    console.log(`🎥 ingest seg=${INGEST_SEGMENT_SECONDS}s window=${INGEST_WINDOW_SEGMENTS} liveOffset=${INGEST_LIVE_OFFSET_SECONDS}s idle=${INGEST_IDLE_TIMEOUT_MS / 1000}s firstSegTimeout=${INGEST_FIRST_SEGMENT_TIMEOUT_MS / 1000}s preflight=${INGEST_PREFLIGHT ? 1 : 0} root=${INGEST_ROOT}`);
     console.log(`🔌 upstream keepAlive=1 sockets=${UPSTREAM_KEEPALIVE_MAX_SOCKETS} free=${UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS} ms=${UPSTREAM_KEEPALIVE_MS}`);
     console.log(`🩺 playback telemetry=1 ttl=${PLAYBACK_ACTIVITY_TTL_MS / 1000}s max=${PLAYBACK_ACTIVITY_MAX}`);
     console.log(`📋 playlist retryWindow=${PLAYLIST_RETRY_WINDOW_MS / 1000}s delay=${PLAYLIST_RETRY_DELAY_MS / 1000}s`);
