@@ -50,7 +50,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "3.3.15";
+const RELEASE_VERSION = "3.3.17";
 const ADDON_TYPE = "tv";
 const PLAYBACK_MODE = "uhf-direct-relay";
 const CATALOG_TTL = 30 * 60 * 1000;
@@ -71,11 +71,11 @@ const HLS_UPSTREAM_RETRY_DELAY_MS = Math.max(0, Number(process.env.HLS_UPSTREAM_
 const HLS_COLD_START_WAIT_MS = Math.max(0, Number(process.env.HLS_COLD_START_WAIT_MS || 25000));
 const HLS_COLD_START_RETRY_MS = Math.max(250, Number(process.env.HLS_COLD_START_RETRY_MS || 1000));
 const HLS_LIVE_MIN_VISIBLE_SEGMENTS = Math.max(1, Number(process.env.HLS_LIVE_MIN_VISIBLE_SEGMENTS || 2));
-const HLS_LIVE_HOLDBACK_SEGMENTS = Math.max(0, Number(process.env.HLS_LIVE_HOLDBACK_SEGMENTS ?? 1));
-const HLS_LIVE_MIN_SEGMENTS = Math.max(
-    HLS_LIVE_MIN_VISIBLE_SEGMENTS + HLS_LIVE_HOLDBACK_SEGMENTS,
-    Number(process.env.HLS_LIVE_MIN_SEGMENTS || 3)
-);
+const HLS_LIVE_HOLDBACK_SEGMENTS = Math.max(0, Number(process.env.HLS_LIVE_HOLDBACK_SEGMENTS ?? 2));
+const HLS_STALE_HOLDBACK_RELEASE_TARGETS = Math.max(1, Number(process.env.HLS_STALE_HOLDBACK_RELEASE_TARGETS || 1));
+const HLS_START_OFFSET_TARGETS = Math.max(0, Number(process.env.HLS_START_OFFSET_TARGETS || 2));
+const HLS_STREAM_PREFLIGHT = String(process.env.HLS_STREAM_PREFLIGHT ?? "1") !== "0";
+const HLS_LIVE_MIN_SEGMENTS = Math.max(HLS_LIVE_MIN_VISIBLE_SEGMENTS, Number(process.env.HLS_LIVE_MIN_SEGMENTS || 3));
 const HLS_LIVE_WARMUP_WAIT_MS = Math.max(0, Number(process.env.HLS_LIVE_WARMUP_WAIT_MS || 35000));
 const HLS_LIVE_WARMUP_POLL_MS = Math.max(250, Number(process.env.HLS_LIVE_WARMUP_POLL_MS || 2000));
 const ACTIVE_STREAM_TTL_MS = Math.max(0, Number(process.env.ACTIVE_STREAM_TTL_MS || 120000));
@@ -84,8 +84,8 @@ const SEGMENT_UPSTREAM_CONCURRENCY = Math.max(1, Number(process.env.SEGMENT_UPST
 const SEGMENT_UPSTREAM_RETRIES = Math.max(0, Number(process.env.SEGMENT_UPSTREAM_RETRIES || 1));
 const SEGMENT_UPSTREAM_RETRY_DELAY_MS = Math.max(0, Number(process.env.SEGMENT_UPSTREAM_RETRY_DELAY_MS || 250));
 const HLS_STALE_MANIFEST_TTL_MS = Math.max(0, Number(process.env.HLS_STALE_MANIFEST_TTL_MS || 90000));
-const HLS_STALE_LIVE_TARGETS = Math.max(0, Number(process.env.HLS_STALE_LIVE_TARGETS || 2));
-const HLS_STALE_FORBIDDEN_TARGETS = Math.max(0, Number(process.env.HLS_STALE_FORBIDDEN_TARGETS || 1));
+const HLS_STALE_LIVE_TARGETS = Math.max(0, Number(process.env.HLS_STALE_LIVE_TARGETS || 6));
+const HLS_STALE_FORBIDDEN_TARGETS = Math.max(0, Number(process.env.HLS_STALE_FORBIDDEN_TARGETS || 6));
 const HLS_FORBIDDEN_BACKOFF_MS = Math.max(0, Number(process.env.HLS_FORBIDDEN_BACKOFF_MS || 15000));
 const HLS_FORBIDDEN_SOURCE_REFRESH = String(process.env.HLS_FORBIDDEN_SOURCE_REFRESH ?? "1") !== "0";
 const HLS_WAITING_MANIFEST_ON_ERROR = String(process.env.HLS_WAITING_MANIFEST_ON_ERROR ?? "1") !== "0";
@@ -1355,13 +1355,13 @@ function splitHlsMediaPlaylist(playlist) {
 function applyLiveHoldback(playlist, info) {
     const sourceMedia = info?.segmentCount ?? 0;
     if (!info || info.isMaster || !info.isLive || HLS_LIVE_HOLDBACK_SEGMENTS <= 0) {
-        return { playlist, heldBack: 0, sourceMedia };
+        return { playlist, heldBack: 0, sourceMedia, releasedHoldback: 0 };
     }
 
     const parsed = splitHlsMediaPlaylist(playlist);
     const maxHoldback = Math.max(0, parsed.items.length - HLS_LIVE_MIN_VISIBLE_SEGMENTS);
     const heldBack = Math.min(HLS_LIVE_HOLDBACK_SEGMENTS, maxHoldback);
-    if (heldBack <= 0) return { playlist, heldBack: 0, sourceMedia: parsed.items.length || sourceMedia };
+    if (heldBack <= 0) return { playlist, heldBack: 0, sourceMedia: parsed.items.length || sourceMedia, releasedHoldback: 0 };
 
     const kept = parsed.items.slice(0, parsed.items.length - heldBack);
     const lines = [...parsed.head];
@@ -1369,15 +1369,48 @@ function applyLiveHoldback(playlist, info) {
     return {
         playlist: lines.join("\n").replace(/\n+$/g, "") + "\n",
         heldBack,
-        sourceMedia: parsed.items.length
+        sourceMedia: parsed.items.length,
+        releasedHoldback: 0
+    };
+}
+
+function applyLiveStartHint(playlist, info) {
+    if (!info || info.isMaster || !info.isLive || HLS_START_OFFSET_TARGETS <= 0) return playlist;
+    if (!Number.isFinite(info.targetDuration) || info.targetDuration <= 0) return playlist;
+    const lines = String(playlist || "").split(/\r?\n/);
+    if (lines.some(line => line.trim().startsWith("#EXT-X-START:"))) return playlist;
+    const offset = Math.max(1, Math.round(info.targetDuration * HLS_START_OFFSET_TARGETS));
+    const insertAt = Math.max(1, lines.findIndex(line => line.trim().startsWith("#EXT-X-TARGETDURATION:")) + 1);
+    lines.splice(insertAt, 0, `#EXT-X-START:TIME-OFFSET=-${offset},PRECISE=NO`);
+    return lines.join("\n");
+}
+
+function releaseStaleHoldback(held, info, staleManifestMs = 0) {
+    if (!held?.heldBack || !staleManifestMs || !info?.targetDuration) return held;
+    const releaseEveryMs = Math.max(1, info.targetDuration * 1000 * HLS_STALE_HOLDBACK_RELEASE_TARGETS);
+    const releaseCount = Math.min(held.heldBack, Math.floor(staleManifestMs / releaseEveryMs));
+    if (releaseCount <= 0) return held;
+
+    const parsed = splitHlsMediaPlaylist(held.originalPlaylist || held.playlist);
+    const targetHoldback = Math.max(0, held.heldBack - releaseCount);
+    const kept = targetHoldback > 0 ? parsed.items.slice(0, parsed.items.length - targetHoldback) : parsed.items;
+    const lines = [...parsed.head];
+    for (const item of kept) lines.push(...item.pre, item.uri);
+    return {
+        playlist: lines.join("\n").replace(/\n+$/g, "") + "\n",
+        heldBack: targetHoldback,
+        sourceMedia: parsed.items.length,
+        releasedHoldback: releaseCount
     };
 }
 
 // Transparent HLS relay: do not invent media-sequences, segment ids or cache
 // state. This mirrors a normal IPTV player behind the server-side VPN: every
 // refreshed manifest carries the current token-bearing segment URLs.
-function rewriteHLSUrlsDirect(playlist, baseUrl, hostBase, configKey, streamKey, info = null, channelId = "") {
-    const held = applyLiveHoldback(playlist, info);
+function rewriteHLSUrlsDirect(playlist, baseUrl, hostBase, configKey, streamKey, info = null, channelId = "", staleManifestMs = 0) {
+    let held = applyLiveHoldback(playlist, info);
+    held = releaseStaleHoldback({ ...held, originalPlaylist: playlist }, info, staleManifestMs);
+    held.playlist = applyLiveStartHint(held.playlist, info);
     const queueKey = hashKey(baseUrl);
     const activeParam = streamKey ? `&a=${encodeURIComponent(streamKey)}` : "";
     const channelParam = channelId ? `&cid=${encodeURIComponent(channelId)}` : "";
@@ -1413,6 +1446,7 @@ function rewriteHLSUrlsDirect(playlist, baseUrl, hostBase, configKey, streamKey,
         mediaUrls,
         upstreamMediaUrls: held.sourceMedia,
         heldBack: held.heldBack,
+        releasedHoldback: held.releasedHoldback || 0,
         firstMedia,
         lastMedia,
         queueKey
@@ -1463,6 +1497,18 @@ function buildStream(channel, host, configKey) {
         };
     }
     return { title: `${channel.name} - sorgente web`, name: "TV", externalUrl: channel.url };
+}
+
+function preflightHLSStream(channel) {
+    if (!HLS_STREAM_PREFLIGHT || !channel?.url || !isHlsUrl(channel.url)) return;
+    fetchPlayableHLSShared(channel.url, channel.name)
+        .then(result => {
+            const info = result?.info || {};
+            console.log(`[HLS PREFLIGHT READY] channel="${channel.name}" media=${info.segmentCount ?? "n/a"} seq=${info.mediaSequence ?? "n/a"} target=${info.targetDuration ?? "n/a"} warmup=${result?.warmupMs || 0}ms stale=${result?.staleManifestMs || 0}ms`);
+        })
+        .catch(err => {
+            console.warn(`[HLS PREFLIGHT FAIL] channel="${channel.name}" status=${getErrorStatus(err) || err?.code || "n/a"} reason=${err.message}`);
+        });
 }
 
 function toMeta(channel, host, configKey = "") {
@@ -1789,7 +1835,7 @@ app.get("/:base64Config/proxy/live.m3u8", async (req, res) => {
 
         const { data, finalUrl, info, attempts, warmupMs, warmupPolls, staleManifestMs, staleManifestReason } = result;
         if (controller.signal.aborted) return;
-        const { rewritten, mediaUrls, upstreamMediaUrls, heldBack, firstMedia, lastMedia, queueKey } = rewriteHLSUrlsDirect(data, finalUrl, getPublicHost(req), configKey, streamKey, info, channelId);
+        const { rewritten, mediaUrls, upstreamMediaUrls, heldBack, releasedHoldback, firstMedia, lastMedia, queueKey } = rewriteHLSUrlsDirect(data, finalUrl, getPublicHost(req), configKey, streamKey, info, channelId, staleManifestMs || 0);
         setPlaylistHeaders(res);
         notePlaybackActivity(activityKey, {
             lastManifestServeAt: Date.now(),
@@ -1803,7 +1849,7 @@ app.get("/:base64Config/proxy/live.m3u8", async (req, res) => {
             lastManifestStaleMs: staleManifestMs || 0,
             lastManifestStaleReason: staleManifestReason || ""
         });
-        console.log(`[HLS DIRECT SERVE] id=${reqId} channel="${label}" master=${info.isMaster ? 1 : 0} media=${mediaUrls}/${upstreamMediaUrls ?? mediaUrls} held=${heldBack || 0} seq=${info.mediaSequence ?? "n/a"} target=${info.targetDuration ?? "n/a"} first=${firstMedia || "n/a"} last=${lastMedia || "n/a"} q=${queueKey} attempts=${attempts} warmup=${warmupMs || 0}ms polls=${warmupPolls || 0} stale=${staleManifestMs || 0}ms staleReason=${staleManifestReason || "n/a"} ${openGapLog} time=${Date.now() - started}ms`);
+        console.log(`[HLS DIRECT SERVE] id=${reqId} channel="${label}" master=${info.isMaster ? 1 : 0} media=${mediaUrls}/${upstreamMediaUrls ?? mediaUrls} held=${heldBack || 0} released=${releasedHoldback || 0} seq=${info.mediaSequence ?? "n/a"} target=${info.targetDuration ?? "n/a"} first=${firstMedia || "n/a"} last=${lastMedia || "n/a"} q=${queueKey} attempts=${attempts} warmup=${warmupMs || 0}ms polls=${warmupPolls || 0} stale=${staleManifestMs || 0}ms staleReason=${staleManifestReason || "n/a"} ${openGapLog} time=${Date.now() - started}ms`);
         res.send(rewritten);
     } catch (err) {
         if (controller.signal.aborted) return;
@@ -1975,6 +2021,7 @@ app.get("/:base64Config/stream/:type/:id.json", async (req, res) => {
         const config = decodeConfig(configKey);
         const ch = await getChannelById(configKey, config, req.params.id);
         if (!ch) return res.status(404).json({ streams: [] });
+        preflightHLSStream(ch);
         res.json({ streams: [buildStream(ch, getPublicHost(req), configKey)] });
     } catch (err) {
         console.error("[STREAM ERROR]", err.message);
@@ -2044,6 +2091,7 @@ app.get("/:base64Config/debug", async (req, res) => {
                 HLS_UPSTREAM_RETRIES, HLS_UPSTREAM_RETRY_DELAY_MS,
                 HLS_COLD_START_WAIT_MS, HLS_COLD_START_RETRY_MS,
                 HLS_LIVE_MIN_SEGMENTS, HLS_LIVE_MIN_VISIBLE_SEGMENTS, HLS_LIVE_HOLDBACK_SEGMENTS,
+                HLS_STALE_HOLDBACK_RELEASE_TARGETS, HLS_START_OFFSET_TARGETS, HLS_STREAM_PREFLIGHT,
                 HLS_LIVE_WARMUP_WAIT_MS, HLS_LIVE_WARMUP_POLL_MS,
                 HLS_STALE_MANIFEST_TTL_MS, HLS_STALE_LIVE_TARGETS, HLS_STALE_FORBIDDEN_TARGETS,
                 HLS_FORBIDDEN_BACKOFF_MS, HLS_FORBIDDEN_SOURCE_REFRESH,
@@ -2066,7 +2114,7 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`🌐 http://0.0.0.0:${PORT}`);
     console.log(`📦 Node ${process.version}`);
     console.log(`🎬 playback=${PLAYBACK_MODE} noBuffer=1 noPrefetch=1 noSegmentCache=1`);
-    console.log(`🔁 manifest directFetch=1 timeout=${HLS_REQUEST_TIMEOUT / 1000}s retries=${HLS_UPSTREAM_RETRIES} retryDelay=${HLS_UPSTREAM_RETRY_DELAY_MS / 1000}s coldWait=${HLS_COLD_START_WAIT_MS / 1000}s coldRetry=${HLS_COLD_START_RETRY_MS / 1000}s liveMin=${HLS_LIVE_MIN_SEGMENTS} visible=${HLS_LIVE_MIN_VISIBLE_SEGMENTS} holdback=${HLS_LIVE_HOLDBACK_SEGMENTS} warmupWait=${HLS_LIVE_WARMUP_WAIT_MS / 1000}s staleTTL=${HLS_STALE_MANIFEST_TTL_MS / 1000}s staleLiveTargets=${HLS_STALE_LIVE_TARGETS} stale403Targets=${HLS_STALE_FORBIDDEN_TARGETS} forbiddenBackoff=${HLS_FORBIDDEN_BACKOFF_MS / 1000}s sourceRefresh403=${HLS_FORBIDDEN_SOURCE_REFRESH ? 1 : 0} waiting=${HLS_WAITING_MANIFEST_ON_ERROR ? 1 : 0}/${HLS_WAITING_TARGET_DURATION}s activeTtl=${ACTIVE_STREAM_TTL_MS / 1000}s`);
+    console.log(`🔁 manifest directFetch=1 timeout=${HLS_REQUEST_TIMEOUT / 1000}s retries=${HLS_UPSTREAM_RETRIES} retryDelay=${HLS_UPSTREAM_RETRY_DELAY_MS / 1000}s coldWait=${HLS_COLD_START_WAIT_MS / 1000}s coldRetry=${HLS_COLD_START_RETRY_MS / 1000}s liveMin=${HLS_LIVE_MIN_SEGMENTS} visible=${HLS_LIVE_MIN_VISIBLE_SEGMENTS} holdback=${HLS_LIVE_HOLDBACK_SEGMENTS} startOffset=${HLS_START_OFFSET_TARGETS} staleReleaseTargets=${HLS_STALE_HOLDBACK_RELEASE_TARGETS} preflight=${HLS_STREAM_PREFLIGHT ? 1 : 0} warmupWait=${HLS_LIVE_WARMUP_WAIT_MS / 1000}s staleTTL=${HLS_STALE_MANIFEST_TTL_MS / 1000}s staleLiveTargets=${HLS_STALE_LIVE_TARGETS} stale403Targets=${HLS_STALE_FORBIDDEN_TARGETS} forbiddenBackoff=${HLS_FORBIDDEN_BACKOFF_MS / 1000}s sourceRefresh403=${HLS_FORBIDDEN_SOURCE_REFRESH ? 1 : 0} waiting=${HLS_WAITING_MANIFEST_ON_ERROR ? 1 : 0}/${HLS_WAITING_TARGET_DURATION}s activeTtl=${ACTIVE_STREAM_TTL_MS / 1000}s`);
     console.log(`🔌 upstream keepAlive=1 sockets=${UPSTREAM_KEEPALIVE_MAX_SOCKETS} free=${UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS} ms=${UPSTREAM_KEEPALIVE_MS}`);
     console.log(`🩺 playback telemetry=1 ttl=${PLAYBACK_ACTIVITY_TTL_MS / 1000}s max=${PLAYBACK_ACTIVITY_MAX}`);
     console.log(`📋 playlist retryWindow=${PLAYLIST_RETRY_WINDOW_MS / 1000}s delay=${PLAYLIST_RETRY_DELAY_MS / 1000}s`);
