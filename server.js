@@ -134,7 +134,8 @@ const INGEST_WINDOW_SEGMENTS = Math.max(24, Number(process.env.INGEST_WINDOW_SEG
 const INGEST_LIVE_OFFSET_SECONDS = Math.max(0, Number(process.env.INGEST_LIVE_OFFSET_SECONDS || 120));
 const INGEST_MIN_VISIBLE_SECONDS = Math.max(12, Number(process.env.INGEST_MIN_VISIBLE_SECONDS || 24));
 const INGEST_MIN_VISIBLE_SEGMENTS = Math.max(3, Number(process.env.INGEST_MIN_VISIBLE_SEGMENTS || 8));
-const INGEST_PLAYER_HOLDBACK_SECONDS = Math.max(0, Number(process.env.INGEST_PLAYER_HOLDBACK_SECONDS || 12));
+const INGEST_TARGET_VISIBLE_SECONDS = Math.max(INGEST_MIN_VISIBLE_SECONDS, Number(process.env.INGEST_TARGET_VISIBLE_SECONDS || 120));
+const INGEST_PLAYER_HOLDBACK_SECONDS = Math.max(0, Number(process.env.INGEST_PLAYER_HOLDBACK_SECONDS || 45));
 const INGEST_PREBUFFER_SECONDS = Math.max(INGEST_MIN_VISIBLE_SECONDS, Number(process.env.INGEST_PREBUFFER_SECONDS ?? 28));
 // Feeder poll interval (auto-tuned per channel from the upstream target duration).
 const INGEST_POLL_MS = Math.max(1500, Number(process.env.INGEST_POLL_MS || 4000));
@@ -1801,13 +1802,13 @@ function trimUnpublishableTail(ingest, segments) {
 function trimSegmentsBehindLiveEdge(segments) {
     const keep = segments.slice();
     const rawBufferSec = sumSegmentDuration(keep);
-    const targetDelaySec = Math.min(INGEST_LIVE_OFFSET_SECONDS, Math.max(0, rawBufferSec - INGEST_MIN_VISIBLE_SECONDS));
+    const targetDelaySec = Math.min(INGEST_LIVE_OFFSET_SECONDS, Math.max(0, rawBufferSec - INGEST_TARGET_VISIBLE_SECONDS));
     let delaySec = 0;
 
     while (delaySec < targetDelaySec && keep.length > INGEST_MIN_VISIBLE_SEGMENTS) {
         const last = keep[keep.length - 1];
         const nextVisibleSec = rawBufferSec - delaySec - (last.duration || 0);
-        if (nextVisibleSec < INGEST_MIN_VISIBLE_SECONDS) break;
+        if (nextVisibleSec < INGEST_TARGET_VISIBLE_SECONDS) break;
         keep.pop();
         delaySec += last.duration || 0;
     }
@@ -2119,6 +2120,7 @@ app.get("/:base64Config/debug", async (req, res) => {
                 ACTIVE_STREAM_TTL_MS,
                 SEGMENT_UPSTREAM_CONCURRENCY, SEGMENT_UPSTREAM_RETRIES, SEGMENT_UPSTREAM_RETRY_DELAY_MS,
                 INGEST_WINDOW_SEGMENTS, INGEST_LIVE_OFFSET_SECONDS, INGEST_MIN_VISIBLE_SECONDS,
+                INGEST_TARGET_VISIBLE_SECONDS,
                 INGEST_MIN_VISIBLE_SEGMENTS, INGEST_PLAYER_HOLDBACK_SECONDS, INGEST_PREBUFFER_SECONDS,
                 INGEST_FIRST_SEGMENT_TIMEOUT_MS, INGEST_IDLE_TIMEOUT_MS, INGEST_BLOCKED_SEGMENT_MAX_MS,
                 INGEST_BLOCKED_SEGMENT_MAX_ATTEMPTS, INGEST_STDIN_DRAIN_TIMEOUT_MS,
@@ -2139,7 +2141,7 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`🌐 http://0.0.0.0:${PORT}`);
     console.log(`📦 Node ${process.version}`);
     console.log(`🎬 playback=${PLAYBACK_MODE} engine=ffmpeg(-c copy) bin=${FFMPEG_BIN}`);
-    console.log(`🎥 ingest mode=feeder-pipe seg=${INGEST_SEGMENT_SECONDS}s window=${INGEST_WINDOW_SEGMENTS} cushion=${INGEST_LIVE_OFFSET_SECONDS}s minVisible=${INGEST_MIN_VISIBLE_SECONDS}s prebuffer=${INGEST_PREBUFFER_SECONDS}s holdback=${INGEST_PLAYER_HOLDBACK_SECONDS}s publishDelay=${INGEST_PUBLISH_DELAY_SECONDS}s poll=${INGEST_POLL_MS}ms(auto) maxConcurrent=${INGEST_MAX_CONCURRENT} idle=${INGEST_IDLE_TIMEOUT_MS / 1000}s firstSegTimeout=${INGEST_FIRST_SEGMENT_TIMEOUT_MS / 1000}s`);
+    console.log(`🎥 ingest mode=feeder-pipe seg=${INGEST_SEGMENT_SECONDS}s window=${INGEST_WINDOW_SEGMENTS} cushion=${INGEST_LIVE_OFFSET_SECONDS}s minVisible=${INGEST_MIN_VISIBLE_SECONDS}s targetVisible=${INGEST_TARGET_VISIBLE_SECONDS}s prebuffer=${INGEST_PREBUFFER_SECONDS}s holdback=${INGEST_PLAYER_HOLDBACK_SECONDS}s publishDelay=${INGEST_PUBLISH_DELAY_SECONDS}s poll=${INGEST_POLL_MS}ms(auto) maxConcurrent=${INGEST_MAX_CONCURRENT} idle=${INGEST_IDLE_TIMEOUT_MS / 1000}s firstSegTimeout=${INGEST_FIRST_SEGMENT_TIMEOUT_MS / 1000}s`);
     console.log(`🔁 ingest respawn=${INGEST_RESPAWN_DELAY_MS}ms forbidden=${INGEST_FORBIDDEN_RESPAWN_DELAY_MS}ms drain=${INGEST_DRAIN_GRACE_MS}ms healthyRun=${INGEST_HEALTHY_RUN_MS / 1000}s maxRestarts=${INGEST_MAX_RESTARTS}`);
     console.log(`🔌 upstream keepAlive=1 sockets=${UPSTREAM_KEEPALIVE_MAX_SOCKETS} free=${UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS} ms=${UPSTREAM_KEEPALIVE_MS}`);
     console.log(`🩺 playback telemetry=1 ttl=${PLAYBACK_ACTIVITY_TTL_MS / 1000}s max=${PLAYBACK_ACTIVITY_MAX}`);
