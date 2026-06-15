@@ -130,11 +130,17 @@ const INGEST_MAX_CONCURRENT = Math.max(1, Number(process.env.INGEST_MAX_CONCURRE
 // ffmpeg sometimes exits on a transient upstream blip ("Failed to reload
 // playlist"). Respawn while the channel is still wanted, with backoff, and a
 // longer backoff on 403 so we never hammer the upstream into a temp ban.
-const INGEST_RESTART_BACKOFF_MS = Math.max(250, Number(process.env.INGEST_RESTART_BACKOFF_MS || 1500));
-const INGEST_RESTART_BACKOFF_MAX_MS = Math.max(2000, Number(process.env.INGEST_RESTART_BACKOFF_MAX_MS || 15000));
-const INGEST_FORBIDDEN_BACKOFF_MS = Math.max(2000, Number(process.env.INGEST_FORBIDDEN_BACKOFF_MS || 20000));
+// Respawn quickly on a transient exit. The upstream frees its single connection
+// slot a few seconds after the previous channel disconnects, so a fast fixed
+// retry reconnects as soon as the slot is free (instead of a slow escalating
+// backoff that would blow the manifest timeout on a zap).
+const INGEST_RESPAWN_DELAY_MS = Math.max(500, Number(process.env.INGEST_RESPAWN_DELAY_MS || 2500));
+// When zapping, wait for the previous channel's ffmpeg to fully close before
+// connecting the new one, to minimise the upstream connection-limit 403.
+const INGEST_DRAIN_TIMEOUT_MS = Math.max(500, Number(process.env.INGEST_DRAIN_TIMEOUT_MS || 4000));
+const INGEST_DRAIN_GRACE_MS = Math.max(0, Number(process.env.INGEST_DRAIN_GRACE_MS || 1500));
 const INGEST_HEALTHY_RUN_MS = Math.max(5000, Number(process.env.INGEST_HEALTHY_RUN_MS || 25000));
-const INGEST_MAX_RESTARTS = Math.max(1, Number(process.env.INGEST_MAX_RESTARTS || 10));
+const INGEST_MAX_RESTARTS = Math.max(1, Number(process.env.INGEST_MAX_RESTARTS || 12));
 const INGEST_HTTP_RETRY_CODES = String(process.env.INGEST_HTTP_RETRY_CODES || "429,500,502,503,504,520,521,522,524");
 const INGEST_PREFLIGHT = String(process.env.INGEST_PREFLIGHT ?? "0") !== "0";
 
@@ -1356,8 +1362,7 @@ function scheduleRespawn(ingest, ranMs, tail) {
     }
 
     const forbidden = /403|Forbidden|access denied/i.test(tail);
-    const base = forbidden ? INGEST_FORBIDDEN_BACKOFF_MS : INGEST_RESTART_BACKOFF_MS;
-    const delay = Math.min(base * ingest.failures, INGEST_RESTART_BACKOFF_MAX_MS + (forbidden ? INGEST_FORBIDDEN_BACKOFF_MS : 0));
+    const delay = INGEST_RESPAWN_DELAY_MS;
     ingest.restarts++;
     console.log(`[INGEST RESPAWN] channel="${ingest.label}" key=${ingest.shortKey} in=${delay}ms failures=${ingest.failures} forbidden=${forbidden ? 1 : 0}`);
     ingest.respawnTimer = setTimeout(() => {
@@ -1369,13 +1374,17 @@ function scheduleRespawn(ingest, ranMs, tail) {
 }
 
 // Enforce the upstream's concurrent-connection budget: stop the least-recently
-// used OTHER ingests so we never hold more than INGEST_MAX_CONCURRENT at once.
-function enforceConcurrency(keepKey) {
+// used OTHER ingests, then WAIT for their ffmpeg (and upstream socket) to close
+// before the caller connects the new channel — otherwise the new one gets a 403.
+async function freeConnectionSlot(keepKey) {
     const others = [...ingests.values()].filter(i => i.key !== keepKey);
     if (others.length + 1 <= INGEST_MAX_CONCURRENT) return;
     others.sort((a, b) => a.lastAccess - b.lastAccess); // oldest first
-    const toStop = others.length + 1 - INGEST_MAX_CONCURRENT;
-    for (let i = 0; i < toStop; i++) stopIngest(others[i], "freeing connection slot (zap)");
+    const toStop = others.slice(0, others.length + 1 - INGEST_MAX_CONCURRENT);
+    for (const i of toStop) stopIngest(i, "freeing connection slot (zap)");
+    const deadline = Date.now() + INGEST_DRAIN_TIMEOUT_MS;
+    while (Date.now() < deadline && toStop.some(i => !i.exited)) await sleep(100);
+    if (INGEST_DRAIN_GRACE_MS) await sleep(INGEST_DRAIN_GRACE_MS); // let the upstream register the disconnect
 }
 
 function ensureIngest(ingestKey, url, label) {
@@ -1403,7 +1412,6 @@ function ensureIngest(ingestKey, url, label) {
         if (label) ingest.label = label;
         ingest.lastAccess = Date.now();
     }
-    enforceConcurrency(ingestKey);
     spawnIngest(ingest);
     startIngestReaper();
     return ingest;
@@ -1513,6 +1521,9 @@ app.get("/:base64Config/live/:cid/index.m3u8", async (req, res) => {
         if (!ch || !ch.url) return res.status(404).type("text/plain").send("#EXTM3U\n");
         label = ch.name || "live";
         const ingestKey = `${configKey}:${cid}`;
+        // Zapping: stop any other channel and wait for its upstream connection to
+        // close before we connect this one (the upstream allows only N at once).
+        if (!ingests.has(ingestKey) || ingests.get(ingestKey)?.exited) await freeConnectionSlot(ingestKey);
         const ingest = ensureIngest(ingestKey, ch.url, label);
         ingest.lastAccess = Date.now();
 
@@ -1672,7 +1683,7 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`📦 Node ${process.version}`);
     console.log(`🎬 playback=${PLAYBACK_MODE} engine=ffmpeg(-c copy) bin=${FFMPEG_BIN}`);
     console.log(`🎥 ingest seg=${INGEST_SEGMENT_SECONDS}s window=${INGEST_WINDOW_SEGMENTS} cushion=${INGEST_LIVE_OFFSET_SECONDS}s prebuffer=${INGEST_PREBUFFER_SECONDS}s maxConcurrent=${INGEST_MAX_CONCURRENT} idle=${INGEST_IDLE_TIMEOUT_MS / 1000}s firstSegTimeout=${INGEST_FIRST_SEGMENT_TIMEOUT_MS / 1000}s preflight=${INGEST_PREFLIGHT ? 1 : 0}`);
-    console.log(`🔁 ingest respawn backoff=${INGEST_RESTART_BACKOFF_MS}-${INGEST_RESTART_BACKOFF_MAX_MS}ms forbidden=${INGEST_FORBIDDEN_BACKOFF_MS}ms healthyRun=${INGEST_HEALTHY_RUN_MS / 1000}s maxRestarts=${INGEST_MAX_RESTARTS} httpRetry=${INGEST_HTTP_RETRY_CODES}`);
+    console.log(`🔁 ingest respawn=${INGEST_RESPAWN_DELAY_MS}ms drain=${INGEST_DRAIN_GRACE_MS}ms healthyRun=${INGEST_HEALTHY_RUN_MS / 1000}s maxRestarts=${INGEST_MAX_RESTARTS} httpRetry=${INGEST_HTTP_RETRY_CODES}`);
     console.log(`🔌 upstream keepAlive=1 sockets=${UPSTREAM_KEEPALIVE_MAX_SOCKETS} free=${UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS} ms=${UPSTREAM_KEEPALIVE_MS}`);
     console.log(`🩺 playback telemetry=1 ttl=${PLAYBACK_ACTIVITY_TTL_MS / 1000}s max=${PLAYBACK_ACTIVITY_MAX}`);
     console.log(`📋 playlist retryWindow=${PLAYLIST_RETRY_WINDOW_MS / 1000}s delay=${PLAYLIST_RETRY_DELAY_MS / 1000}s`);
