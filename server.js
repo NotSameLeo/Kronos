@@ -50,7 +50,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "3.3.18";
+const RELEASE_VERSION = "3.3.19";
 const ADDON_TYPE = "tv";
 const PLAYBACK_MODE = "uhf-direct-relay";
 const CATALOG_TTL = 30 * 60 * 1000;
@@ -292,6 +292,20 @@ function getSegmentQueueKey(sourceUrl) {
 function getErrorStatus(err) {
     const status = Number(err?.response?.status || err?.status || 0);
     return Number.isFinite(status) && status > 0 ? status : null;
+}
+
+function getHttpFallbackUrl(sourceUrl) {
+    try {
+        const u = new URL(sourceUrl);
+        if (u.protocol !== "https:") return "";
+        u.protocol = "http:";
+        return u.toString();
+    } catch { return ""; }
+}
+
+function isHttpsPlainHttpError(err) {
+    const message = String(err?.message || "");
+    return err?.code === "EPROTO" && /wrong version number|ssl3_get_record/i.test(message);
 }
 
 function isRetryableSegmentError(err) {
@@ -749,10 +763,12 @@ async function fetchPlaylist(sourceUrl, options = {}) {
     const deadline = Date.now() + (options.retryWindow || PLAYLIST_RETRY_WINDOW_MS);
     let attempt = 0;
     let lastErr = null;
+    let requestUrl = sourceUrl;
+    let usedHttpFallback = false;
     while (Date.now() < deadline) {
         attempt++;
         try {
-            const response = await axios.get(sourceUrl, {
+            const response = await axios.get(requestUrl, {
                 timeout: Math.max(1, Math.min(options.timeout || PLAYLIST_REQUEST_TIMEOUT, deadline - Date.now())),
                 ...upstreamAgentOptions(),
                 maxRedirects: 5,
@@ -766,10 +782,17 @@ async function fetchPlaylist(sourceUrl, options = {}) {
             });
             const data = String(response.data || "");
             if (!data.trimStart().startsWith("#EXTM3U")) throw new Error("Invalid M3U playlist from upstream");
-            console.log("[FETCH PLAYLIST OK]", sourceUrl, "size=" + data.length, "attempt=" + attempt);
+            console.log("[FETCH PLAYLIST OK]", requestUrl, "size=" + data.length, "attempt=" + attempt);
             return response.data;
         } catch (err) {
             lastErr = err;
+            const fallbackUrl = !usedHttpFallback && isHttpsPlainHttpError(err) ? getHttpFallbackUrl(requestUrl) : "";
+            if (fallbackUrl) {
+                usedHttpFallback = true;
+                requestUrl = fallbackUrl;
+                console.warn(`[FETCH PLAYLIST HTTP FALLBACK] ${sourceUrl} -> ${fallbackUrl} reason=${err.message}`);
+                continue;
+            }
             console.warn(`[FETCH PLAYLIST RETRY] attempt=${attempt} reason=${err.message}`);
         }
         const sleepMs = Math.min(PLAYLIST_RETRY_DELAY_MS, deadline - Date.now());
@@ -1113,9 +1136,11 @@ function assertNoHlsBackoff(sourceUrl) {
 async function fetchUpstreamHLS(sourceUrl, label = "stream", signal = null) {
     assertNoHlsBackoff(sourceUrl);
     let lastErr = null;
+    let requestUrl = sourceUrl;
+    let usedHttpFallback = false;
     for (let attempt = 1; attempt <= HLS_UPSTREAM_RETRIES + 1; attempt++) {
         try {
-            const r = await axios.get(sourceUrl, {
+            const r = await axios.get(requestUrl, {
                 timeout: HLS_REQUEST_TIMEOUT,
                 signal,
                 ...upstreamAgentOptions(),
@@ -1128,7 +1153,7 @@ async function fetchUpstreamHLS(sourceUrl, label = "stream", signal = null) {
                 },
                 validateStatus: s => s >= 200 && s < 300
             });
-            const finalUrl = r.request?.res?.responseUrl || sourceUrl;
+            const finalUrl = r.request?.res?.responseUrl || requestUrl;
             const text = String(r.data || "").trim();
             if (!text.startsWith("#EXTM3U")) {
                 const err = new Error(`Invalid HLS manifest from upstream for ${label}`);
@@ -1141,6 +1166,14 @@ async function fetchUpstreamHLS(sourceUrl, label = "stream", signal = null) {
             return result;
         } catch (err) {
             lastErr = err;
+            const fallbackUrl = !usedHttpFallback && isHttpsPlainHttpError(err) ? getHttpFallbackUrl(requestUrl) : "";
+            if (fallbackUrl) {
+                usedHttpFallback = true;
+                requestUrl = fallbackUrl;
+                console.warn(`[HLS HTTP FALLBACK] channel="${label}" ${sourceUrl} -> ${fallbackUrl} reason=${err.message}`);
+                attempt--;
+                continue;
+            }
             if (signal?.aborted || !isRetryableHlsError(err) || attempt > HLS_UPSTREAM_RETRIES) {
                 noteHlsBackoff(sourceUrl, err);
                 throw err;
@@ -1930,9 +1963,11 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
 // client behind the server-side VPN: no segment cache, no synthetic ids.
 async function fetchSegmentResponse(sourceUrl, headers, signal = null) {
     let lastErr = null;
+    let requestUrl = sourceUrl;
+    let usedHttpFallback = false;
     for (let attempt = 1; attempt <= SEGMENT_UPSTREAM_RETRIES + 1; attempt++) {
         try {
-            return await axios.get(sourceUrl, {
+            return await axios.get(requestUrl, {
                 responseType: "stream",
                 timeout: SEG_REQUEST_TIMEOUT,
                 signal,
@@ -1946,6 +1981,14 @@ async function fetchSegmentResponse(sourceUrl, headers, signal = null) {
             });
         } catch (err) {
             lastErr = err;
+            const fallbackUrl = !usedHttpFallback && isHttpsPlainHttpError(err) ? getHttpFallbackUrl(requestUrl) : "";
+            if (fallbackUrl) {
+                usedHttpFallback = true;
+                requestUrl = fallbackUrl;
+                console.warn(`[SEG HTTP FALLBACK] ${getSegmentLabel(sourceUrl)} -> ${getSegmentLabel(fallbackUrl)} reason=${err.message}`);
+                attempt--;
+                continue;
+            }
             if (signal?.aborted || !isRetryableSegmentError(err) || attempt > SEGMENT_UPSTREAM_RETRIES) throw err;
             console.warn(`[SEG RETRY] ${getSegmentLabel(sourceUrl)} attempt=${attempt} reason=${err.message}`);
             if (SEGMENT_UPSTREAM_RETRY_DELAY_MS > 0) await sleep(SEGMENT_UPSTREAM_RETRY_DELAY_MS);

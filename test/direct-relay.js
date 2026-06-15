@@ -82,7 +82,7 @@ async function main() {
     const mock = createMockUpstream();
     await new Promise(resolve => mock.server.listen(0, "127.0.0.1", resolve));
     const upstreamOrigin = `http://127.0.0.1:${mock.server.address().port}`;
-    const sourceUrl = `${upstreamOrigin}/playlist.m3u`;
+    const sourceUrl = `https://127.0.0.1:${mock.server.address().port}/playlist.m3u`;
     const streamUrl = `${upstreamOrigin}/live/direct.m3u8`;
     const config = encodeConfig({ l: [{ n: "Direct", u: sourceUrl }], g: ["IT | TEST"], gm: "filter" });
     const id = channelId(sourceUrl, streamUrl);
@@ -129,6 +129,7 @@ async function main() {
 
         const oldNestedResponse = await request(`${kronosOrigin}/${config}/proxy/pl?u=${Buffer.from(streamUrl).toString("base64url")}`, {}, 2000);
         assert.equal(oldNestedResponse.status, 404, "legacy stable nested-playlist route is still exposed");
+        assert(logs.join("").includes("[FETCH PLAYLIST HTTP FALLBACK]"), "https-to-http playlist fallback was not exercised");
 
         const segmentLine = manifest.split(/\r?\n/).find(line => line.includes("/proxy/seg?u="));
         const segmentUrl = new URL(segmentLine, kronosOrigin).toString();
