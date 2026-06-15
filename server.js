@@ -103,8 +103,6 @@ const PLAYLIST_RETRY_WINDOW_MS = Number(process.env.PLAYLIST_RETRY_WINDOW_MS || 
 const PLAYLIST_RETRY_DELAY_MS = Number(process.env.PLAYLIST_RETRY_DELAY_MS || 2000);
 const EPG_TIME_ZONE = process.env.EPG_TIME_ZONE || "Europe/Rome";
 
-const SLOW_SEGMENT_MS = Number(process.env.SLOW_SEGMENT_MS || 4000);
-
 // ── ffmpeg live ingest configuration ──────────────────────────────────────────
 // We run one ffmpeg per active channel. ffmpeg behaves like a real IPTV client
 // (like UHF): it follows token rotation, reconnects on upstream errors, and
@@ -305,73 +303,22 @@ function getEffectiveEpgUrl(config, lists = []) {
     return configured;
 }
 
-function encodeProxyUrl(url) { return Buffer.from(String(url), "utf8").toString("base64url"); }
-function decodeProxyUrl(enc) { return Buffer.from(String(enc), "base64url").toString("utf8"); }
 function hashKey(value) { return crypto.createHash("sha1").update(String(value)).digest("hex").slice(0, 20); }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-function analyzeHLS(text) {
-    const lines = String(text || "").split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-    const td = lines.find(l => l.startsWith("#EXT-X-TARGETDURATION:"));
-    const seq = lines.find(l => l.startsWith("#EXT-X-MEDIA-SEQUENCE:"));
-    return {
-        isMaster: lines.some(l => l.startsWith("#EXT-X-STREAM-INF")),
-        isLive: !lines.some(l => l.startsWith("#EXT-X-ENDLIST")),
-        segmentCount: lines.filter(l => l && !l.startsWith("#")).length,
-        targetDuration: td ? Number(td.split(":")[1]) : null,
-        mediaSequence: seq ? Number(seq.split(":")[1]) : null
-    };
-}
-
-function toAbsoluteUrl(value, baseUrl) {
-    try { return new URL(value, baseUrl).toString(); } catch { return value; }
-}
 function isHttpUrl(v) { return /^https?:\/\//i.test(String(v || "")); }
 function isHlsUrl(v) { return /\.m3u8(?:[?#].*)?$/i.test(String(v || "")); }
 function isPlayableHttpUrl(v) { return /^https?:\/\//i.test(String(v || "")); }
-function makeAbortController(res) {
-    const controller = new AbortController();
-    res.on("close", () => {
-        if (!res.writableEnded) controller.abort();
-    });
-    return controller;
-}
 
 function escapeXml(value) {
     return String(value || "")
         .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-function formatBytes(bytes) {
-    const v = Number(bytes || 0);
-    if (v < 1024) return `${v}B`;
-    if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)}KB`;
-    return `${(v / 1024 / 1024).toFixed(2)}MB`;
-}
-
 function getPublicHost(req) {
     const proto = req.get("x-forwarded-proto") || req.protocol;
     const host = req.get("x-forwarded-host") || req.get("host");
     return `${proto}://${host}`;
-}
-
-function getSegmentLabel(sourceUrl) {
-    try {
-        const u = new URL(sourceUrl);
-        return decodeURIComponent(u.pathname.split("/").filter(Boolean).pop() || "segment");
-    } catch {
-        return String(sourceUrl || "").split("?")[0].split("/").filter(Boolean).pop() || "segment";
-    }
-}
-
-function getSegmentQueueKey(sourceUrl) {
-    try {
-        const u = new URL(sourceUrl);
-        const dir = u.pathname.replace(/\/[^/]*$/, "/");
-        return `${u.protocol}//${u.host}${dir}`;
-    } catch {
-        return String(sourceUrl || "").split("?")[0].replace(/\/[^/]*$/, "/");
-    }
 }
 
 function getErrorStatus(err) {
@@ -391,19 +338,6 @@ function getHttpFallbackUrl(sourceUrl) {
 function isHttpsPlainHttpError(err) {
     const message = String(err?.message || "");
     return err?.code === "EPROTO" && /wrong version number|ssl3_get_record/i.test(message);
-}
-
-function isRetryableSegmentError(err) {
-    const status = getErrorStatus(err);
-    if ([408, 425, 429, 500, 502, 503, 504].includes(status)) return true;
-    return ["ECONNRESET", "ECONNABORTED", "ETIMEDOUT", "EPIPE"].includes(err?.code);
-}
-
-function isRetryableHlsError(err) {
-    const status = getErrorStatus(err);
-    if ([408, 425, 429, 500, 502, 503, 504].includes(status)) return true;
-    return ["ECONNRESET", "ECONNABORTED", "ETIMEDOUT", "EPIPE", "INVALID_HLS"].includes(err?.code)
-        || /timeout/i.test(String(err?.message || ""));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1050,309 +984,6 @@ async function getChannelById(configKey, config, id) {
     return memoryCache.channelIndex[configKey]?.[id] || null;
 }
 
-function channelNameKey(value) {
-    return normalizeSearchText(stripInitialCountryPrefix(value));
-}
-
-function sourceTailKey(value) {
-    try {
-        const url = new URL(value);
-        return decodeURIComponent(url.pathname.split("/").filter(Boolean).pop() || "").toLowerCase();
-    } catch {
-        return "";
-    }
-}
-
-function findFreshChannel(channels, channelId, sourceUrl, label) {
-    if (!Array.isArray(channels) || !channels.length) return null;
-    if (channelId) {
-        const byId = channels.find(ch => ch.id === channelId);
-        if (byId?.url) return byId;
-    }
-
-    const sourceHash = hashKey(sourceUrl);
-    const byHash = channels.find(ch => ch.url && hashKey(ch.url) === sourceHash);
-    if (byHash?.url) return byHash;
-
-    const labelKey = channelNameKey(label);
-    const tailKey = sourceTailKey(sourceUrl);
-    if (labelKey && tailKey) {
-        const byNameAndTail = channels.find(ch => channelNameKey(ch.name) === labelKey && sourceTailKey(ch.url) === tailKey);
-        if (byNameAndTail?.url) return byNameAndTail;
-    }
-    if (labelKey) {
-        const byName = channels.find(ch => channelNameKey(ch.name) === labelKey);
-        if (byName?.url) return byName;
-    }
-    if (tailKey) {
-        const byTail = channels.find(ch => sourceTailKey(ch.url) === tailKey);
-        if (byTail?.url) return byTail;
-    }
-    return null;
-}
-
-async function recoverHlsSourceAfterForbidden(configKey, config, sourceUrl, label, channelId, err) {
-    if (!HLS_FORBIDDEN_SOURCE_REFRESH || !isForbiddenHlsError(err)) return null;
-    const recoveryKey = `${configKey}:${channelId || hashKey(sourceUrl)}:${hashKey(sourceUrl)}`;
-    if (hlsSourceRecoveries.has(recoveryKey)) return await hlsSourceRecoveries.get(recoveryKey);
-
-    const promise = (async () => {
-        const started = Date.now();
-        let channels = [];
-        try {
-            channels = await fetchAndProcessChannels(configKey, config, { force: true });
-        } catch (refreshErr) {
-            console.warn(`[HLS SOURCE RECOVER FAIL] channel="${label}" stage=playlist reason=${refreshErr.message}`);
-            return null;
-        }
-
-        const fresh = findFreshChannel(channels, channelId, sourceUrl, label);
-        if (!fresh?.url || !isHlsUrl(fresh.url)) {
-            console.warn(`[HLS SOURCE RECOVER MISS] channel="${label}" channelId=${channelId || "n/a"} refresh=${Date.now() - started}ms`);
-            return null;
-        }
-
-        const changed = fresh.url !== sourceUrl;
-        clearHlsBackoff(sourceUrl);
-        if (changed) clearHlsBackoff(fresh.url);
-        console.warn(`[HLS SOURCE RECOVER] channel="${label}" channelId=${channelId || "n/a"} changed=${changed ? 1 : 0} refresh=${Date.now() - started}ms status=${getErrorStatus(err) || err?.code || "n/a"}`);
-
-        try {
-            const result = await fetchPlayableHLS(fresh.url, fresh.name || label);
-            return { sourceUrl: fresh.url, label: fresh.name || label, result };
-        } catch (retryErr) {
-            console.warn(`[HLS SOURCE RECOVER FAIL] channel="${label}" stage=manifest status=${getErrorStatus(retryErr) || retryErr?.code || "n/a"} reason=${retryErr.message}`);
-            return null;
-        }
-    })();
-
-    hlsSourceRecoveries.set(recoveryKey, promise);
-    try { return await promise; }
-    finally { hlsSourceRecoveries.delete(recoveryKey); }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// HLS relay
-// ─────────────────────────────────────────────────────────────────────────────
-const hlsLastGoodManifests = new Map();
-const hlsManifestBackoffs = new Map();
-const hlsSourceRecoveries = new Map();
-
-function rememberGoodHLS(sourceUrl, result) {
-    if (!HLS_STALE_MANIFEST_TTL_MS || !result?.info) return;
-    if (!result.info.isMaster && result.info.isLive && result.info.segmentCount < HLS_LIVE_MIN_VISIBLE_SEGMENTS) return;
-    hlsLastGoodManifests.set(hashKey(sourceUrl), { ...result, storedAt: Date.now() });
-    hlsManifestBackoffs.delete(hashKey(sourceUrl));
-}
-
-function isStaleHlsEligibleError(err) {
-    const status = getErrorStatus(err);
-    if (err?.code === "HLS_BACKOFF") return true;
-    if ([403, 408, 425, 429, 500, 502, 503, 504].includes(status)) return true;
-    return ["ECONNRESET", "ECONNABORTED", "ETIMEDOUT", "EPIPE", "INVALID_HLS"].includes(err?.code)
-        || /timeout/i.test(String(err?.message || ""));
-}
-
-function isColdStartHlsRetryable(err) {
-    return isStaleHlsEligibleError(err);
-}
-
-function getStaleHLS(sourceUrl, label, err, warmupMs = 0, warmupPolls = 0) {
-    if (!HLS_STALE_MANIFEST_TTL_MS || !isStaleHlsEligibleError(err)) return null;
-    const key = hashKey(sourceUrl);
-    const entry = hlsLastGoodManifests.get(key);
-    if (!entry) return null;
-    const age = Date.now() - entry.storedAt;
-    const status = getErrorStatus(err) || err?.code || "n/a";
-    const isForbidden = status === 403 || String(status) === "HLS_BACKOFF";
-    const targetMs = Math.max(0, Number(entry.info?.targetDuration || 0) * 1000);
-    const liveTargets = isForbidden ? HLS_STALE_FORBIDDEN_TARGETS : HLS_STALE_LIVE_TARGETS;
-    const liveCapMs = entry.info?.isLive && targetMs > 0 && liveTargets > 0
-        ? targetMs * liveTargets
-        : HLS_STALE_MANIFEST_TTL_MS;
-    const maxAge = Math.max(0, Math.min(HLS_STALE_MANIFEST_TTL_MS, liveCapMs));
-    if (age > maxAge) {
-        console.warn(`[HLS STALE EXPIRED] channel="${label}" age=${age}ms max=${maxAge}ms status=${status} reason=${err.message}`);
-        hlsLastGoodManifests.delete(key);
-        return null;
-    }
-    console.warn(`[HLS STALE MANIFEST] channel="${label}" age=${age}ms status=${status} reason=${err.message}`);
-    return {
-        ...entry,
-        attempts: 0,
-        warmupMs,
-        warmupPolls,
-        staleManifestMs: age,
-        staleManifestReason: status
-    };
-}
-
-function noteHlsBackoff(sourceUrl, err) {
-    if (!HLS_FORBIDDEN_BACKOFF_MS || getErrorStatus(err) !== 403) return;
-    hlsManifestBackoffs.set(hashKey(sourceUrl), { until: Date.now() + HLS_FORBIDDEN_BACKOFF_MS, status: 403 });
-}
-
-function clearHlsBackoff(sourceUrl) {
-    hlsManifestBackoffs.delete(hashKey(sourceUrl));
-}
-
-function isForbiddenHlsError(err) {
-    const status = getErrorStatus(err);
-    return status === 403 || err?.code === "HLS_BACKOFF";
-}
-
-function assertNoHlsBackoff(sourceUrl) {
-    if (!HLS_FORBIDDEN_BACKOFF_MS) return;
-    const key = hashKey(sourceUrl);
-    const backoff = hlsManifestBackoffs.get(key);
-    if (!backoff) return;
-    if (Date.now() >= backoff.until) {
-        hlsManifestBackoffs.delete(key);
-        return;
-    }
-    const err = new Error(`Upstream HLS manifest temporarily backed off after status ${backoff.status}`);
-    err.code = "HLS_BACKOFF";
-    err.status = backoff.status;
-    throw err;
-}
-
-// Fetch the manifest requested by the player without inventing live state. A
-// short bounded retry absorbs transient Xtream 5xx/timeouts without hiding a
-// genuinely broken upstream behind synthetic playlists.
-async function fetchUpstreamHLS(sourceUrl, label = "stream", signal = null) {
-    assertNoHlsBackoff(sourceUrl);
-    let lastErr = null;
-    let requestUrl = sourceUrl;
-    let usedHttpFallback = false;
-    for (let attempt = 1; attempt <= HLS_UPSTREAM_RETRIES + 1; attempt++) {
-        try {
-            const r = await axios.get(requestUrl, {
-                timeout: HLS_REQUEST_TIMEOUT,
-                signal,
-                ...upstreamAgentOptions(),
-                maxRedirects: 5,
-                headers: {
-                    "User-Agent": UPSTREAM_UA,
-                    "Accept": "application/x-mpegURL, application/vnd.apple.mpegurl, audio/mpegurl, text/plain, */*",
-                    "Accept-Encoding": "gzip, deflate",
-                    "Connection": "keep-alive"
-                },
-                validateStatus: s => s >= 200 && s < 300
-            });
-            const finalUrl = r.request?.res?.responseUrl || requestUrl;
-            const text = String(r.data || "").trim();
-            if (!text.startsWith("#EXTM3U")) {
-                const err = new Error(`Invalid HLS manifest from upstream for ${label}`);
-                err.code = "INVALID_HLS";
-                err.status = getErrorStatus({ response: r }) || r.status;
-                throw err;
-            }
-            const result = { data: r.data, finalUrl, info: analyzeHLS(text), attempts: attempt };
-            rememberGoodHLS(sourceUrl, result);
-            return result;
-        } catch (err) {
-            lastErr = err;
-            const fallbackUrl = !usedHttpFallback && isHttpsPlainHttpError(err) ? getHttpFallbackUrl(requestUrl) : "";
-            if (fallbackUrl) {
-                usedHttpFallback = true;
-                requestUrl = fallbackUrl;
-                console.warn(`[HLS HTTP FALLBACK] channel="${label}" ${sourceUrl} -> ${fallbackUrl} reason=${err.message}`);
-                attempt--;
-                continue;
-            }
-            if (signal?.aborted || !isRetryableHlsError(err) || attempt > HLS_UPSTREAM_RETRIES) {
-                noteHlsBackoff(sourceUrl, err);
-                throw err;
-            }
-            console.warn(`[HLS RETRY] channel="${label}" attempt=${attempt} reason=${err.message}`);
-            if (HLS_UPSTREAM_RETRY_DELAY_MS > 0) await sleep(HLS_UPSTREAM_RETRY_DELAY_MS);
-        }
-    }
-    throw lastErr || new Error(`HLS manifest fetch failed for ${label}`);
-}
-
-function needsLiveWarmup(info) {
-    if (!info || info.isMaster || !info.isLive) return false;
-    if (info.segmentCount >= HLS_LIVE_MIN_SEGMENTS) return false;
-    return (info.mediaSequence ?? 0) <= 1;
-}
-
-async function waitForColdStartHLS(sourceUrl, label, firstErr, started, signal = null) {
-    if (!HLS_COLD_START_WAIT_MS || !isColdStartHlsRetryable(firstErr)) return null;
-    const deadline = started + HLS_COLD_START_WAIT_MS;
-    let polls = 0;
-    let lastErr = firstErr;
-    console.warn(`[HLS COLD WAIT] channel="${label}" status=${getErrorStatus(firstErr) || firstErr?.code || "n/a"} wait=${HLS_COLD_START_WAIT_MS}ms reason=${firstErr.message}`);
-
-    while (!signal?.aborted && Date.now() < deadline) {
-        const delay = Math.min(HLS_COLD_START_RETRY_MS, Math.max(0, deadline - Date.now()));
-        if (delay > 0) await sleep(delay);
-        if (signal?.aborted) break;
-        polls++;
-        clearHlsBackoff(sourceUrl);
-        try {
-            const result = await fetchUpstreamHLS(sourceUrl, label, signal);
-            const waited = Date.now() - started;
-            console.log(`[HLS COLD READY] channel="${label}" media=${result.info.segmentCount} seq=${result.info.mediaSequence ?? "n/a"} wait=${waited}ms polls=${polls}`);
-            return { ...result, coldStartMs: waited, coldStartPolls: polls };
-        } catch (err) {
-            lastErr = err;
-            const stale = getStaleHLS(sourceUrl, label, err, Date.now() - started, polls);
-            if (stale) return stale;
-            if (!isColdStartHlsRetryable(err)) break;
-            console.warn(`[HLS COLD RETRY] channel="${label}" poll=${polls} status=${getErrorStatus(err) || err?.code || "n/a"} reason=${err.message}`);
-        }
-    }
-
-    console.warn(`[HLS COLD GIVEUP] channel="${label}" wait=${Date.now() - started}ms polls=${polls} status=${getErrorStatus(lastErr) || lastErr?.code || "n/a"} reason=${lastErr.message}`);
-    throw lastErr;
-}
-
-async function fetchPlayableHLS(sourceUrl, label = "stream", signal = null) {
-    const started = Date.now();
-    let result;
-    try {
-        result = await fetchUpstreamHLS(sourceUrl, label, signal);
-    } catch (err) {
-        const stale = getStaleHLS(sourceUrl, label, err);
-        if (stale) return stale;
-        result = await waitForColdStartHLS(sourceUrl, label, err, started, signal);
-        if (!result) throw err;
-    }
-    if (!needsLiveWarmup(result.info) || HLS_LIVE_WARMUP_WAIT_MS <= 0) return { ...result, warmupMs: 0, warmupPolls: 0 };
-
-    let polls = 0;
-    let lastWarmupErr = null;
-    console.warn(`[HLS WARMUP] channel="${label}" media=${result.info.segmentCount}/${HLS_LIVE_MIN_SEGMENTS} seq=${result.info.mediaSequence ?? "n/a"} target=${result.info.targetDuration ?? "n/a"}`);
-    while (!signal?.aborted && Date.now() - started < HLS_LIVE_WARMUP_WAIT_MS) {
-        polls++;
-        await sleep(HLS_LIVE_WARMUP_POLL_MS);
-        try {
-            result = await fetchUpstreamHLS(sourceUrl, label, signal);
-        } catch (err) {
-            const stale = getStaleHLS(sourceUrl, label, err, Date.now() - started, polls);
-            if (stale) return stale;
-            if (isColdStartHlsRetryable(err) && Date.now() - started < HLS_LIVE_WARMUP_WAIT_MS) {
-                lastWarmupErr = err;
-                console.warn(`[HLS WARMUP RETRY] channel="${label}" poll=${polls} status=${getErrorStatus(err) || err?.code || "n/a"} reason=${err.message}`);
-                continue;
-            }
-            throw err;
-        }
-        if (!needsLiveWarmup(result.info)) {
-            const warmupMs = Date.now() - started;
-            console.log(`[HLS WARMUP READY] channel="${label}" media=${result.info.segmentCount} seq=${result.info.mediaSequence ?? "n/a"} wait=${warmupMs}ms polls=${polls}`);
-            return { ...result, warmupMs, warmupPolls: polls };
-        }
-    }
-
-    console.warn(`[HLS WARMUP GIVEUP] channel="${label}" media=${result.info.segmentCount}/${HLS_LIVE_MIN_SEGMENTS} seq=${result.info.mediaSequence ?? "n/a"} wait=${Date.now() - started}ms polls=${polls} lastError=${lastWarmupErr?.message || "n/a"}`);
-    return { ...result, warmupMs: Date.now() - started, warmupPolls: polls };
-}
-
-const hlsWarmups = new Map();
-const activeStreams = new Map();
-const playbackActivities = new Map();
 let playbackRequestCounter = 0;
 
 function nextPlaybackRequestId(prefix) {
@@ -1360,80 +991,8 @@ function nextPlaybackRequestId(prefix) {
     return `${prefix}${playbackRequestCounter.toString(36)}`;
 }
 
-function playbackActivityKey(configKey, streamKey, sourceUrl) {
-    return `${configKey}:${streamKey || hashKey(sourceUrl)}`;
-}
-
-function prunePlaybackActivities(now = Date.now()) {
-    for (const [key, activity] of playbackActivities.entries()) {
-        if (now - (activity.lastSeenAt || activity.firstSeenAt || 0) > PLAYBACK_ACTIVITY_TTL_MS) {
-            playbackActivities.delete(key);
-        }
-    }
-    if (playbackActivities.size <= PLAYBACK_ACTIVITY_MAX) return;
-    const oldest = [...playbackActivities.entries()]
-        .sort((a, b) => (a[1].lastSeenAt || 0) - (b[1].lastSeenAt || 0));
-    for (const [key] of oldest) {
-        if (playbackActivities.size <= PLAYBACK_ACTIVITY_MAX) break;
-        playbackActivities.delete(key);
-    }
-}
-
-function notePlaybackActivity(key, fields = {}) {
-    if (!key) return null;
-    const now = Date.now();
-    const activity = playbackActivities.get(key) || { firstSeenAt: now };
-    Object.assign(activity, fields, { lastSeenAt: now });
-    playbackActivities.set(key, activity);
-    if (playbackActivities.size > PLAYBACK_ACTIVITY_MAX) prunePlaybackActivities(now);
-    return activity;
-}
-
-function formatIdleMs(value) {
-    return value == null ? "never" : `${Math.max(0, Math.round(value))}ms`;
-}
-
-function playbackGapFields(activity, now = Date.now()) {
-    return {
-        idleHls: activity?.lastManifestRequestAt ? now - activity.lastManifestRequestAt : null,
-        idleHlsServe: activity?.lastManifestServeAt ? now - activity.lastManifestServeAt : null,
-        idleSegReq: activity?.lastSegmentRequestAt ? now - activity.lastSegmentRequestAt : null,
-        idleSegDone: activity?.lastSegmentFinishAt ? now - activity.lastSegmentFinishAt : null
-    };
-}
-
-function formatPlaybackGaps(gaps) {
-    return `idleHls=${formatIdleMs(gaps.idleHls)} idleHlsServe=${formatIdleMs(gaps.idleHlsServe)} idleSegReq=${formatIdleMs(gaps.idleSegReq)} idleSegDone=${formatIdleMs(gaps.idleSegDone)}`;
-}
-
 function playbackClientTag(req) {
     return hashKey(`${req.ip || req.socket?.remoteAddress || ""}|${req.get("user-agent") || ""}`).slice(0, 10);
-}
-
-async function fetchPlayableHLSShared(sourceUrl, label = "stream") {
-    const key = hashKey(sourceUrl);
-    const current = hlsWarmups.get(key);
-    if (current) return await current;
-    const promise = fetchPlayableHLS(sourceUrl, label);
-    hlsWarmups.set(key, promise);
-    try { return await promise; }
-    finally { hlsWarmups.delete(key); }
-}
-
-function setActiveStream(configKey, streamKey, label) {
-    if (!ACTIVE_STREAM_TTL_MS) return;
-    activeStreams.set(configKey, { streamKey, label, updatedAt: Date.now() });
-}
-
-function isStaleStream(configKey, streamKey) {
-    if (!ACTIVE_STREAM_TTL_MS || !streamKey) return false;
-    const current = activeStreams.get(configKey);
-    if (!current) return false;
-    if (Date.now() - current.updatedAt > ACTIVE_STREAM_TTL_MS) {
-        activeStreams.delete(configKey);
-        return false;
-    }
-    return current.streamKey !== streamKey;
 }
 
 async function getLogoDataUri(logoUrl) {
@@ -1695,74 +1254,6 @@ function setPlaylistHeaders(res) {
     res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, no-transform");
     res.setHeader("Pragma", "no-cache");
-}
-
-function sendWaitingManifest(res, label, err, started, reqId = "n/a", gapLog = "") {
-    const status = getErrorStatus(err) || err?.code || "n/a";
-    setPlaylistHeaders(res);
-    res.setHeader("Retry-After", String(HLS_WAITING_TARGET_DURATION));
-    console.warn(`[HLS WAITING MANIFEST] id=${reqId} channel="${label}" ${gapLog} status=${status} time=${Date.now() - started}ms reason=${err.message}`);
-    return res.send([
-        "#EXTM3U",
-        "#EXT-X-VERSION:3",
-        `#EXT-X-TARGETDURATION:${HLS_WAITING_TARGET_DURATION}`,
-        "#EXT-X-MEDIA-SEQUENCE:0",
-        ""
-    ].join("\n"));
-}
-
-const segmentQueues = new Map();
-
-function acquireSegmentSlot(key, signal) {
-    const requestedAt = Date.now();
-    let state = segmentQueues.get(key);
-    if (!state) {
-        state = { active: 0, waiters: [] };
-        segmentQueues.set(key, state);
-    }
-
-    return new Promise((resolve, reject) => {
-        let settled = false;
-        let waiter = null;
-
-        const cleanupAbort = () => signal?.removeEventListener?.("abort", onAbort);
-        const release = () => {
-            state.active = Math.max(0, state.active - 1);
-            const next = state.waiters.shift();
-            if (next) next();
-            else if (state.active === 0) segmentQueues.delete(key);
-        };
-        const grant = () => {
-            if (settled) return;
-            settled = true;
-            cleanupAbort();
-            state.active++;
-            resolve({ release, waitMs: Date.now() - requestedAt, queueSize: state.waiters.length });
-        };
-        const onAbort = () => {
-            if (settled) return;
-            settled = true;
-            if (waiter) {
-                const i = state.waiters.indexOf(waiter);
-                if (i !== -1) state.waiters.splice(i, 1);
-            }
-            cleanupAbort();
-            if (state.active === 0 && state.waiters.length === 0) segmentQueues.delete(key);
-            reject(new Error("Segment request aborted"));
-        };
-
-        if (signal?.aborted) return onAbort();
-        if (state.active < SEGMENT_UPSTREAM_CONCURRENCY) return grant();
-        waiter = grant;
-        state.waiters.push(waiter);
-        signal?.addEventListener?.("abort", onAbort, { once: true });
-    });
-}
-
-async function withSegmentSlot(queueKey, signal, fn) {
-    const slot = await acquireSegmentSlot(queueKey, signal);
-    try { return await fn(slot); }
-    finally { slot.release(); }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2100,15 +1591,21 @@ app.get("/:base64Config/stats", (req, res) => {
             epgMaps: Object.keys(memoryCache.epgData).length,
             logos: Object.keys(memoryCache.logoData).length
         },
-        upstream: {
-            directRelay: true,
-            segmentConcurrency: SEGMENT_UPSTREAM_CONCURRENCY,
-            segmentQueues: segmentQueues.size,
-            hlsWarmups: hlsWarmups.size,
-            hlsLastGoodManifests: hlsLastGoodManifests.size,
-            hlsManifestBackoffs: hlsManifestBackoffs.size,
-            activeStreams: activeStreams.size,
-            playbackActivities: playbackActivities.size
+        ingest: {
+            engine: "ffmpeg",
+            active: ingests.size,
+            maxConcurrent: INGEST_MAX_CONCURRENT,
+            cushionSeconds: INGEST_LIVE_OFFSET_SECONDS,
+            prebufferSeconds: INGEST_PREBUFFER_SECONDS,
+            channels: [...ingests.values()].map(i => ({
+                label: i.label,
+                pid: i.pid,
+                up: !i.exited,
+                restarts: i.restarts,
+                failures: i.failures || 0,
+                ageSeconds: Math.round((Date.now() - (i.startedAt || Date.now())) / 1000),
+                idleSeconds: Math.round((Date.now() - i.lastAccess) / 1000)
+            }))
         }
     });
 });
