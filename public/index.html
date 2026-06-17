@@ -497,7 +497,7 @@
         }
 
         .group-options {
-            max-height: 190px;
+            max-height: 310px;
             overflow: auto;
             padding: 10px;
             display: grid;
@@ -505,17 +505,17 @@
         }
 
         .group-option {
-            display: flex;
+            display: grid;
+            grid-template-columns: auto minmax(130px, 1fr) minmax(150px, 1fr) auto auto auto;
             align-items: center;
             gap: 10px;
             padding: 10px;
             border-radius: 12px;
             background: rgba(255, 255, 255, 0.055);
             border: 1px solid rgba(255, 255, 255, 0.08);
-            cursor: pointer;
         }
 
-        .group-option input {
+        .group-option input[type="checkbox"] {
             width: 16px;
             flex: 0 0 auto;
             padding: 0;
@@ -523,14 +523,31 @@
 
         .group-option span {
             min-width: 0;
-            flex: 1;
             overflow-wrap: anywhere;
             font-weight: 800;
+        }
+
+        .group-option input[type="text"] {
+            min-width: 0;
+            padding: 8px 10px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            background: rgba(7, 8, 13, 0.55);
+            font-size: 0.86rem;
         }
 
         .group-option small {
             color: var(--muted);
             white-space: nowrap;
+        }
+
+        .group-move {
+            min-height: 34px;
+            padding: 0 10px;
+            border-radius: 10px;
+            color: #d9fbff;
+            background: rgba(56, 223, 244, 0.08);
+            border: 1px solid rgba(56, 223, 244, 0.2);
         }
 
         .assistant-actions {
@@ -971,7 +988,8 @@
             .link-tools,
             .assistant-actions,
             .playlist-actions,
-            .playlist-row {
+            .playlist-row,
+            .group-option {
                 grid-template-columns: 1fr;
             }
 
@@ -1106,7 +1124,7 @@
                     </div>
                     <div id="groupOptions" class="group-options"></div>
                     <div class="assistant-actions">
-                        <button type="button" id="insertGroupsButton" class="insert-groups-button">Inserisci gruppi selezionati</button>
+                        <button type="button" id="insertGroupsButton" class="insert-groups-button">Applica categorie selezionate</button>
                         <button type="button" id="selectAllGroupsButton" class="ghost-button" title="Seleziona tutti" aria-label="Seleziona tutti">Tutti</button>
                     </div>
                 </div>
@@ -1218,6 +1236,7 @@
         let analysisData = null;
         let analysisSignature = '';
         let groupsInsertedFromAnalysis = false;
+        let categoryConfig = [];
 
         function parseGroups() {
             return groups.value.split(',').map(item => item.trim()).filter(Boolean);
@@ -1225,6 +1244,31 @@
 
         function normalizeGroupName(group) {
             return String(group || '').trim().toLowerCase();
+        }
+
+        function cleanGroupName(group) {
+            return String(group || '')
+                .trim()
+                .replace(/^\s*IT\s*\|\s*/i, '')
+                .replace(/^\s*IT\s*:\s*/i, '')
+                .trim();
+        }
+
+        function getCategoryRows() {
+            return [...groupOptions.querySelectorAll('.group-option')];
+        }
+
+        function getCategoryConfig() {
+            const rows = getCategoryRows();
+            if (!rows.length) return categoryConfig.slice();
+            return rows
+                .filter(row => row.querySelector('[data-group-enabled]').checked)
+                .map(row => {
+                    const id = row.dataset.groupId;
+                    const fallback = row.dataset.groupDefault || id;
+                    const name = row.querySelector('[data-group-name]').value.trim() || fallback;
+                    return { id, name: cleanGroupName(name) || fallback };
+                });
         }
 
         function getPlaylistRows() {
@@ -1359,6 +1403,7 @@
             analysisData = null;
             analysisSignature = '';
             groupsInsertedFromAnalysis = false;
+            categoryConfig = [];
             groupAssistant.classList.remove('is-visible');
             groupOptions.innerHTML = '';
         }
@@ -1399,63 +1444,119 @@
         function renderAnalysis() {
             const totalGroups = analysisData.groups.length;
             analysisTitle.textContent = `${totalGroups} gruppi individuati`;
-            analysisSummary.textContent = `${analysisData.totalChannels} canali letti da ${analysisData.totalLists} liste. I canali aggregati includeranno il nome lista tra parentesi.`;
+            analysisSummary.textContent = `${analysisData.totalChannels} canali letti. Scegli, rinomina e riordina le categorie da mostrare in Stremio.`;
             groupOptions.innerHTML = '';
 
-            analysisData.groups.forEach((group, index) => {
-                const label = document.createElement('label');
-                label.className = 'group-option';
+            const previous = new Map(categoryConfig.map((item, index) => [normalizeGroupName(item.id), { ...item, index }]));
+            const orderedGroups = analysisData.groups.slice().sort((a, b) => {
+                const ai = previous.get(normalizeGroupName(a.name))?.index ?? Number.MAX_SAFE_INTEGER;
+                const bi = previous.get(normalizeGroupName(b.name))?.index ?? Number.MAX_SAFE_INTEGER;
+                return ai - bi || b.count - a.count || a.name.localeCompare(b.name);
+            });
+
+            orderedGroups.forEach((group, index) => {
+                const saved = previous.get(normalizeGroupName(group.name));
+                const row = document.createElement('div');
+                row.className = 'group-option';
+                row.dataset.groupId = group.name;
+                row.dataset.groupDefault = cleanGroupName(saved?.name || group.name) || group.name;
 
                 const input = document.createElement('input');
                 input.type = 'checkbox';
+                input.dataset.groupEnabled = '1';
                 input.value = group.name;
-                input.checked = index < 8;
+                input.checked = saved ? true : index < 8;
 
                 const name = document.createElement('span');
-                name.textContent = group.name;
+                name.textContent = cleanGroupName(group.name) || group.name;
+
+                const display = document.createElement('input');
+                display.type = 'text';
+                display.dataset.groupName = '1';
+                display.value = cleanGroupName(saved?.name || group.name) || group.name;
+                display.placeholder = 'Nome in Stremio';
 
                 const count = document.createElement('small');
                 count.textContent = `${group.count} canali`;
 
-                label.append(input, name, count);
-                groupOptions.appendChild(label);
+                const up = document.createElement('button');
+                up.type = 'button';
+                up.className = 'group-move';
+                up.textContent = 'Su';
+                up.addEventListener('click', function() {
+                    const prev = row.previousElementSibling;
+                    if (prev) groupOptions.insertBefore(row, prev);
+                    categoryConfig = getCategoryConfig();
+                    updatePreview();
+                });
+
+                const down = document.createElement('button');
+                down.type = 'button';
+                down.className = 'group-move';
+                down.textContent = 'Giu';
+                down.addEventListener('click', function() {
+                    const next = row.nextElementSibling;
+                    if (next) groupOptions.insertBefore(next, row);
+                    categoryConfig = getCategoryConfig();
+                    updatePreview();
+                });
+
+                [input, display].forEach(element => {
+                    element.addEventListener('input', function() {
+                        categoryConfig = getCategoryConfig();
+                        groupsInsertedFromAnalysis = true;
+                        updatePreview();
+                    });
+                    element.addEventListener('change', function() {
+                        categoryConfig = getCategoryConfig();
+                        groupsInsertedFromAnalysis = true;
+                        updatePreview();
+                    });
+                });
+
+                row.append(input, name, display, count, up, down);
+                groupOptions.appendChild(row);
             });
 
             groupAssistant.classList.add('is-visible');
+            categoryConfig = getCategoryConfig();
+            updatePreview();
         }
 
         function getSelectedAnalyzedGroups() {
-            return [...groupOptions.querySelectorAll('input:checked')].map(input => input.value);
+            return getCategoryConfig();
         }
 
         function setGroupsFromAnalysis() {
-            const selectedGroups = getSelectedAnalyzedGroups();
-            if (!selectedGroups.length) {
+            categoryConfig = getSelectedAnalyzedGroups();
+            if (!categoryConfig.length) {
                 showToast('Seleziona almeno un gruppo individuato');
                 return;
             }
 
-            groups.value = selectedGroups.join(', ');
+            groups.value = categoryConfig.map(item => item.id).join(', ');
             groupsInsertedFromAnalysis = true;
             updatePreview();
-            showToast('Gruppi inseriti');
+            showToast('Categorie applicate');
         }
 
         function getConfig() {
             const lists = getLists();
+            const categories = getCategoryConfig();
             return {
                 l: lists,
                 u: lists[0]?.u || '',
                 e: epgUrl.value.trim() || null,
-                g: parseGroups(),
-                gm: groupsInsertedFromAnalysis ? 'filter' : 'list'
+                g: categories.length ? categories.map(item => item.id) : parseGroups(),
+                cg: categories.length ? categories : undefined,
+                gm: categories.length || groupsInsertedFromAnalysis ? 'filter' : 'list'
             };
         }
 
         function updatePreview() {
             const config = getConfig();
             const ready = Boolean(config.l.length);
-            const groupList = config.g.length ? config.g : config.l.map(list => list.n);
+            const groupList = config.cg?.length ? config.cg.map(item => item.name) : (config.g.length ? config.g : config.l.map(list => list.n));
 
             playlistState.textContent = String(config.l.length);
             epgState.textContent = config.e ? 'Si' : 'No';
@@ -1552,7 +1653,10 @@
             (lists.length ? lists : [{ n: 'Lista 1', u: '' }]).forEach(createPlaylistRow);
 
             epgUrl.value = config.e || '';
-            groups.value = Array.isArray(config.g) ? config.g.join(', ') : '';
+            categoryConfig = Array.isArray(config.cg)
+                ? config.cg.map(item => ({ id: item.id || item.name, name: item.name || item.id })).filter(item => item.id)
+                : [];
+            groups.value = categoryConfig.length ? categoryConfig.map(item => item.id).join(', ') : (Array.isArray(config.g) ? config.g.join(', ') : '');
             groupsInsertedFromAnalysis = config.gm === 'filter';
             analysisSignature = groupsInsertedFromAnalysis ? getListSignature(lists) : '';
             groupAssistant.classList.remove('is-visible');
@@ -1586,6 +1690,12 @@
                 const firstUrl = getPlaylistRows()[0]?.querySelector('[data-list-url]');
                 firstUrl?.reportValidity();
                 return null;
+            }
+
+            if (config.cg?.length) {
+                config.gm = 'filter';
+                config.g = config.cg.map(item => item.id);
+                return config;
             }
 
             if (!config.g.length) {
@@ -1675,11 +1785,15 @@
         analyzeButton.addEventListener('click', fetchAnalysis);
         insertGroupsButton.addEventListener('click', setGroupsFromAnalysis);
         selectAllGroupsButton.addEventListener('click', function() {
-            groupOptions.querySelectorAll('input').forEach(input => input.checked = true);
+            groupOptions.querySelectorAll('[data-group-enabled]').forEach(input => input.checked = true);
+            categoryConfig = getCategoryConfig();
+            groupsInsertedFromAnalysis = true;
+            updatePreview();
         });
 
         groups.addEventListener('input', function() {
             groupsInsertedFromAnalysis = false;
+            categoryConfig = [];
         });
 
         [epgUrl, groups].forEach(element => {

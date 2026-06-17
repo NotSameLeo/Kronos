@@ -51,7 +51,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "4.1.1";
+const RELEASE_VERSION = "4.2.0";
 const ADDON_TYPE = "tv";
 const PLAYBACK_MODE = "transparent-relay";
 const CATALOG_TTL = 30 * 60 * 1000;
@@ -983,6 +983,33 @@ function decorateChannelName(channel, totalLists, mode) {
     return `${base} (${getListAbbreviation(channel.sourceName)})`;
 }
 function normalizeGroupName(g) { return cleanGroupName(g).toLowerCase(); }
+function getCategoryCustomizations(config) {
+    if (!Array.isArray(config?.cg)) return [];
+    return config.cg
+        .map(item => ({
+            id: cleanGroupName(item?.id || item?.name || ""),
+            name: cleanGroupName(item?.name || item?.id || "")
+        }))
+        .filter(item => item.id && item.name);
+}
+function getSelectedGroups(config) {
+    const custom = getCategoryCustomizations(config);
+    if (custom.length) return custom.map(item => item.id);
+    return Array.isArray(config.g) ? config.g : [];
+}
+function getDisplayGroupName(config, group) {
+    const normalized = normalizeGroupName(group);
+    const custom = getCategoryCustomizations(config).find(item => normalizeGroupName(item.id) === normalized);
+    return custom?.name || cleanGroupName(group);
+}
+function sortGroupsForManifest(config, groups) {
+    const order = new Map(getCategoryCustomizations(config).map((item, index) => [normalizeGroupName(item.name), index]));
+    return groups.slice().sort((a, b) => {
+        const ai = order.has(normalizeGroupName(a)) ? order.get(normalizeGroupName(a)) : Number.MAX_SAFE_INTEGER;
+        const bi = order.has(normalizeGroupName(b)) ? order.get(normalizeGroupName(b)) : Number.MAX_SAFE_INTEGER;
+        return ai - bi || a.localeCompare(b, "it", { sensitivity: "base" });
+    });
+}
 function normalizeSearchText(v) {
     return String(v || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase()
         .replace(/&/g, " e ").replace(/[^a-z0-9]+/gi, " ").replace(/\s+/g, " ").trim();
@@ -1032,7 +1059,7 @@ async function fetchAndProcessChannels(configKey, config, options = {}) {
                 return null;
             })
             : null;
-        const selectedGroups = Array.isArray(config.g) ? config.g : [];
+        const selectedGroups = getSelectedGroups(config);
         const selectedSet = new Set(selectedGroups.map(normalizeGroupName));
         const bucketGroup = selectedGroups[0] || "Kronos";
 
@@ -1049,7 +1076,7 @@ async function fetchAndProcessChannels(configKey, config, options = {}) {
                 return {
                     ...c,
                     name: decorateChannelName(c, lists.length, config.gm),
-                    group: config.gm === "bucket" ? cleanGroupName(bucketGroup) : cleanGroupName(c.group)
+                    group: config.gm === "bucket" ? cleanGroupName(bucketGroup) : getDisplayGroupName(config, c.group)
                 };
             });
         let epgData = getCachedEPG(epgUrl);
@@ -1209,9 +1236,8 @@ app.get("/:base64Config/manifest.json", async (req, res) => {
 
         const catalogs = getConfiguredLists(config).map(list => {
             const catalogChannels = channels.filter(c => c.sourceName === list.name);
-            const groups = [...new Set(catalogChannels.map(c => c.group))]
-                .filter(g => g && g.trim())
-                .sort((a, b) => a.localeCompare(b, "it", { sensitivity: "base" }));
+            const groups = sortGroupsForManifest(config, [...new Set(catalogChannels.map(c => c.group))]
+                .filter(g => g && g.trim()));
             const extra = [{ name: "search", isRequired: false }];
             if (groups.length > 0) extra.push({ name: "genre", options: groups, isRequired: false });
             return { id: toCatalogId(list.name), type: ADDON_TYPE, name: list.name, extra };
