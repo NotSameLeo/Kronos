@@ -51,7 +51,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "4.2.0";
+const RELEASE_VERSION = "4.3.0";
 const ADDON_TYPE = "tv";
 const PLAYBACK_MODE = "transparent-relay";
 const CATALOG_TTL = 30 * 60 * 1000;
@@ -83,6 +83,11 @@ function isBlockedPlaylist(url) {
 }
 const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 15000);
 const SEG_REQUEST_TIMEOUT = Number(process.env.SEG_REQUEST_TIMEOUT || 45000);
+const HLS_MANIFEST_RETRIES = Math.max(0, Number(process.env.HLS_MANIFEST_RETRIES || 1));
+const HLS_MANIFEST_RETRY_DELAY_MS = Math.max(0, Number(process.env.HLS_MANIFEST_RETRY_DELAY_MS || 500));
+const HLS_STALE_MANIFEST_TTL_MS = Math.max(0, Number(process.env.HLS_STALE_MANIFEST_TTL_MS || 60000));
+const SEGMENT_UPSTREAM_RETRIES = Math.max(0, Number(process.env.SEGMENT_UPSTREAM_RETRIES || 1));
+const SEGMENT_UPSTREAM_RETRY_DELAY_MS = Math.max(0, Number(process.env.SEGMENT_UPSTREAM_RETRY_DELAY_MS || 350));
 const UPSTREAM_KEEPALIVE_MAX_SOCKETS = Math.max(1, Number(process.env.UPSTREAM_KEEPALIVE_MAX_SOCKETS || 8));
 const UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS = Math.max(1, Number(process.env.UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS || 4));
 const UPSTREAM_KEEPALIVE_MS = Math.max(1000, Number(process.env.UPSTREAM_KEEPALIVE_MS || 60000));
@@ -94,7 +99,7 @@ const EPG_TIME_ZONE = process.env.EPG_TIME_ZONE || "Europe/Rome";
 // ── Transparent relay configuration ───────────────────────────────────────────
 // No VPN, no re-mux, no buffer: just relay the (non-geo-blocked) upstream with the
 // right User-Agent and nudge the player to start a touch behind the live edge.
-const PROXY_START_OFFSET_SECONDS = Math.max(0, Number(process.env.PROXY_START_OFFSET_SECONDS || 15));
+const PROXY_START_OFFSET_SECONDS = Math.max(0, Number(process.env.PROXY_START_OFFSET_SECONDS || 10));
 
 const upstreamHttpAgent = new http.Agent({
     keepAlive: true,
@@ -133,6 +138,8 @@ const memoryCache = {
     epgSubscribers: {},   // epgUrl -> Set<configKey>
     configByKey: {},      // configKey -> decoded config
     logoData: {},         // logoUrl -> data: URI
+    hlsManifestData: {},  // hash(configKey|url) -> { text, updatedAt }
+    hlsManifestInflight: {},
     isUpdating: {}
 };
 
@@ -1405,6 +1412,75 @@ function toAbsoluteUrl(value, baseUrl) { try { return new URL(value, baseUrl).to
 
 const RELAY_HEADERS = { "User-Agent": UPSTREAM_UA, "Accept": "*/*" };
 
+function hlsManifestCacheKey(configKey, upstream) {
+    return hashKey(`${configKey}|${upstream}`);
+}
+
+async function retryOperation(label, retries, delayMs, fn) {
+    let lastErr = null;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            return await fn(attempt);
+        } catch (err) {
+            lastErr = err;
+            if (attempt >= retries) break;
+            if (delayMs > 0) await sleep(delayMs);
+        }
+    }
+    throw lastErr || new Error(`${label} failed`);
+}
+
+async function fetchUpstreamManifest(upstream) {
+    return retryOperation("manifest", HLS_MANIFEST_RETRIES, HLS_MANIFEST_RETRY_DELAY_MS, async attempt => {
+        const response = await axios.get(upstream, {
+            responseType: "text", timeout: HLS_REQUEST_TIMEOUT, maxRedirects: 5,
+            headers: RELAY_HEADERS, ...upstreamAgentOptions(), validateStatus: s => s >= 200 && s < 300
+        });
+        const data = String(response.data || "");
+        if (!data.trimStart().startsWith("#EXTM3U")) throw new Error("Invalid HLS manifest from upstream");
+        if (attempt > 0) console.warn(`[PROXY M3U8 RECOVERED] attempt=${attempt + 1}`);
+        return { data, finalUrl: response.request?.res?.responseUrl || upstream };
+    });
+}
+
+async function getRewrittenManifest(configKey, upstream, host) {
+    const key = hlsManifestCacheKey(configKey, upstream);
+    if (memoryCache.hlsManifestInflight[key]) return memoryCache.hlsManifestInflight[key];
+
+    const promise = (async () => {
+        try {
+            const fetched = await fetchUpstreamManifest(upstream);
+            const text = rewriteManifest(fetched.data, fetched.finalUrl, host, configKey);
+            memoryCache.hlsManifestData[key] = { text, updatedAt: Date.now(), upstream };
+            return { text, stale: false };
+        } catch (err) {
+            const cached = memoryCache.hlsManifestData[key];
+            const age = cached ? Date.now() - cached.updatedAt : Infinity;
+            if (cached && age <= HLS_STALE_MANIFEST_TTL_MS) {
+                console.warn(`[PROXY M3U8 STALE] age=${Math.round(age / 1000)}s reason=${err.message}`);
+                return { text: cached.text, stale: true };
+            }
+            throw err;
+        }
+    })();
+
+    memoryCache.hlsManifestInflight[key] = promise;
+    try { return await promise; }
+    finally { delete memoryCache.hlsManifestInflight[key]; }
+}
+
+async function fetchSegmentStream(upstream, headers) {
+    return retryOperation("segment", SEGMENT_UPSTREAM_RETRIES, SEGMENT_UPSTREAM_RETRY_DELAY_MS, async attempt => {
+        const response = await axios.get(upstream, {
+            responseType: "stream", timeout: SEG_REQUEST_TIMEOUT, maxRedirects: 5, headers,
+            ...upstreamAgentOptions(), decompress: false, maxContentLength: Infinity, maxBodyLength: Infinity,
+            validateStatus: s => s >= 200 && s < 300
+        });
+        if (attempt > 0) console.warn(`[PROXY SEG RECOVERED] attempt=${attempt + 1}`);
+        return response;
+    });
+}
+
 // Rewrite an upstream HLS manifest so every URL points back through our relay
 // (master variants -> /proxy/live.m3u8, media segments + URI= keys -> /proxy/seg),
 // and inject a small startup offset on media playlists.
@@ -1442,13 +1518,11 @@ app.get("/:base64Config/proxy/live.m3u8", async (req, res) => {
         decodeConfig(configKey);
         const upstream = decodeProxyUrl(req.query.u || "");
         if (!isHttpUrl(upstream)) return res.status(400).type("text/plain").send("#EXTM3U\n");
-        const r = await axios.get(upstream, {
-            responseType: "text", timeout: HLS_REQUEST_TIMEOUT, maxRedirects: 5,
-            headers: RELAY_HEADERS, ...upstreamAgentOptions(), validateStatus: s => s >= 200 && s < 300
-        });
-        const finalUrl = r.request?.res?.responseUrl || upstream;
+        const manifest = await getRewrittenManifest(configKey, upstream, getPublicHost(req));
         setPlaylistHeaders(res);
-        res.send(rewriteManifest(String(r.data), finalUrl, getPublicHost(req), configKey));
+        res.setHeader("X-Kronos-Relay", "1");
+        res.setHeader("X-Kronos-Cache", manifest.stale ? "stale" : "fresh");
+        res.send(manifest.text);
     } catch (err) {
         console.error(`[PROXY M3U8] ${err?.message || err}`);
         if (!res.headersSent) res.status(502).type("text/plain").send("#EXTM3U\n");
@@ -1463,11 +1537,7 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
         if (!isHttpUrl(upstream)) return res.status(400).end();
         const headers = { ...RELAY_HEADERS };
         if (req.headers.range) headers.Range = req.headers.range;
-        const r = await axios.get(upstream, {
-            responseType: "stream", timeout: SEG_REQUEST_TIMEOUT, maxRedirects: 5, headers,
-            ...upstreamAgentOptions(), decompress: false, maxContentLength: Infinity, maxBodyLength: Infinity,
-            validateStatus: s => s >= 200 && s < 300
-        });
+        const r = await fetchSegmentStream(upstream, headers);
         res.status(r.status);
         for (const h of ["content-type", "content-length", "content-range", "accept-ranges", "last-modified", "etag"]) {
             if (r.headers[h]) res.setHeader(h, r.headers[h]);
@@ -1507,12 +1577,16 @@ app.get("/:base64Config/stats", (req, res) => {
         cache: {
             channels: Object.values(memoryCache.channelItems).reduce((s, l) => s + l.length, 0),
             epgMaps: Object.keys(memoryCache.epgData).length,
-            logos: Object.keys(memoryCache.logoData).length
+            logos: Object.keys(memoryCache.logoData).length,
+            hlsManifests: Object.keys(memoryCache.hlsManifestData).length
         },
         playback: {
             mode: "transparent-relay",
             vpn: false,
-            startOffsetSeconds: PROXY_START_OFFSET_SECONDS
+            startOffsetSeconds: PROXY_START_OFFSET_SECONDS,
+            manifestRetries: HLS_MANIFEST_RETRIES,
+            staleManifestTtlMs: HLS_STALE_MANIFEST_TTL_MS,
+            segmentRetries: SEGMENT_UPSTREAM_RETRIES
         }
     });
 });
@@ -1554,6 +1628,8 @@ app.get("/:base64Config/debug", async (req, res) => {
             constants: {
                 ADDON_TYPE, RELEASE_VERSION, PLAYBACK_MODE,
                 HLS_REQUEST_TIMEOUT, SEG_REQUEST_TIMEOUT, PROXY_START_OFFSET_SECONDS,
+                HLS_MANIFEST_RETRIES, HLS_MANIFEST_RETRY_DELAY_MS, HLS_STALE_MANIFEST_TTL_MS,
+                SEGMENT_UPSTREAM_RETRIES, SEGMENT_UPSTREAM_RETRY_DELAY_MS,
                 UPSTREAM_KEEPALIVE_MAX_SOCKETS, UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS, UPSTREAM_KEEPALIVE_MS,
                 PLAYLIST_REQUEST_TIMEOUT, PLAYLIST_RETRY_WINDOW_MS, PLAYLIST_RETRY_DELAY_MS
             }
@@ -1571,7 +1647,7 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`🎬 playback=transparent-relay vpn=off remux=off startOffset=${PROXY_START_OFFSET_SECONDS}s hlsTimeout=${HLS_REQUEST_TIMEOUT / 1000}s segTimeout=${SEG_REQUEST_TIMEOUT / 1000}s`);
     console.log(`🔌 upstream keepAlive=1 sockets=${UPSTREAM_KEEPALIVE_MAX_SOCKETS} free=${UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS} ms=${UPSTREAM_KEEPALIVE_MS}`);
     console.log(`📋 playlist retryWindow=${PLAYLIST_RETRY_WINDOW_MS / 1000}s delay=${PLAYLIST_RETRY_DELAY_MS / 1000}s`);
-    console.log(`🎞️ segment timeout=${SEG_REQUEST_TIMEOUT / 1000}s rangeForward=1`);
+    console.log(`🎞️ hls retries=${HLS_MANIFEST_RETRIES} staleTtl=${HLS_STALE_MANIFEST_TTL_MS / 1000}s segmentRetries=${SEGMENT_UPSTREAM_RETRIES} rangeForward=1`);
     console.log(`📺 epg timezone=${EPG_TIME_ZONE} timeout=${EPG_REQUEST_TIMEOUT / 1000}s firstWait=${EPG_FIRST_CATALOG_WAIT_MS / 1000}s retryDelay=${EPG_RETRY_DELAY_MS / 1000}s cacheTTL=${EPG_CACHE_TTL / 1000}s refresh=${EPG_REFRESH_INTERVAL_MS / 1000}s preload=${EPG_PRELOAD_URLS.length} startupWatch=${EPG_STARTUP_WATCH_MS / 1000}s`);
     console.log(`📚 catalog preload=${CATALOG_PRELOAD_CONFIGS.length}`);
     console.log("=".repeat(60) + "\n");

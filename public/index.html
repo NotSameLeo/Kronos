@@ -506,13 +506,36 @@
 
         .group-option {
             display: grid;
-            grid-template-columns: auto minmax(130px, 1fr) minmax(150px, 1fr) auto auto auto;
+            grid-template-columns: auto auto minmax(130px, 1fr) minmax(150px, 1fr) auto;
             align-items: center;
             gap: 10px;
             padding: 10px;
             border-radius: 12px;
             background: rgba(255, 255, 255, 0.055);
             border: 1px solid rgba(255, 255, 255, 0.08);
+        }
+
+        .group-option.is-dragging {
+            opacity: 0.55;
+            border-color: rgba(56, 223, 244, 0.48);
+        }
+
+        .group-drag-handle {
+            display: grid;
+            place-items: center;
+            width: 34px;
+            height: 34px;
+            border-radius: 10px;
+            color: #d9fbff;
+            background: rgba(56, 223, 244, 0.08);
+            border: 1px solid rgba(56, 223, 244, 0.2);
+            cursor: grab;
+            user-select: none;
+            font-weight: 900;
+        }
+
+        .group-drag-handle:active {
+            cursor: grabbing;
         }
 
         .group-option input[type="checkbox"] {
@@ -539,15 +562,6 @@
         .group-option small {
             color: var(--muted);
             white-space: nowrap;
-        }
-
-        .group-move {
-            min-height: 34px;
-            padding: 0 10px;
-            border-radius: 10px;
-            color: #d9fbff;
-            background: rgba(56, 223, 244, 0.08);
-            border: 1px solid rgba(56, 223, 244, 0.2);
         }
 
         .assistant-actions {
@@ -1243,7 +1257,7 @@
         }
 
         function normalizeGroupName(group) {
-            return String(group || '').trim().toLowerCase();
+            return cleanGroupName(group).toLowerCase();
         }
 
         function cleanGroupName(group) {
@@ -1269,6 +1283,97 @@
                     const name = row.querySelector('[data-group-name]').value.trim() || fallback;
                     return { id, name: cleanGroupName(name) || fallback };
                 });
+        }
+
+        function getDragAfterElement(container, y) {
+            const rows = [...container.querySelectorAll('.group-option:not(.is-dragging)')];
+            return rows.reduce((closest, child) => {
+                const box = child.getBoundingClientRect();
+                const offset = y - box.top - box.height / 2;
+                if (offset < 0 && offset > closest.offset) return { offset, element: child };
+                return closest;
+            }, { offset: Number.NEGATIVE_INFINITY, element: null }).element;
+        }
+
+        function syncCategoryOrderFromDom() {
+            categoryConfig = getCategoryConfig();
+            groupsInsertedFromAnalysis = true;
+            updatePreview();
+        }
+
+        function appendCategoryRow(data) {
+            const row = document.createElement('div');
+            row.className = 'group-option';
+            row.draggable = false;
+            row.dataset.groupId = data.id;
+            row.dataset.groupDefault = data.name || data.id;
+
+            const handle = document.createElement('button');
+            handle.type = 'button';
+            handle.className = 'group-drag-handle';
+            handle.textContent = '::';
+            handle.title = 'Trascina per riordinare';
+            handle.draggable = true;
+            handle.addEventListener('dragstart', function(event) {
+                row.classList.add('is-dragging');
+                event.dataTransfer.effectAllowed = 'move';
+                event.dataTransfer.setData('text/plain', row.dataset.groupId);
+            });
+            handle.addEventListener('dragend', function() {
+                row.classList.remove('is-dragging');
+                syncCategoryOrderFromDom();
+            });
+
+            const input = document.createElement('input');
+            input.type = 'checkbox';
+            input.dataset.groupEnabled = '1';
+            input.value = data.id;
+            input.checked = data.checked !== false;
+
+            const original = document.createElement('span');
+            original.textContent = cleanGroupName(data.id) || data.id;
+
+            const display = document.createElement('input');
+            display.type = 'text';
+            display.dataset.groupName = '1';
+            display.value = data.name || cleanGroupName(data.id) || data.id;
+            display.placeholder = 'Nome in Stremio';
+
+            const count = document.createElement('small');
+            count.textContent = data.count || 'salvata';
+
+            [input, display].forEach(element => {
+                element.addEventListener('input', function() {
+                    categoryConfig = getCategoryConfig();
+                    groupsInsertedFromAnalysis = true;
+                    updatePreview();
+                });
+                element.addEventListener('change', function() {
+                    categoryConfig = getCategoryConfig();
+                    groupsInsertedFromAnalysis = true;
+                    updatePreview();
+                });
+            });
+
+            row.append(handle, input, original, display, count);
+            groupOptions.appendChild(row);
+            return row;
+        }
+
+        function renderSavedCategoryConfig() {
+            if (!categoryConfig.length) return false;
+            analysisTitle.textContent = `${categoryConfig.length} categorie configurate`;
+            analysisSummary.textContent = 'Configurazione caricata dal manifest. Puoi modificare nomi, ordine e selezione.';
+            groupOptions.innerHTML = '';
+            categoryConfig.forEach(item => appendCategoryRow({
+                id: item.id,
+                name: item.name || item.id,
+                count: 'salvata',
+                checked: true
+            }));
+            groupAssistant.classList.add('is-visible');
+            categoryConfig = getCategoryConfig();
+            return true;
         }
 
         function getPlaylistRows() {
@@ -1456,66 +1561,12 @@
 
             orderedGroups.forEach((group, index) => {
                 const saved = previous.get(normalizeGroupName(group.name));
-                const row = document.createElement('div');
-                row.className = 'group-option';
-                row.dataset.groupId = group.name;
-                row.dataset.groupDefault = cleanGroupName(saved?.name || group.name) || group.name;
-
-                const input = document.createElement('input');
-                input.type = 'checkbox';
-                input.dataset.groupEnabled = '1';
-                input.value = group.name;
-                input.checked = saved ? true : index < 8;
-
-                const name = document.createElement('span');
-                name.textContent = cleanGroupName(group.name) || group.name;
-
-                const display = document.createElement('input');
-                display.type = 'text';
-                display.dataset.groupName = '1';
-                display.value = cleanGroupName(saved?.name || group.name) || group.name;
-                display.placeholder = 'Nome in Stremio';
-
-                const count = document.createElement('small');
-                count.textContent = `${group.count} canali`;
-
-                const up = document.createElement('button');
-                up.type = 'button';
-                up.className = 'group-move';
-                up.textContent = 'Su';
-                up.addEventListener('click', function() {
-                    const prev = row.previousElementSibling;
-                    if (prev) groupOptions.insertBefore(row, prev);
-                    categoryConfig = getCategoryConfig();
-                    updatePreview();
+                appendCategoryRow({
+                    id: group.name,
+                    name: cleanGroupName(saved?.name || group.name) || group.name,
+                    count: `${group.count} canali`,
+                    checked: saved ? true : index < 8
                 });
-
-                const down = document.createElement('button');
-                down.type = 'button';
-                down.className = 'group-move';
-                down.textContent = 'Giu';
-                down.addEventListener('click', function() {
-                    const next = row.nextElementSibling;
-                    if (next) groupOptions.insertBefore(next, row);
-                    categoryConfig = getCategoryConfig();
-                    updatePreview();
-                });
-
-                [input, display].forEach(element => {
-                    element.addEventListener('input', function() {
-                        categoryConfig = getCategoryConfig();
-                        groupsInsertedFromAnalysis = true;
-                        updatePreview();
-                    });
-                    element.addEventListener('change', function() {
-                        categoryConfig = getCategoryConfig();
-                        groupsInsertedFromAnalysis = true;
-                        updatePreview();
-                    });
-                });
-
-                row.append(input, name, display, count, up, down);
-                groupOptions.appendChild(row);
             });
 
             groupAssistant.classList.add('is-visible');
@@ -1661,6 +1712,7 @@
             analysisSignature = groupsInsertedFromAnalysis ? getListSignature(lists) : '';
             groupAssistant.classList.remove('is-visible');
             groupOptions.innerHTML = '';
+            renderSavedCategoryConfig();
 
             if (token) {
                 setCurrentManifestFromToken(token);
@@ -1781,6 +1833,18 @@
             createPlaylistRow();
             updatePreview();
             playlistList.lastElementChild.querySelector('[data-list-name]').focus();
+        });
+        groupOptions.addEventListener('dragover', function(event) {
+            event.preventDefault();
+            const dragging = groupOptions.querySelector('.is-dragging');
+            if (!dragging) return;
+            const after = getDragAfterElement(groupOptions, event.clientY);
+            if (after) groupOptions.insertBefore(dragging, after);
+            else groupOptions.appendChild(dragging);
+        });
+        groupOptions.addEventListener('drop', function(event) {
+            event.preventDefault();
+            syncCategoryOrderFromDom();
         });
         analyzeButton.addEventListener('click', fetchAnalysis);
         insertGroupsButton.addEventListener('click', setGroupsFromAnalysis);
