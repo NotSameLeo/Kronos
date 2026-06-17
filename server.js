@@ -51,7 +51,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "4.3.2";
+const RELEASE_VERSION = "4.3.3";
 const ADDON_TYPE = "tv";
 const PLAYBACK_MODE = "transparent-relay";
 const CATALOG_TTL = 30 * 60 * 1000;
@@ -1032,9 +1032,9 @@ function matchesChannelSearch(channel, raw) {
 function getExtraParams(extra) {
     const params = {};
     if (!extra) return params;
-    decodeURIComponent(String(extra)).replace(/\.json$/i, "").split("&").forEach(pair => {
+    String(extra).replace(/\.json$/i, "").split("&").forEach(pair => {
         const i = pair.indexOf("="); if (i === -1) return;
-        const n = pair.slice(0, i); const v = pair.slice(i + 1);
+        const n = decodeURIComponent(pair.slice(0, i)); const v = pair.slice(i + 1);
         if (n) params[n] = decodeURIComponent(v || "");
     });
     return params;
