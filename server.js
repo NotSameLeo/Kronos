@@ -51,7 +51,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "4.1.0";
+const RELEASE_VERSION = "4.1.1";
 const ADDON_TYPE = "tv";
 const PLAYBACK_MODE = "transparent-relay";
 const CATALOG_TTL = 30 * 60 * 1000;
@@ -838,7 +838,7 @@ function parseM3UChannels(data, source = {}) {
         const line = lines[i].trim();
         if (line.startsWith("#EXTINF:")) {
             const name = (line.match(/,(.+)$/) || [, "Canale Sconosciuto"])[1].trim();
-            const group = (line.match(/group-title="([^"]+)"/) || [, "Altri Canali"])[1].trim();
+            const group = cleanGroupName((line.match(/group-title="([^"]+)"/) || [, "Altri Canali"])[1]);
             const logoMatch = line.match(/tvg-logo="([^"]+)"/);
             const tvgId = (line.match(/tvg-id="([^"]+)"/) || [, null])[1];
             cur = {
@@ -855,7 +855,19 @@ function parseM3UChannels(data, source = {}) {
             cur = null;
         }
     }
-    return channels;
+    return channels.filter(channel => !isDividerChannelName(channel.name));
+}
+
+function isDividerChannelName(name) {
+    return /^#{2,}/.test(String(name || "").trim());
+}
+
+function cleanGroupName(group) {
+    const cleaned = String(group || "").trim()
+        .replace(/^\s*IT\s*\|\s*/i, "")
+        .replace(/^\s*IT\s*:\s*/i, "")
+        .trim();
+    return cleaned || "Altri Canali";
 }
 
 function parseXtreamConfig(sourceUrl) {
@@ -917,11 +929,12 @@ async function fetchXtreamChannels(source) {
     if (!Array.isArray(streams)) throw new Error("Invalid Xtream live stream response");
 
     const categoryNames = new Map((Array.isArray(categories) ? categories : [])
-        .map(c => [String(c.category_id), String(c.category_name || "").trim()])
+        .map(c => [String(c.category_id), cleanGroupName(c.category_name)])
         .filter(([, name]) => name));
 
     const channels = streams
         .filter(item => item && item.stream_id != null && String(item.name || "").trim())
+        .filter(item => !isDividerChannelName(item.name))
         .map(item => {
             const streamId = String(item.stream_id);
             const categoryId = String(item.category_id || item.category_ids?.[0] || "");
@@ -929,7 +942,7 @@ async function fetchXtreamChannels(source) {
             return {
                 id: "channel_" + crypto.createHash("sha1").update(`${source.url || ""}|xtream:${streamId}`).digest("hex").slice(0, 20),
                 name: String(item.name || "Canale Sconosciuto").trim(),
-                group: categoryNames.get(categoryId) || source.name || "Xtream",
+                group: categoryNames.get(categoryId) || cleanGroupName(source.name || "Xtream"),
                 logo: String(item.stream_icon || "").trim(),
                 tvgId: item.epg_channel_id ? String(item.epg_channel_id) : null,
                 url,
@@ -969,7 +982,7 @@ function decorateChannelName(channel, totalLists, mode) {
     const base = display.replace(/\s*\([^)]*\)\s*$/g, "").trim();
     return `${base} (${getListAbbreviation(channel.sourceName)})`;
 }
-function normalizeGroupName(g) { return String(g || "").trim().toLowerCase(); }
+function normalizeGroupName(g) { return cleanGroupName(g).toLowerCase(); }
 function normalizeSearchText(v) {
     return String(v || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase()
         .replace(/&/g, " e ").replace(/[^a-z0-9]+/gi, " ").replace(/\s+/g, " ").trim();
@@ -1026,6 +1039,7 @@ async function fetchAndProcessChannels(configKey, config, options = {}) {
         const parsedGroups = await Promise.all(lists.map(fetchChannelsFromSource));
 
         const rawChannels = parsedGroups.flat()
+            .filter(c => !isDividerChannelName(c.name))
             .filter(c => {
                 if (config.gm === "list" || config.gm === "bucket") return true;
                 if (selectedSet.size === 0) return true;
@@ -1035,7 +1049,7 @@ async function fetchAndProcessChannels(configKey, config, options = {}) {
                 return {
                     ...c,
                     name: decorateChannelName(c, lists.length, config.gm),
-                    group: config.gm === "bucket" ? bucketGroup : c.group
+                    group: config.gm === "bucket" ? cleanGroupName(bucketGroup) : cleanGroupName(c.group)
                 };
             });
         let epgData = getCachedEPG(epgUrl);
