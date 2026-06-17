@@ -1631,6 +1631,9 @@
                 chip.textContent = `+${visibleGroups.length - 7} altri`;
                 chips.appendChild(chip);
             }
+            if (ready && currentManifestUrl && resultSection.classList.contains('is-visible')) {
+                setCurrentManifestFromConfig(config, false);
+            }
         }
 
         function showToast(message) {
@@ -1684,6 +1687,13 @@
             manifestText.textContent = currentManifestUrl;
             localWarning.classList.toggle('is-visible', ['localhost', '127.0.0.1'].includes(window.location.hostname));
             resultSection.classList.add('is-visible');
+        }
+
+        function setCurrentManifestFromConfig(config, shouldRemember = false) {
+            const token = toBase64Url(JSON.stringify(config));
+            setCurrentManifestFromToken(token);
+            if (shouldRemember) rememberPreloadConfig(token, config);
+            return token;
         }
 
         async function rememberPreloadConfig(token, config) {
@@ -1795,15 +1805,7 @@
             const config = await prepareConfigForSubmit();
             if (!config) return;
 
-            const base64Config = toBase64Url(JSON.stringify(config));
-            currentManifestUrl = `${window.location.origin}/${base64Config}/manifest.json`;
-            rememberPreloadConfig(base64Config, config);
-
-            stremioLink.href = getStremioInstallUrl(currentManifestUrl);
-            stremioLink.textContent = 'Installa in Stremio';
-            manifestText.textContent = currentManifestUrl;
-            localWarning.classList.toggle('is-visible', ['localhost', '127.0.0.1'].includes(window.location.hostname));
-            resultSection.classList.add('is-visible');
+            setCurrentManifestFromConfig(config, true);
             resultSection.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
         });
 
