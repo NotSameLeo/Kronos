@@ -358,7 +358,8 @@
             white-space: nowrap;
         }
 
-        input {
+        input,
+        select {
             width: 100%;
             border: 0;
             outline: 0;
@@ -367,6 +368,15 @@
             padding: 11px 15px 15px;
             font: inherit;
             font-size: 0.96rem;
+        }
+
+        select {
+            appearance: none;
+            cursor: pointer;
+        }
+
+        select option {
+            color: #111827;
         }
 
         input::placeholder {
@@ -562,13 +572,22 @@
 
         .playlist-row {
             display: grid;
-            grid-template-columns: minmax(160px, 0.28fr) minmax(360px, 1fr) auto;
+            grid-template-columns: minmax(140px, 0.22fr) minmax(120px, 0.16fr) minmax(260px, 1fr) minmax(130px, 0.22fr) minmax(130px, 0.22fr) auto;
             gap: 10px;
             align-items: stretch;
             padding: 10px;
             border: 1px solid var(--line);
             border-radius: 18px;
             background: rgba(255, 255, 255, 0.045);
+        }
+
+        .playlist-row .xtream-field {
+            display: none;
+        }
+
+        .playlist-row.is-xtream .xtream-field,
+        .playlist-row.is-auto .xtream-field {
+            display: block;
         }
 
         .playlist-remove {
@@ -992,7 +1011,7 @@
             <div class="hero-copy">
                 <p class="eyebrow">Channel Configurator</p>
                 <h1><span class="gradient-text">Editor canali per generare liste per Stremio.</span></h1>
-                <p class="lead">Unisci una o piu liste M3U, scegli i gruppi da mostrare e genera un catalogo live TV pronto per Stremio.</p>
+                <p class="lead">Unisci sorgenti M3U o Xtream, scegli i gruppi da mostrare e genera un catalogo live TV pronto per Stremio.</p>
             </div>
 
             <div class="orbit" aria-hidden="true">
@@ -1003,8 +1022,8 @@
 
             <div class="signal-card" aria-label="Funzionalita principali">
                 <div class="metric">
-                    <strong>M3U</strong>
-                    <span>Liste multiple ordinate in cataloghi separati.</span>
+                    <strong>M3U/Xtream</strong>
+                    <span>Sorgenti multiple ordinate in cataloghi separati.</span>
                 </div>
                 <div class="metric">
                     <strong>EPG</strong>
@@ -1058,7 +1077,7 @@
                     <div class="playlist-head">
                         <div>
                             <strong>Liste canali</strong>
-                            <span>Aggiungi una o piu playlist. Ogni nome lista puo diventare una sezione del catalogo.</span>
+                            <span>Aggiungi playlist M3U o account Xtream. Ogni nome lista puo diventare una sezione del catalogo.</span>
                         </div>
                     </div>
                     <div id="playlistList" class="playlist-list"></div>
@@ -1102,14 +1121,14 @@
                 <div class="preview-head">
                     <div>
                         <strong>Anteprima configurazione</strong>
-                        <span id="previewHint">Inserisci una lista M3U per abilitare il setup.</span>
+                        <span id="previewHint">Inserisci una sorgente canali per abilitare il setup.</span>
                     </div>
                     <div id="health" class="health">In attesa</div>
                 </div>
                 <div class="preview-body">
                     <div class="preview-item">
                         <b id="playlistState">0</b>
-                        <span>Sorgenti playlist pronte</span>
+                        <span>Sorgenti canali pronte</span>
                     </div>
                     <div class="preview-item">
                         <b id="epgState">No</b>
@@ -1212,16 +1231,59 @@
             return [...playlistList.querySelectorAll('.playlist-row')];
         }
 
+        function normalizeSourceType(value) {
+            return ['auto', 'm3u', 'xtream'].includes(value) ? value : 'auto';
+        }
+
+        function parseXtreamFields(url) {
+            try {
+                const parsed = new URL(url);
+                const parts = parsed.pathname.split('/').filter(Boolean);
+                let username = parsed.searchParams.get('username') || '';
+                let password = parsed.searchParams.get('password') || '';
+                if ((!username || !password) && parts.length >= 3 && parts[0] === 'live') {
+                    username = username || decodeURIComponent(parts[1]);
+                    password = password || decodeURIComponent(parts[2]);
+                }
+                return { server: parsed.origin, username, password };
+            } catch (err) {
+                return { server: url || '', username: '', password: '' };
+            }
+        }
+
+        function buildXtreamUrl(server, username, password) {
+            try {
+                const base = new URL('/get.php', server);
+                base.searchParams.set('username', username);
+                base.searchParams.set('password', password);
+                base.searchParams.set('type', 'm3u_plus');
+                base.searchParams.set('output', 'hls');
+                return base.toString();
+            } catch (err) {
+                return server;
+            }
+        }
+
+        function syncRowSourceMode(row) {
+            const type = normalizeSourceType(row.querySelector('[data-list-type]').value);
+            row.classList.toggle('is-auto', type === 'auto');
+            row.classList.toggle('is-xtream', type === 'xtream');
+        }
+
         function getLists() {
             return getPlaylistRows().map((row, index) => {
                 const name = row.querySelector('[data-list-name]').value.trim() || `Lista ${index + 1}`;
-                const url = row.querySelector('[data-list-url]').value.trim();
-                return { n: name, u: url };
+                const type = normalizeSourceType(row.querySelector('[data-list-type]').value);
+                const rawUrl = row.querySelector('[data-list-url]').value.trim();
+                const username = row.querySelector('[data-list-username]').value.trim();
+                const password = row.querySelector('[data-list-password]').value.trim();
+                const url = username && password ? buildXtreamUrl(rawUrl, username, password) : rawUrl;
+                return { n: name, u: url, t: type };
             }).filter(list => list.u);
         }
 
         function getListSignature(lists = getLists()) {
-            return JSON.stringify(lists.map(list => ({ n: list.n, u: list.u })));
+            return JSON.stringify(lists.map(list => ({ n: list.n, u: list.u, t: list.t || 'auto' })));
         }
 
         function createPlaylistRow(data = {}) {
@@ -1233,18 +1295,43 @@
                     <input type="text" data-list-name placeholder="Lista 1" autocomplete="off">
                 </div>
                 <div class="field">
-                    <label>URL lista M3U <small>obbligatorio</small></label>
-                    <input type="url" data-list-url required placeholder="https://example.com/lista.m3u" autocomplete="url">
+                    <label>Tipo <small>sorgente</small></label>
+                    <select data-list-type>
+                        <option value="auto">Auto</option>
+                        <option value="m3u">M3U</option>
+                        <option value="xtream">Xtream</option>
+                    </select>
+                </div>
+                <div class="field">
+                    <label>URL sorgente <small>server o playlist</small></label>
+                    <input type="url" data-list-url required placeholder="https://example.com/get.php" autocomplete="url">
+                </div>
+                <div class="field xtream-field">
+                    <label>Username <small>Xtream</small></label>
+                    <input type="text" data-list-username placeholder="opzionale" autocomplete="username">
+                </div>
+                <div class="field xtream-field">
+                    <label>Password <small>Xtream</small></label>
+                    <input type="password" data-list-password placeholder="opzionale" autocomplete="current-password">
                 </div>
                 <button type="button" class="playlist-remove" title="Rimuovi lista" aria-label="Rimuovi lista">X</button>
             `;
 
+            const xtream = parseXtreamFields(data.u || '');
             row.querySelector('[data-list-name]').value = data.n || `Lista ${getPlaylistRows().length + 1}`;
-            row.querySelector('[data-list-url]').value = data.u || '';
+            row.querySelector('[data-list-type]').value = normalizeSourceType(data.t || (xtream.username && xtream.password ? 'xtream' : 'auto'));
+            row.querySelector('[data-list-url]').value = xtream.username && xtream.password ? xtream.server : (data.u || '');
+            row.querySelector('[data-list-username]').value = xtream.username;
+            row.querySelector('[data-list-password]').value = xtream.password;
+            syncRowSourceMode(row);
             row.querySelector('.playlist-remove').addEventListener('click', function() {
                 if (getPlaylistRows().length === 1) {
                     row.querySelector('[data-list-url]').value = '';
                     row.querySelector('[data-list-name]').value = 'Lista 1';
+                    row.querySelector('[data-list-type]').value = 'auto';
+                    row.querySelector('[data-list-username]').value = '';
+                    row.querySelector('[data-list-password]').value = '';
+                    syncRowSourceMode(row);
                 } else {
                     row.remove();
                 }
@@ -1252,12 +1339,16 @@
                 updatePreview();
             });
 
-            row.querySelectorAll('input').forEach(input => {
+            row.querySelectorAll('input, select').forEach(input => {
                 input.addEventListener('input', function() {
                     resetAnalysisState();
+                    if (input.matches('[data-list-type]')) syncRowSourceMode(row);
                     updatePreview();
                 });
-                input.addEventListener('change', updatePreview);
+                input.addEventListener('change', function() {
+                    if (input.matches('[data-list-type]')) syncRowSourceMode(row);
+                    updatePreview();
+                });
             });
 
             playlistList.appendChild(row);
@@ -1372,7 +1463,7 @@
             health.classList.toggle('ready', ready);
             previewHint.textContent = ready
                 ? 'Il manifest includera liste, filtri e opzioni selezionate.'
-                : 'Inserisci almeno una lista M3U per abilitare il setup.';
+                : 'Inserisci almeno una sorgente canali per abilitare il setup.';
 
             chips.innerHTML = '';
             const visibleGroups = groupList.length ? groupList : ['Tutti i gruppi'];
@@ -1425,12 +1516,13 @@
                 return config.l
                     .map((list, index) => ({
                         n: list.n || `Lista ${index + 1}`,
-                        u: list.u || ''
+                        u: list.u || '',
+                        t: normalizeSourceType(list.t)
                     }))
                     .filter(list => list.u);
             }
 
-            return config.u ? [{ n: config.ln || 'Lista 1', u: config.u }] : [];
+            return config.u ? [{ n: config.ln || 'Lista 1', u: config.u, t: normalizeSourceType(config.t) }] : [];
         }
 
         function setCurrentManifestFromToken(token) {

@@ -51,7 +51,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "4.0.0";
+const RELEASE_VERSION = "4.1.0";
 const ADDON_TYPE = "tv";
 const PLAYBACK_MODE = "transparent-relay";
 const CATALOG_TTL = 30 * 60 * 1000;
@@ -82,32 +82,7 @@ function isBlockedPlaylist(url) {
     return BLOCKED_PLAYLISTS.some(b => u.includes(b));
 }
 const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 15000);
-const HLS_UPSTREAM_RETRIES = Math.max(0, Number(process.env.HLS_UPSTREAM_RETRIES || 2));
-const HLS_UPSTREAM_RETRY_DELAY_MS = Math.max(0, Number(process.env.HLS_UPSTREAM_RETRY_DELAY_MS || 1000));
-const HLS_COLD_START_WAIT_MS = Math.max(0, Number(process.env.HLS_COLD_START_WAIT_MS || 25000));
-const HLS_COLD_START_RETRY_MS = Math.max(250, Number(process.env.HLS_COLD_START_RETRY_MS || 1000));
-const HLS_LIVE_MIN_VISIBLE_SEGMENTS = Math.max(1, Number(process.env.HLS_LIVE_MIN_VISIBLE_SEGMENTS || 2));
-const HLS_LIVE_HOLDBACK_SEGMENTS = Math.max(0, Number(process.env.HLS_LIVE_HOLDBACK_SEGMENTS ?? 2));
-const HLS_STALE_HOLDBACK_RELEASE_TARGETS = Math.max(1, Number(process.env.HLS_STALE_HOLDBACK_RELEASE_TARGETS || 1));
-const HLS_START_OFFSET_TARGETS = Math.max(0, Number(process.env.HLS_START_OFFSET_TARGETS || 2));
-const HLS_STREAM_PREFLIGHT = String(process.env.HLS_STREAM_PREFLIGHT ?? "1") !== "0";
-const HLS_LIVE_MIN_SEGMENTS = Math.max(HLS_LIVE_MIN_VISIBLE_SEGMENTS, Number(process.env.HLS_LIVE_MIN_SEGMENTS || 3));
-const HLS_LIVE_WARMUP_WAIT_MS = Math.max(0, Number(process.env.HLS_LIVE_WARMUP_WAIT_MS || 35000));
-const HLS_LIVE_WARMUP_POLL_MS = Math.max(250, Number(process.env.HLS_LIVE_WARMUP_POLL_MS || 2000));
-const ACTIVE_STREAM_TTL_MS = Math.max(0, Number(process.env.ACTIVE_STREAM_TTL_MS || 120000));
 const SEG_REQUEST_TIMEOUT = Number(process.env.SEG_REQUEST_TIMEOUT || 45000);
-const SEGMENT_UPSTREAM_CONCURRENCY = Math.max(1, Number(process.env.SEGMENT_UPSTREAM_CONCURRENCY || 2));
-const SEGMENT_UPSTREAM_RETRIES = Math.max(0, Number(process.env.SEGMENT_UPSTREAM_RETRIES || 1));
-const SEGMENT_UPSTREAM_RETRY_DELAY_MS = Math.max(0, Number(process.env.SEGMENT_UPSTREAM_RETRY_DELAY_MS || 250));
-const HLS_STALE_MANIFEST_TTL_MS = Math.max(0, Number(process.env.HLS_STALE_MANIFEST_TTL_MS || 90000));
-const HLS_STALE_LIVE_TARGETS = Math.max(0, Number(process.env.HLS_STALE_LIVE_TARGETS || 6));
-const HLS_STALE_FORBIDDEN_TARGETS = Math.max(0, Number(process.env.HLS_STALE_FORBIDDEN_TARGETS || 6));
-const HLS_FORBIDDEN_BACKOFF_MS = Math.max(0, Number(process.env.HLS_FORBIDDEN_BACKOFF_MS || 15000));
-const HLS_FORBIDDEN_SOURCE_REFRESH = String(process.env.HLS_FORBIDDEN_SOURCE_REFRESH ?? "1") !== "0";
-const HLS_WAITING_MANIFEST_ON_ERROR = String(process.env.HLS_WAITING_MANIFEST_ON_ERROR ?? "1") !== "0";
-const HLS_WAITING_TARGET_DURATION = Math.max(1, Number(process.env.HLS_WAITING_TARGET_DURATION || 2));
-const PLAYBACK_ACTIVITY_TTL_MS = Math.max(60 * 1000, Number(process.env.PLAYBACK_ACTIVITY_TTL_MS || 30 * 60 * 1000));
-const PLAYBACK_ACTIVITY_MAX = Math.max(16, Number(process.env.PLAYBACK_ACTIVITY_MAX || 512));
 const UPSTREAM_KEEPALIVE_MAX_SOCKETS = Math.max(1, Number(process.env.UPSTREAM_KEEPALIVE_MAX_SOCKETS || 8));
 const UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS = Math.max(1, Number(process.env.UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS || 4));
 const UPSTREAM_KEEPALIVE_MS = Math.max(1000, Number(process.env.UPSTREAM_KEEPALIVE_MS || 60000));
@@ -321,6 +296,24 @@ function getHttpFallbackUrl(sourceUrl) {
 function isHttpsPlainHttpError(err) {
     const message = String(err?.message || "");
     return err?.code === "EPROTO" && /wrong version number|ssl3_get_record/i.test(message);
+}
+
+function redactUrl(value) {
+    try {
+        const parsed = new URL(value);
+        for (const key of ["username", "password"]) {
+            if (parsed.searchParams.has(key)) parsed.searchParams.set(key, "***");
+        }
+        const parts = parsed.pathname.split("/");
+        if (parts.length >= 5 && parts[1] === "live") {
+            parts[2] = "***";
+            parts[3] = "***";
+            parsed.pathname = parts.join("/");
+        }
+        return parsed.toString();
+    } catch {
+        return String(value || "").replace(/(password=)[^&\s]+/gi, "$1***").replace(/(username=)[^&\s]+/gi, "$1***");
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -768,27 +761,34 @@ function findEpgMatch(epgData, channel) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Playlist fetching + parsing
 // ─────────────────────────────────────────────────────────────────────────────
+function normalizeSourceType(value) {
+    const t = String(value || "auto").trim().toLowerCase();
+    return ["auto", "m3u", "xtream"].includes(t) ? t : "auto";
+}
+
 function getConfiguredLists(config) {
     if (Array.isArray(config.l) && config.l.length) {
         return config.l
             .map((list, i) => ({
                 name: String(list.n || `Lista ${i + 1}`).trim() || `Lista ${i + 1}`,
-                url: String(list.u || "").trim()
+                url: String(list.u || "").trim(),
+                type: normalizeSourceType(list.t)
             }))
             .filter(l => l.url && !isBlockedPlaylist(l.url));
     }
     return [{
         name: String(config.ln || "Canali TV").trim() || "Canali TV",
-        url: String(config.u || "").trim()
+        url: String(config.u || "").trim(),
+        type: normalizeSourceType(config.t)
     }].filter(l => l.url && !isBlockedPlaylist(l.url));
 }
 
 async function fetchPlaylist(sourceUrl, options = {}) {
     if (isBlockedPlaylist(sourceUrl)) {
-        console.warn("[PLAYLIST BLOCKED]", sourceUrl);
+        console.warn("[PLAYLIST BLOCKED]", redactUrl(sourceUrl));
         throw new Error("Playlist is blocked");
     }
-    console.log("[FETCH PLAYLIST]", sourceUrl);
+    console.log("[FETCH PLAYLIST]", redactUrl(sourceUrl));
     const deadline = Date.now() + (options.retryWindow || PLAYLIST_RETRY_WINDOW_MS);
     let attempt = 0;
     let lastErr = null;
@@ -811,7 +811,7 @@ async function fetchPlaylist(sourceUrl, options = {}) {
             });
             const data = String(response.data || "");
             if (!data.trimStart().startsWith("#EXTM3U")) throw new Error("Invalid M3U playlist from upstream");
-            console.log("[FETCH PLAYLIST OK]", requestUrl, "size=" + data.length, "attempt=" + attempt);
+            console.log("[FETCH PLAYLIST OK]", redactUrl(requestUrl), "size=" + data.length, "attempt=" + attempt);
             return response.data;
         } catch (err) {
             lastErr = err;
@@ -819,7 +819,7 @@ async function fetchPlaylist(sourceUrl, options = {}) {
             if (fallbackUrl) {
                 usedHttpFallback = true;
                 requestUrl = fallbackUrl;
-                console.warn(`[FETCH PLAYLIST HTTP FALLBACK] ${sourceUrl} -> ${fallbackUrl} reason=${err.message}`);
+                console.warn(`[FETCH PLAYLIST HTTP FALLBACK] ${redactUrl(sourceUrl)} -> ${redactUrl(fallbackUrl)} reason=${err.message}`);
                 continue;
             }
             console.warn(`[FETCH PLAYLIST RETRY] attempt=${attempt} reason=${err.message}`);
@@ -856,6 +856,106 @@ function parseM3UChannels(data, source = {}) {
         }
     }
     return channels;
+}
+
+function parseXtreamConfig(sourceUrl) {
+    try {
+        const parsed = new URL(sourceUrl);
+        const pathParts = parsed.pathname.split("/").filter(Boolean);
+        let username = parsed.searchParams.get("username") || "";
+        let password = parsed.searchParams.get("password") || "";
+        if ((!username || !password) && pathParts.length >= 3 && pathParts[0] === "live") {
+            username = username || decodeURIComponent(pathParts[1]);
+            password = password || decodeURIComponent(pathParts[2]);
+        }
+        if (!username || !password) return null;
+        return { origin: parsed.origin, username, password };
+    } catch {
+        return null;
+    }
+}
+
+function xtreamApiUrl(xtream, action = "") {
+    const url = new URL("/player_api.php", xtream.origin);
+    url.searchParams.set("username", xtream.username);
+    url.searchParams.set("password", xtream.password);
+    if (action) url.searchParams.set("action", action);
+    return url.toString();
+}
+
+function xtreamLiveUrl(xtream, streamId) {
+    return `${xtream.origin}/live/${encodeURIComponent(xtream.username)}/${encodeURIComponent(xtream.password)}/${encodeURIComponent(streamId)}.m3u8`;
+}
+
+async function fetchXtreamApi(xtream, action = "") {
+    const url = xtreamApiUrl(xtream, action);
+    const response = await axios.get(url, {
+        timeout: PLAYLIST_REQUEST_TIMEOUT,
+        ...upstreamAgentOptions(),
+        maxRedirects: 5,
+        headers: {
+            "User-Agent": UPSTREAM_UA,
+            "Accept": "application/json, text/plain, */*",
+            "Connection": "keep-alive"
+        },
+        validateStatus: s => s >= 200 && s < 300
+    });
+    return typeof response.data === "string" ? JSON.parse(response.data) : response.data;
+}
+
+async function fetchXtreamChannels(source) {
+    const xtream = parseXtreamConfig(source.url);
+    if (!xtream) throw new Error("Missing Xtream credentials");
+    console.log("[FETCH XTREAM]", redactUrl(xtreamApiUrl(xtream)));
+
+    const [account, categories, streams] = await Promise.all([
+        fetchXtreamApi(xtream).catch(err => ({ error: err.message })),
+        fetchXtreamApi(xtream, "get_live_categories"),
+        fetchXtreamApi(xtream, "get_live_streams")
+    ]);
+    if (account?.user_info && Number(account.user_info.auth) !== 1) throw new Error("Xtream account not authorized");
+    if (!Array.isArray(streams)) throw new Error("Invalid Xtream live stream response");
+
+    const categoryNames = new Map((Array.isArray(categories) ? categories : [])
+        .map(c => [String(c.category_id), String(c.category_name || "").trim()])
+        .filter(([, name]) => name));
+
+    const channels = streams
+        .filter(item => item && item.stream_id != null && String(item.name || "").trim())
+        .map(item => {
+            const streamId = String(item.stream_id);
+            const categoryId = String(item.category_id || item.category_ids?.[0] || "");
+            const url = isHttpUrl(item.direct_source) ? item.direct_source : xtreamLiveUrl(xtream, streamId);
+            return {
+                id: "channel_" + crypto.createHash("sha1").update(`${source.url || ""}|xtream:${streamId}`).digest("hex").slice(0, 20),
+                name: String(item.name || "Canale Sconosciuto").trim(),
+                group: categoryNames.get(categoryId) || source.name || "Xtream",
+                logo: String(item.stream_icon || "").trim(),
+                tvgId: item.epg_channel_id ? String(item.epg_channel_id) : null,
+                url,
+                sourceName: source.name || "Xtream",
+                sourceUrl: source.url || "",
+                sourceType: "xtream"
+            };
+        });
+
+    console.log(`[FETCH XTREAM OK] channels=${channels.length} categories=${categoryNames.size}`);
+    return channels;
+}
+
+async function fetchChannelsFromSource(source) {
+    const type = normalizeSourceType(source.type);
+    const canUseXtream = !!parseXtreamConfig(source.url);
+    if (type === "xtream" || (type === "auto" && canUseXtream)) {
+        try {
+            return await fetchXtreamChannels(source);
+        } catch (err) {
+            if (type === "xtream") throw err;
+            console.warn(`[FETCH XTREAM FALLBACK] ${err.message}; trying M3U`);
+        }
+    }
+    const data = await fetchPlaylist(source.url);
+    return parseM3UChannels(data, source);
 }
 
 function stripInitialCountryPrefix(name) { return String(name || "").replace(/^\s*IT:\s*/i, "").trim(); }
@@ -905,7 +1005,7 @@ function buildChannelIndex(channels) {
 }
 
 async function fetchAndProcessChannels(configKey, config, options = {}) {
-    if (memoryCache.channelInflight[configKey] && !options.force) return memoryCache.channelInflight[configKey];
+    if (memoryCache.channelInflight[configKey]) return memoryCache.channelInflight[configKey];
     const promise = (async () => {
         memoryCache.isUpdating[configKey] = true;
         const lists = getConfiguredLists(config);
@@ -923,10 +1023,7 @@ async function fetchAndProcessChannels(configKey, config, options = {}) {
         const selectedSet = new Set(selectedGroups.map(normalizeGroupName));
         const bucketGroup = selectedGroups[0] || "Kronos";
 
-        const parsedGroups = await Promise.all(lists.map(async list => {
-            const data = await fetchPlaylist(list.url);
-            return parseM3UChannels(data, list);
-        }));
+        const parsedGroups = await Promise.all(lists.map(fetchChannelsFromSource));
 
         const rawChannels = parsedGroups.flat()
             .filter(c => {
@@ -986,22 +1083,13 @@ async function getChannelsFromCache(configKey, config) {
 async function getChannelById(configKey, config, id) {
     let ch = memoryCache.channelIndex[configKey]?.[id];
     if (ch) return ch;
+    const hadCache = !!memoryCache.channelItems[configKey];
     const channels = await getChannelsFromCache(configKey, config);
     ch = channels.find(c => c.id === id);
     if (ch) return ch;
+    if (!hadCache) return null;
     await fetchAndProcessChannels(configKey, config, { force: true });
     return memoryCache.channelIndex[configKey]?.[id] || null;
-}
-
-let playbackRequestCounter = 0;
-
-function nextPlaybackRequestId(prefix) {
-    playbackRequestCounter = (playbackRequestCounter + 1) % 1000000;
-    return `${prefix}${playbackRequestCounter.toString(36)}`;
-}
-
-function playbackClientTag(req) {
-    return hashKey(`${req.ip || req.socket?.remoteAddress || ""}|${req.get("user-agent") || ""}`).slice(0, 10);
 }
 
 async function getLogoDataUri(logoUrl) {
@@ -1152,20 +1240,24 @@ app.post("/api/preload-config", async (req, res) => {
 
 app.post("/api/analyze-link", async (req, res) => {
     try {
-        const data = await fetchPlaylist(req.body.url);
-        const channels = parseM3UChannels(data, { name: req.body.name || "Lista", url: req.body.url });
+        const source = {
+            name: req.body.name || "Lista",
+            url: req.body.url,
+            type: normalizeSourceType(req.body.type)
+        };
+        const channels = await fetchChannelsFromSource(source);
         const map = new Map();
         channels.forEach(c => map.set(c.group, (map.get(c.group) || 0) + 1));
         const groups = [...map.entries()].map(([name, count]) => ({ name, count }))
             .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
         res.json({ totalChannels: channels.length, groups });
-    } catch { res.status(400).json({ error: "Impossibile analizzare la lista M3U" }); }
+    } catch { res.status(400).json({ error: "Impossibile analizzare questa sorgente" }); }
 });
 
 app.post("/api/analyze-lists", async (req, res) => {
     try {
         const lists = getConfiguredLists({ l: req.body.lists || [] });
-        const parsed = await Promise.all(lists.map(async l => parseM3UChannels(await fetchPlaylist(l.url), l)));
+        const parsed = await Promise.all(lists.map(fetchChannelsFromSource));
         const channels = parsed.flat();
         const map = new Map();
         channels.forEach(c => {
@@ -1177,7 +1269,7 @@ app.post("/api/analyze-lists", async (req, res) => {
             .map(g => ({ name: g.name, count: g.count, sources: [...g.sources] }))
             .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
         res.json({ totalChannels: channels.length, totalLists: lists.length, groups });
-    } catch { res.status(400).json({ error: "Impossibile analizzare le liste M3U" }); }
+    } catch { res.status(400).json({ error: "Impossibile analizzare le sorgenti" }); }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1312,7 +1404,7 @@ app.get("/:base64Config/proxy/live.m3u8", async (req, res) => {
         if (!isHttpUrl(upstream)) return res.status(400).type("text/plain").send("#EXTM3U\n");
         const r = await axios.get(upstream, {
             responseType: "text", timeout: HLS_REQUEST_TIMEOUT, maxRedirects: 5,
-            headers: RELAY_HEADERS, ...upstreamAgentOptions(), validateStatus: s => s >= 200 && s < 400
+            headers: RELAY_HEADERS, ...upstreamAgentOptions(), validateStatus: s => s >= 200 && s < 300
         });
         const finalUrl = r.request?.res?.responseUrl || upstream;
         setPlaylistHeaders(res);
@@ -1334,13 +1426,14 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
         const r = await axios.get(upstream, {
             responseType: "stream", timeout: SEG_REQUEST_TIMEOUT, maxRedirects: 5, headers,
             ...upstreamAgentOptions(), decompress: false, maxContentLength: Infinity, maxBodyLength: Infinity,
-            validateStatus: s => s >= 200 && s < 400
+            validateStatus: s => s >= 200 && s < 300
         });
         res.status(r.status);
         for (const h of ["content-type", "content-length", "content-range", "accept-ranges", "last-modified", "etag"]) {
             if (r.headers[h]) res.setHeader(h, r.headers[h]);
         }
         res.setHeader("Cache-Control", "no-store");
+        res.setHeader("X-Kronos-Relay", "1");
         r.data.on("error", () => { if (!res.headersSent) res.status(502).end(); else res.destroy(); });
         res.on("close", () => { try { r.data.destroy(); } catch {} });
         r.data.pipe(res);
@@ -1398,6 +1491,7 @@ app.get("/:base64Config/debug", async (req, res) => {
                 hasUrl: !!config.u,
                 hasMultiLists: Array.isArray(config.l),
                 listCount: getConfiguredLists(config).length,
+                sourceTypes: getConfiguredLists(config).map(list => list.type),
                 groupMode: config.gm,
                 selectedGroups: config.g
             },
@@ -1414,7 +1508,7 @@ app.get("/:base64Config/debug", async (req, res) => {
             },
             sampleChannels: channels.slice(0, 5).map(c => ({
                 id: c.id, name: c.name, group: c.group, sourceName: c.sourceName,
-                hasUrl: !!c.url, hasLogo: !!c.logo, hasEpg: !!c.description, epgId: c.epgId
+                sourceType: c.sourceType || "m3u", hasUrl: !!c.url, hasLogo: !!c.logo, hasEpg: !!c.description, epgId: c.epgId
             })),
             groups: [...new Set(channels.map(c => c.group))].slice(0, 50),
             constants: {
@@ -1436,9 +1530,8 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`📦 Node ${process.version}`);
     console.log(`🎬 playback=transparent-relay vpn=off remux=off startOffset=${PROXY_START_OFFSET_SECONDS}s hlsTimeout=${HLS_REQUEST_TIMEOUT / 1000}s segTimeout=${SEG_REQUEST_TIMEOUT / 1000}s`);
     console.log(`🔌 upstream keepAlive=1 sockets=${UPSTREAM_KEEPALIVE_MAX_SOCKETS} free=${UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS} ms=${UPSTREAM_KEEPALIVE_MS}`);
-    console.log(`🩺 playback telemetry=1 ttl=${PLAYBACK_ACTIVITY_TTL_MS / 1000}s max=${PLAYBACK_ACTIVITY_MAX}`);
     console.log(`📋 playlist retryWindow=${PLAYLIST_RETRY_WINDOW_MS / 1000}s delay=${PLAYLIST_RETRY_DELAY_MS / 1000}s`);
-    console.log(`🎞️ segment timeout=${SEG_REQUEST_TIMEOUT / 1000}s rangeForward=1 upstreamConcurrency=${SEGMENT_UPSTREAM_CONCURRENCY} retries=${SEGMENT_UPSTREAM_RETRIES}`);
+    console.log(`🎞️ segment timeout=${SEG_REQUEST_TIMEOUT / 1000}s rangeForward=1`);
     console.log(`📺 epg timezone=${EPG_TIME_ZONE} timeout=${EPG_REQUEST_TIMEOUT / 1000}s firstWait=${EPG_FIRST_CATALOG_WAIT_MS / 1000}s retryDelay=${EPG_RETRY_DELAY_MS / 1000}s cacheTTL=${EPG_CACHE_TTL / 1000}s refresh=${EPG_REFRESH_INTERVAL_MS / 1000}s preload=${EPG_PRELOAD_URLS.length} startupWatch=${EPG_STARTUP_WATCH_MS / 1000}s`);
     console.log(`📚 catalog preload=${CATALOG_PRELOAD_CONFIGS.length}`);
     console.log("=".repeat(60) + "\n");
