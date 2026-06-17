@@ -8,7 +8,6 @@ const https = require("https");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
-const { spawn } = require("child_process");
 
 const app = express();
 const PORT = process.env.PORT || 7000;
@@ -54,7 +53,7 @@ app.use(express.static(path.join(__dirname, "public")));
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const RELEASE_VERSION = "4.0.0";
 const ADDON_TYPE = "tv";
-const PLAYBACK_MODE = "ffmpeg-restream";
+const PLAYBACK_MODE = "transparent-relay";
 const CATALOG_TTL = 30 * 60 * 1000;
 // Periodically re-fetch the preloaded (frontend) playlist so the catalog stays
 // warm even with no requests, and so frontend changes are picked up. 0 disables.
@@ -117,57 +116,10 @@ const PLAYLIST_RETRY_WINDOW_MS = Number(process.env.PLAYLIST_RETRY_WINDOW_MS || 
 const PLAYLIST_RETRY_DELAY_MS = Number(process.env.PLAYLIST_RETRY_DELAY_MS || 2000);
 const EPG_TIME_ZONE = process.env.EPG_TIME_ZONE || "Europe/Rome";
 
-// ── ffmpeg live ingest configuration ──────────────────────────────────────────
-// We run one ffmpeg per active channel. ffmpeg behaves like a real IPTV client
-// (like UHF): it follows token rotation, reconnects on upstream errors, and
-// remuxes (-c copy, NO transcode -> ~0 CPU, safe on a GPU-less VPS) into a clean
-// local rolling HLS playlist. The player only ever reads stable local files,
-// decoupled from upstream instability, sitting a cushion behind the live edge.
-const FFMPEG_BIN = process.env.FFMPEG_BIN || "ffmpeg";
-const INGEST_ROOT = process.env.INGEST_ROOT || "/tmp/kronos-ingest";
-const INGEST_SEGMENT_SECONDS = Math.max(1, Number(process.env.INGEST_SEGMENT_SECONDS || 4));
-const INGEST_WINDOW_SEGMENTS = Math.max(24, Number(process.env.INGEST_WINDOW_SEGMENTS || 120));
-// Live cushion: the served playlist deliberately hides ffmpeg's newest local
-// segments. Stremio then plays an older, already-proven part of the rolling
-// buffer instead of chasing the provider edge where token and network errors
-// happen. Startup uses a smaller delay if the full cushion is not warm yet.
-const INGEST_LIVE_OFFSET_SECONDS = Math.max(0, Number(process.env.INGEST_LIVE_OFFSET_SECONDS || 120));
-const INGEST_MIN_VISIBLE_SECONDS = Math.max(12, Number(process.env.INGEST_MIN_VISIBLE_SECONDS || 24));
-const INGEST_MIN_VISIBLE_SEGMENTS = Math.max(3, Number(process.env.INGEST_MIN_VISIBLE_SEGMENTS || 8));
-const INGEST_TARGET_VISIBLE_SECONDS = Math.max(INGEST_MIN_VISIBLE_SECONDS, Number(process.env.INGEST_TARGET_VISIBLE_SECONDS || 120));
-const INGEST_PLAYER_HOLDBACK_SECONDS = Math.max(0, Number(process.env.INGEST_PLAYER_HOLDBACK_SECONDS || 45));
-const INGEST_PREBUFFER_SECONDS = Math.max(INGEST_MIN_VISIBLE_SECONDS, Number(process.env.INGEST_PREBUFFER_SECONDS ?? 28));
-// Feeder poll interval (auto-tuned per channel from the upstream target duration).
-const INGEST_POLL_MS = Math.max(1500, Number(process.env.INGEST_POLL_MS || 4000));
-const INGEST_IDLE_TIMEOUT_MS = Math.max(10000, Number(process.env.INGEST_IDLE_TIMEOUT_MS || 180000));
-const INGEST_FIRST_SEGMENT_TIMEOUT_MS = Math.max(5000, Number(process.env.INGEST_FIRST_SEGMENT_TIMEOUT_MS || 30000));
-const INGEST_REAP_INTERVAL_MS = Math.max(5000, Number(process.env.INGEST_REAP_INTERVAL_MS || 10000));
-// One upstream connection at a time by default — these IPTV accounts usually cap
-// concurrent streams (a 2nd stream 403s). Opening a channel stops the others, so
-// zapping never overlaps and never trips the upstream's connection limit.
-const INGEST_MAX_CONCURRENT = Math.max(1, Number(process.env.INGEST_MAX_CONCURRENT || 1));
-// Respawn after a transient exit. On a 403 the upstream is briefly refusing a
-// new connection (its single slot from the previous channel hasn't been freed):
-// retry GENTLY so we don't keep its anti-abuse lock alive (hammering livelocks
-// it). On other errors retry fast. Keep retrying while the channel is wanted —
-// the idle reaper stops it once nobody is watching.
-const INGEST_RESPAWN_DELAY_MS = Math.max(500, Number(process.env.INGEST_RESPAWN_DELAY_MS || 2000));
-const INGEST_FORBIDDEN_RESPAWN_DELAY_MS = Math.max(2000, Number(process.env.INGEST_FORBIDDEN_RESPAWN_DELAY_MS || 5000));
-// When zapping, wait for the previous channel's ffmpeg to fully close before
-// connecting the new one, to minimise the upstream connection-limit 403.
-const INGEST_DRAIN_TIMEOUT_MS = Math.max(500, Number(process.env.INGEST_DRAIN_TIMEOUT_MS || 4000));
-const INGEST_DRAIN_GRACE_MS = Math.max(0, Number(process.env.INGEST_DRAIN_GRACE_MS || 3000));
-const INGEST_HEALTHY_RUN_MS = Math.max(5000, Number(process.env.INGEST_HEALTHY_RUN_MS || 25000));
-const INGEST_MAX_RESTARTS = Math.max(1, Number(process.env.INGEST_MAX_RESTARTS || 100));
-const INGEST_PREFLIGHT = String(process.env.INGEST_PREFLIGHT ?? "0") !== "0";
-const INGEST_STDIN_DRAIN_TIMEOUT_MS = Math.max(1000, Number(process.env.INGEST_STDIN_DRAIN_TIMEOUT_MS || 10000));
-const INGEST_BLOCKED_SEGMENT_MAX_MS = Math.max(10000, Number(process.env.INGEST_BLOCKED_SEGMENT_MAX_MS || Math.max(60000, INGEST_LIVE_OFFSET_SECONDS * 1000)));
-const INGEST_BLOCKED_SEGMENT_MAX_ATTEMPTS = Math.max(2, Number(process.env.INGEST_BLOCKED_SEGMENT_MAX_ATTEMPTS || 24));
-const INGEST_PUBLISH_DELAY_SECONDS = Math.max(0, Number(process.env.INGEST_PUBLISH_DELAY_SECONDS || 6));
-const INGEST_MAX_VARIANT_BANDWIDTH = Math.max(0, Number(process.env.INGEST_MAX_VARIANT_BANDWIDTH || 0));
-const LOCAL_SEGMENT_WAIT_MS = Math.max(0, Number(process.env.LOCAL_SEGMENT_WAIT_MS || 5000));
-const LOCAL_SEGMENT_WAIT_POLL_MS = Math.max(25, Number(process.env.LOCAL_SEGMENT_WAIT_POLL_MS || 100));
-const LOCAL_SEGMENT_SLOW_LOG_MS = Math.max(0, Number(process.env.LOCAL_SEGMENT_SLOW_LOG_MS || 1500));
+// ── Transparent relay configuration ───────────────────────────────────────────
+// No VPN, no re-mux, no buffer: just relay the (non-geo-blocked) upstream with the
+// right User-Agent and nudge the player to start a touch behind the live edge.
+const PROXY_START_OFFSET_SECONDS = Math.max(0, Number(process.env.PROXY_START_OFFSET_SECONDS || 15));
 
 const upstreamHttpAgent = new http.Agent({
     keepAlive: true,
@@ -1072,26 +1024,21 @@ async function getLogoDataUri(logoUrl) {
 }
 
 function buildStream(channel, host, configKey) {
-    if (isHlsUrl(channel.url) || isPlayableHttpUrl(channel.url)) {
+    if (isHlsUrl(channel.url)) {
         return {
             title: channel.name, name: "TV",
-            url: `${host}/${configKey}/live/${encodeURIComponent(channel.id)}/index.m3u8`,
+            url: `${host}/${configKey}/proxy/live.m3u8?u=${encodeProxyUrl(channel.url)}`,
+            behaviorHints: { notWebReady: true, bingeGroup: `kronos-${channel.id}` }
+        };
+    }
+    if (isPlayableHttpUrl(channel.url)) {
+        return {
+            title: channel.name, name: "TV",
+            url: `${host}/${configKey}/proxy/seg?u=${encodeProxyUrl(channel.url)}`,
             behaviorHints: { notWebReady: true, bingeGroup: `kronos-${channel.id}` }
         };
     }
     return { title: `${channel.name} - sorgente web`, name: "TV", externalUrl: channel.url };
-}
-
-// Pre-warm the ffmpeg ingest as soon as Stremio asks for the stream list, so the
-// first segment is usually ready by the time the user presses play.
-function preflightHLSStream(channel, configKey) {
-    if (!INGEST_PREFLIGHT || !configKey || !channel?.url || !channel?.id) return;
-    if (!(isHlsUrl(channel.url) || isPlayableHttpUrl(channel.url))) return;
-    try {
-        ensureIngest(`${configKey}:${channel.id}`, channel.url, channel.name);
-    } catch (err) {
-        console.warn(`[INGEST PREFLIGHT FAIL] channel="${channel.name}" reason=${err.message}`);
-    }
 }
 
 function toMeta(channel, host, configKey = "") {
@@ -1314,706 +1261,92 @@ function setPlaylistHeaders(res) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ffmpeg live ingest manager
+// Transparent relay. The playlist is NOT geo-blocked anymore, so Kronos no longer
+// needs a VPN, an ffmpeg re-mux, or a local buffer. It just relays bytes upstream
+// with the right User-Agent and lets Stremio's own player do the HLS work. The
+// only tuning is a small EXT-X-START so playback begins a touch behind the live
+// edge (a stable runway) instead of glued to the edge.
 // ─────────────────────────────────────────────────────────────────────────────
-const ingests = new Map(); // ingestKey -> ingest record
-let ingestReaperStarted = false;
+function encodeProxyUrl(url) { return Buffer.from(String(url), "utf8").toString("base64url"); }
+function decodeProxyUrl(enc) { return Buffer.from(String(enc), "base64url").toString("utf8"); }
+function toAbsoluteUrl(value, baseUrl) { try { return new URL(value, baseUrl).toString(); } catch { return value; } }
 
-function ingestDirFor(ingestKey) {
-    return path.join(INGEST_ROOT, hashKey(ingestKey));
-}
+const RELAY_HEADERS = { "User-Agent": UPSTREAM_UA, "Accept": "*/*" };
 
-function ingestIndexPath(ingest) {
-    return path.join(ingest.dir, "index.m3u8");
-}
-
-// ffmpeg reads a CONTINUOUS MPEG-TS byte stream from our feeder (stdin), not the
-// flaky upstream HLS. So ffmpeg never sees a 5XX/missing segment -> it never dies
-// -> one unbroken timeline, no respawns, no discontinuities, no player skips.
-function ffmpegPipeArgs(dir) {
-    return [
-        "-nostdin", "-hide_banner", "-loglevel", "warning",
-        "-fflags", "+genpts+igndts",
-        "-f", "mpegts", "-i", "pipe:0",
-        "-map", "0", "-ignore_unknown",
-        "-c", "copy",
-        "-f", "hls",
-        "-hls_time", String(INGEST_SEGMENT_SECONDS),
-        "-hls_list_size", String(INGEST_WINDOW_SEGMENTS),
-        "-hls_flags", "delete_segments+omit_endlist+independent_segments+temp_file",
-        "-hls_segment_type", "mpegts",
-        "-hls_allow_cache", "0",
-        "-hls_segment_filename", path.join(dir, "seg_%05d.ts"),
-        path.join(dir, "index.m3u8")
-    ];
-}
-
-function spawnIngest(ingest) {
-    const dir = ingest.dir;
-    if (ingest.respawnTimer) { clearTimeout(ingest.respawnTimer); ingest.respawnTimer = null; }
-    if (ingest.proc && !ingest.exited) return; // already running
-    stopFeeder(ingest);
-    try { fs.mkdirSync(dir, { recursive: true }); } catch {}
-    // Clean slate: one ffmpeg = one timeline; a (rare) restart starts fresh.
-    try {
-        for (const f of fs.readdirSync(dir)) {
-            if (f === "index.m3u8" || /^seg_\d+\.ts/.test(f) || f.endsWith(".tmp")) {
-                try { fs.unlinkSync(path.join(dir, f)); } catch {}
-            }
-        }
-    } catch {}
-    ingest.served = false;
-
-    const proc = spawn(FFMPEG_BIN, ffmpegPipeArgs(dir), { stdio: ["pipe", "ignore", "pipe"] });
-    ingest.proc = proc;
-    ingest.pid = proc.pid;
-    ingest.startedAt = Date.now();
-    ingest.firstSegmentAt = 0;
-    ingest.exited = false;
-    ingest.stopping = false;
-    ingest.stderrTail = "";
-    proc.stdin.on("error", () => {}); // ignore EPIPE if ffmpeg goes away
-
-    proc.stderr.on("data", chunk => {
-        ingest.stderrTail = (ingest.stderrTail + String(chunk)).slice(-2000);
-    });
-    proc.on("exit", (code, signal) => {
-        ingest.exited = true;
-        ingest.exitCode = code;
-        if (ingest.stopping) return;
-        const ranMs = Date.now() - ingest.startedAt;
-        const tail = (ingest.stderrTail || "").trim().split("\n").pop() || "";
-        console.warn(`[INGEST EXIT] channel="${ingest.label}" key=${ingest.shortKey} pid=${ingest.pid} code=${code} signal=${signal || "none"} ran=${ranMs}ms tail=${tail}`);
-        scheduleRespawn(ingest, ranMs, tail);
-    });
-    proc.on("error", err => {
-        ingest.exited = true;
-        ingest.spawnError = err.message;
-        console.error(`[INGEST SPAWN ERROR] channel="${ingest.label}" key=${ingest.shortKey} reason=${err.message}`);
-    });
-
-    startFeeder(ingest);
-    console.log(`[INGEST START] channel="${ingest.label}" key=${ingest.shortKey} pid=${ingest.pid} restarts=${ingest.restarts} mode=pipe seg=${INGEST_SEGMENT_SECONDS}s cushion=${INGEST_LIVE_OFFSET_SECONDS}s`);
-}
-
-// ── Feeder: a resilient HLS client in Node ────────────────────────────────────
-// Polls the upstream playlist (fresh tokens each time), downloads each NEW segment
-// with retries, and pipes the raw bytes to ffmpeg's stdin. A segment that keeps
-// failing is SKIPPED (a small content gap) instead of killing the stream. This is
-// what makes flaky premium channels (DAZN/Sky 5XX) play smoothly.
-function segKey(u) { const m = String(u).match(/([^/?]+\.ts)/); return m ? m[1] : String(u); }
-
-function selectVariantUrl(masterPlaylist, finalUrl) {
-    const lines = String(masterPlaylist || "").split(/\r?\n/);
-    const variants = [];
-    for (let i = 0; i < lines.length; i++) {
-        const line = lines[i].trim();
-        if (!/^#EXT-X-STREAM-INF:/i.test(line)) continue;
-        const bandwidth = Number((line.match(/BANDWIDTH=(\d+)/i) || [])[1] || 0);
-        let uri = "";
-        for (let j = i + 1; j < lines.length; j++) {
-            const candidate = lines[j].trim();
-            if (!candidate || candidate.startsWith("#")) continue;
-            uri = candidate;
-            break;
-        }
-        if (!uri) continue;
-        try {
-            variants.push({ bandwidth, url: new URL(uri, finalUrl).toString() });
-        } catch {}
-    }
-    if (!variants.length) return "";
-    const sorted = variants.sort((a, b) => a.bandwidth - b.bandwidth);
-    if (INGEST_MAX_VARIANT_BANDWIDTH > 0) {
-        const underLimit = sorted.filter(v => v.bandwidth > 0 && v.bandwidth <= INGEST_MAX_VARIANT_BANDWIDTH);
-        if (underLimit.length) return underLimit[underLimit.length - 1].url;
-    }
-    return sorted[sorted.length - 1].url;
-}
-
-async function fetchUpstreamM3U8(url) {
-    let lastErr;
-    for (let i = 0; i < 3; i++) {
-        try {
-            const r = await axios.get(url, { responseType: "text", timeout: HLS_REQUEST_TIMEOUT, maxRedirects: 5, headers: { "User-Agent": UPSTREAM_UA, "Accept": "*/*" }, ...upstreamAgentOptions(), validateStatus: s => s >= 200 && s < 300 });
-            const data = String(r.data);
-            const finalUrl = r.request?.res?.responseUrl || url;
-            if (/#EXT-X-STREAM-INF:/i.test(data)) {
-                const variantUrl = selectVariantUrl(data, finalUrl);
-                if (variantUrl && variantUrl !== url) {
-                    const variant = await axios.get(variantUrl, { responseType: "text", timeout: HLS_REQUEST_TIMEOUT, maxRedirects: 5, headers: { "User-Agent": UPSTREAM_UA, "Accept": "*/*" }, ...upstreamAgentOptions(), validateStatus: s => s >= 200 && s < 300 });
-                    return { data: String(variant.data), finalUrl: variant.request?.res?.responseUrl || variantUrl };
-                }
-            }
-            return { data, finalUrl };
-        } catch (e) { lastErr = e; await sleep(400); }
-    }
-    throw lastErr;
-}
-
-function parseSegmentUrlsFromM3U8(playlist, finalUrl) {
-    return String(playlist || "").split(/\r?\n/)
-        .map(line => line.trim())
-        .filter(line => line && !line.startsWith("#"))
-        .filter(line => !/\.m3u8(?:[?#]|$)/i.test(line))
-        .map(line => { try { return new URL(line, finalUrl).toString(); } catch { return null; } })
-        .filter(Boolean);
-}
-
-async function downloadSegment(u, signal) {
-    let lastErr;
-    const attempts = Math.max(1, SEGMENT_UPSTREAM_RETRIES + 1);
-    for (let i = 0; i < attempts; i++) {
-        try {
-            const r = await axios.get(u, { responseType: "arraybuffer", timeout: SEG_REQUEST_TIMEOUT, maxRedirects: 5, signal, headers: { "User-Agent": UPSTREAM_UA, "Accept": "*/*" }, ...upstreamAgentOptions(), validateStatus: s => s >= 200 && s < 300, maxContentLength: Infinity, maxBodyLength: Infinity });
-            return Buffer.from(r.data);
-        } catch (e) {
-            lastErr = e;
-            if (signal?.aborted) throw e;
-            if (i + 1 < attempts) await sleep(SEGMENT_UPSTREAM_RETRY_DELAY_MS);
-        }
-    }
-    throw lastErr;
-}
-
-function describeUpstreamError(err) {
-    const status = getErrorStatus(err);
-    return status ? `http_${status}` : String(err?.code || err?.message || "error").slice(0, 80);
-}
-
-function writeToFfmpeg(ingest, buf) {
-    const proc = ingest.proc;
-    if (ingest.feederStop || !proc || ingest.exited || !proc.stdin?.writable) {
-        return Promise.reject(new Error("ffmpeg stdin is not writable"));
-    }
-    return new Promise((resolve, reject) => {
-        let done = false;
-        let timer = null;
-        const finish = err => {
-            if (done) return;
-            done = true;
-            if (timer) clearTimeout(timer);
-            proc.stdin.off("drain", onDrain);
-            proc.stdin.off("error", onError);
-            err ? reject(err) : resolve();
-        };
-        const onDrain = () => finish();
-        const onError = err => finish(err || new Error("ffmpeg stdin error"));
-        timer = setTimeout(() => finish(new Error("ffmpeg stdin drain timeout")), INGEST_STDIN_DRAIN_TIMEOUT_MS);
-        proc.stdin.once("error", onError);
-        if (proc.stdin.write(buf)) finish();
-        else proc.stdin.once("drain", onDrain);
-    });
-}
-
-async function downloadAndFeedSegment(ingest, url, key) {
-    const buf = await downloadSegment(url);
-    await writeToFfmpeg(ingest, buf);
-    ingest.seen.add(key);
-    if (ingest.seen.size > 5000) ingest.seen = new Set([...ingest.seen].slice(-2000));
-    ingest.fed++;
-    ingest.fedBytes = (ingest.fedBytes || 0) + buf.length;
-    ingest.lastFedAt = Date.now();
-    ingest.consecutiveSegFails = 0;
-    return buf.length;
-}
-
-function rememberBlockedSegment(ingest, url, key, err) {
-    const now = Date.now();
-    const current = ingest.blockedSegment?.key === key
-        ? ingest.blockedSegment
-        : { url, key, firstFailedAt: now, attempts: 0, nextLogAt: 0 };
-    current.url = url;
-    current.attempts++;
-    current.lastFailedAt = now;
-    current.lastError = describeUpstreamError(err);
-    ingest.blockedSegment = current;
-    ingest.segFails = (ingest.segFails || 0) + 1;
-    ingest.consecutiveSegFails = (ingest.consecutiveSegFails || 0) + 1;
-
-    if (now >= current.nextLogAt || current.attempts === 1) {
-        console.warn(`[SEG BLOCKED] channel="${ingest.label}" key=${ingest.shortKey} seg=${key} attempts=${current.attempts} waited=${Math.round((now - current.firstFailedAt) / 1000)}s reason=${current.lastError}`);
-        current.nextLogAt = now + 10000;
-    }
-}
-
-async function retryBlockedSegment(ingest) {
-    const blocked = ingest.blockedSegment;
-    if (!blocked) return false;
-    if (ingest.seen.has(blocked.key)) {
-        ingest.blockedSegment = null;
-        return false;
-    }
-
-    const waitedMs = Date.now() - blocked.firstFailedAt;
-    if (waitedMs > INGEST_BLOCKED_SEGMENT_MAX_MS || blocked.attempts >= INGEST_BLOCKED_SEGMENT_MAX_ATTEMPTS) {
-        // Last resort: keep the long-running player alive after a segment has
-        // become unrecoverable. This should be rare with the delayed edge; when
-        // it happens it is logged loudly instead of silently punching a hole.
-        ingest.skipped++;
-        ingest.seen.add(blocked.key);
-        console.error(`[SEG GIVEUP] channel="${ingest.label}" key=${ingest.shortKey} seg=${blocked.key} attempts=${blocked.attempts} waited=${Math.round(waitedMs / 1000)}s last=${blocked.lastError}`);
-        ingest.blockedSegment = null;
-        return false;
-    }
-
-    try {
-        const bytes = await downloadAndFeedSegment(ingest, blocked.url, blocked.key);
-        console.log(`[SEG RECOVER] channel="${ingest.label}" key=${ingest.shortKey} seg=${blocked.key} attempts=${blocked.attempts} bytes=${bytes}`);
-        ingest.blockedSegment = null;
-        return false;
-    } catch (err) {
-        rememberBlockedSegment(ingest, blocked.url, blocked.key, err);
-        return true;
-    }
-}
-
-function startFeeder(ingest) {
-    ingest.feederStop = false;
-    ingest.seen = new Set();
-    ingest.pollMs = INGEST_POLL_MS;
-    ingest.plFails = 0; ingest.fed = 0; ingest.skipped = 0; ingest.segFails = 0; ingest.fedBytes = 0; ingest.blockedSegment = null;
-    const tick = async () => {
-        if (ingest.feederStop) return;
-        try { await feedOnce(ingest); } catch {}
-        if (!ingest.feederStop) { ingest.feederTimer = setTimeout(tick, ingest.pollMs); ingest.feederTimer.unref?.(); }
-    };
-    tick();
-}
-
-function stopFeeder(ingest) {
-    ingest.feederStop = true;
-    if (ingest.feederTimer) { clearTimeout(ingest.feederTimer); ingest.feederTimer = null; }
-}
-
-async function feedOnce(ingest) {
-    let pl, finalUrl;
-    try { ({ data: pl, finalUrl } = await fetchUpstreamM3U8(ingest.url)); }
-    catch (err) {
-        const hadBlocked = !!ingest.blockedSegment;
-        if (await retryBlockedSegment(ingest)) return;
-        if (hadBlocked && !ingest.blockedSegment) return;
-        ingest.plFails++;
-        ingest.lastPlaylistError = describeUpstreamError(err);
-        if (ingest.plFails <= 3 || ingest.plFails % 5 === 0) {
-            console.warn(`[FEED PLAYLIST ERROR] channel="${ingest.label}" key=${ingest.shortKey} fails=${ingest.plFails} reason=${ingest.lastPlaylistError}`);
-        }
-        return;
-    }
-    ingest.plFails = 0;
-    ingest.lastPlaylistError = "";
-    const td = (pl.match(/#EXT-X-TARGETDURATION:(\d+)/) || [])[1];
-    if (td) ingest.pollMs = Math.max(2500, Math.min(8000, Math.round(Number(td) * 1000 * 0.5)));
-    const segs = parseSegmentUrlsFromM3U8(pl, finalUrl);
-    if (ingest.blockedSegment) {
-        const fresh = segs.find(su => segKey(su) === ingest.blockedSegment.key);
-        if (fresh && fresh !== ingest.blockedSegment.url) {
-            ingest.blockedSegment.url = fresh;
-            ingest.blockedSegment.lastTokenRefreshAt = Date.now();
-        }
-        if (await retryBlockedSegment(ingest)) return;
-    }
-    for (const su of segs) {
-        if (ingest.feederStop) return;
-        const k = segKey(su);
-        if (ingest.seen.has(k)) continue;
-        try {
-            await downloadAndFeedSegment(ingest, su, k);
-        } catch (err) {
-            rememberBlockedSegment(ingest, su, k, err);
-            return; // Preserve segment order; do not feed newer TS over a gap.
-        }
-    }
-}
-
-// Keep a wanted channel alive across ffmpeg deaths, but with backoff so we never
-// hammer the upstream (which would turn a transient error into a 403 temp-ban).
-function scheduleRespawn(ingest, ranMs, tail) {
-    if (!ingests.has(ingest.key)) return; // stopped/zapped away
-    if (Date.now() - ingest.lastAccess > INGEST_IDLE_TIMEOUT_MS) return; // nobody watching
-
-    if (ranMs >= INGEST_HEALTHY_RUN_MS) ingest.failures = 0; // it ran fine, just hiccuped
-    ingest.failures = (ingest.failures || 0) + 1;
-
-    if (ingest.failures > INGEST_MAX_RESTARTS) {
-        console.error(`[INGEST GIVEUP] channel="${ingest.label}" key=${ingest.shortKey} failures=${ingest.failures} lastTail=${tail}`);
-        stopIngest(ingest, `giveup after ${ingest.failures} failures`);
-        return;
-    }
-
-    const forbidden = /403|Forbidden|access denied/i.test(tail);
-    const delay = forbidden ? INGEST_FORBIDDEN_RESPAWN_DELAY_MS : INGEST_RESPAWN_DELAY_MS;
-    ingest.restarts++;
-    console.log(`[INGEST RESPAWN] channel="${ingest.label}" key=${ingest.shortKey} in=${delay}ms failures=${ingest.failures} forbidden=${forbidden ? 1 : 0}`);
-    ingest.respawnTimer = setTimeout(() => {
-        ingest.respawnTimer = null;
-        if (!ingests.has(ingest.key)) return;
-        if (ingest.proc && !ingest.exited) return; // already respawned (e.g. by a request)
-        if (Date.now() - ingest.lastAccess > INGEST_IDLE_TIMEOUT_MS) { stopIngest(ingest, "idle before respawn"); return; }
-        spawnIngest(ingest);
-    }, delay);
-    ingest.respawnTimer.unref?.();
-}
-
-// Enforce the upstream's concurrent-connection budget: stop the least-recently
-// used OTHER ingests, then WAIT for their ffmpeg (and upstream socket) to close
-// before the caller connects the new channel — otherwise the new one gets a 403.
-async function freeConnectionSlot(keepKey) {
-    const others = [...ingests.values()].filter(i => i.key !== keepKey);
-    if (others.length + 1 <= INGEST_MAX_CONCURRENT) return;
-    others.sort((a, b) => a.lastAccess - b.lastAccess); // oldest first
-    const toStop = others.slice(0, others.length + 1 - INGEST_MAX_CONCURRENT);
-    for (const i of toStop) stopIngest(i, "freeing connection slot (zap)");
-    const deadline = Date.now() + INGEST_DRAIN_TIMEOUT_MS;
-    while (Date.now() < deadline && toStop.some(i => !i.exited)) await sleep(100);
-    if (INGEST_DRAIN_GRACE_MS) await sleep(INGEST_DRAIN_GRACE_MS); // let the upstream register the disconnect
-}
-
-function ensureIngest(ingestKey, url, label) {
-    let ingest = ingests.get(ingestKey);
-    if (ingest && !ingest.exited && ingest.proc) {
-        ingest.lastAccess = Date.now();
-        ingest.url = url;
-        if (label) ingest.label = label;
-        return ingest;
-    }
-    if (!ingest) {
-        ingest = {
-            key: ingestKey,
-            shortKey: hashKey(ingestKey).slice(0, 10),
-            url,
-            label: label || "live",
-            dir: ingestDirFor(ingestKey),
-            lastAccess: Date.now(),
-            restarts: 0,
-            failures: 0
-        };
-        ingests.set(ingestKey, ingest);
-    } else {
-        ingest.url = url;
-        if (label) ingest.label = label;
-        ingest.lastAccess = Date.now();
-    }
-    spawnIngest(ingest);
-    startIngestReaper();
-    return ingest;
-}
-
-function readIngestPlaylist(ingest) {
-    try {
-        const raw = fs.readFileSync(ingestIndexPath(ingest), "utf8");
-        return /seg_\d+\.ts/.test(raw) ? raw : null;
-    } catch {
-        return null;
-    }
-}
-
-function playlistDurationSeconds(raw) {
-    let total = 0;
-    const re = /#EXTINF:([0-9.]+)/g;
-    let m;
-    while ((m = re.exec(raw))) total += parseFloat(m[1]) || 0;
-    return total;
-}
-
-// Block the first serve until we have a real cushion of locally-ingested content
-// (or we hit the timeout). This is what gives the player runway from frame one,
-// instead of starting glued to the live edge and micro-buffering. Stremio
-// tolerates a slow first manifest. Later requests return immediately.
-async function waitForPrebuffer(ingest, targetSeconds, timeoutMs) {
-    const deadline = Date.now() + timeoutMs;
-    let raw = null;
-    while (Date.now() < deadline) {
-        raw = readIngestPlaylist(ingest);
-        if (raw) {
-            if (!ingest.firstSegmentAt) ingest.firstSegmentAt = Date.now();
-            if (playlistDurationSeconds(raw) >= targetSeconds) return raw;
-        } else if (ingest.exited && !ingest.respawnTimer) {
-            return null;
-        }
-        await sleep(250);
-    }
-    return raw; // serve whatever we managed to buffer
-}
-
-function parseLocalHlsPlaylist(raw) {
-    const header = [];
-    const segments = [];
-    let pending = [];
-    let duration = 0;
-
-    for (const line of String(raw || "").split(/\r?\n/)) {
-        const extinf = line.match(/^#EXTINF:([0-9.]+)/i);
-        if (extinf) {
-            pending = [line];
-            duration = parseFloat(extinf[1]) || 0;
+// Rewrite an upstream HLS manifest so every URL points back through our relay
+// (master variants -> /proxy/live.m3u8, media segments + URI= keys -> /proxy/seg),
+// and inject a small startup offset on media playlists.
+function rewriteManifest(text, baseUrl, host, configKey) {
+    const segUrl = abs => `${host}/${configKey}/proxy/seg?u=${encodeProxyUrl(abs)}`;
+    const subUrl = abs => `${host}/${configKey}/proxy/live.m3u8?u=${encodeProxyUrl(abs)}`;
+    const isMaster = /#EXT-X-STREAM-INF/i.test(text);
+    let offsetInjected = false;
+    const out = [];
+    for (const line of text.split(/\r?\n/)) {
+        const t = line.trim();
+        if (!t) { out.push(line); continue; }
+        if (t.startsWith("#")) {
+            out.push(/URI=/i.test(t)
+                ? line.replace(/URI=(["'])(.*?)\1/gi, (_m, q, uri) => `URI=${q}${segUrl(toAbsoluteUrl(uri, baseUrl))}${q}`)
+                : line);
             continue;
         }
-        if (pending.length) {
-            pending.push(line);
-            if (line && !line.startsWith("#")) {
-                segments.push({ duration, lines: pending, uri: line });
-                pending = [];
-                duration = 0;
-            }
-            continue;
+        const abs = toAbsoluteUrl(t, baseUrl);
+        if (isMaster || isHlsUrl(abs)) { out.push(subUrl(abs)); continue; }
+        // First segment of a media playlist: inject the startup offset just before it.
+        if (!offsetInjected && PROXY_START_OFFSET_SECONDS > 0) {
+            out.splice(out.length - 1, 0, `#EXT-X-START:TIME-OFFSET=-${PROXY_START_OFFSET_SECONDS},PRECISE=YES`);
+            offsetInjected = true;
         }
-        if (/^#EXT-X-(?:SERVER-CONTROL|START):/i.test(line)) continue;
-        if (line.trim()) header.push(line);
+        out.push(segUrl(abs));
     }
-    return { header, segments };
+    return out.join("\n");
 }
 
-function sumSegmentDuration(segments) {
-    return segments.reduce((sum, seg) => sum + (seg.duration || 0), 0);
-}
-
-function localSegmentPathForUri(ingest, uri) {
-    const clean = String(uri || "").split(/[?#]/)[0];
-    const name = path.basename(clean);
-    if (!/^seg_\d+\.ts$/.test(name)) return "";
-    return path.join(ingest.dir, name);
-}
-
-function isLocalSegmentPublishable(ingest, segment) {
-    if (!ingest || !segment?.uri) return true;
-    const file = localSegmentPathForUri(ingest, segment.uri);
-    if (!file) return false;
-    try {
-        const st = fs.statSync(file);
-        if (!st.isFile()) return false;
-        if (INGEST_PUBLISH_DELAY_SECONDS <= 0) return true;
-        return Date.now() - st.mtimeMs >= INGEST_PUBLISH_DELAY_SECONDS * 1000;
-    } catch {
-        return false;
-    }
-}
-
-function trimUnpublishableTail(ingest, segments) {
-    const keep = segments.slice();
-    let withheld = 0;
-    while (keep.length > INGEST_MIN_VISIBLE_SEGMENTS && !isLocalSegmentPublishable(ingest, keep[keep.length - 1])) {
-        keep.pop();
-        withheld++;
-    }
-    return { keep, withheld };
-}
-
-function trimSegmentsBehindLiveEdge(segments) {
-    const keep = segments.slice();
-    const rawBufferSec = sumSegmentDuration(keep);
-    const targetDelaySec = Math.min(INGEST_LIVE_OFFSET_SECONDS, Math.max(0, rawBufferSec - INGEST_TARGET_VISIBLE_SECONDS));
-    let delaySec = 0;
-
-    while (delaySec < targetDelaySec && keep.length > INGEST_MIN_VISIBLE_SEGMENTS) {
-        const last = keep[keep.length - 1];
-        const nextVisibleSec = rawBufferSec - delaySec - (last.duration || 0);
-        if (nextVisibleSec < INGEST_TARGET_VISIBLE_SECONDS) break;
-        keep.pop();
-        delaySec += last.duration || 0;
-    }
-
-    return { keep, rawBufferSec, delaySec, visibleSec: sumSegmentDuration(keep) };
-}
-
-function insertLiveControlTags(header, visibleSec) {
-    const out = header.slice();
-    const tags = [];
-    const holdBack = Math.min(INGEST_PLAYER_HOLDBACK_SECONDS, Math.max(0, visibleSec - 6));
-    if (holdBack > 0) {
-        tags.push(`#EXT-X-SERVER-CONTROL:HOLD-BACK=${holdBack.toFixed(3).replace(/\.?0+$/, "")}`);
-        tags.push(`#EXT-X-START:TIME-OFFSET=-${holdBack.toFixed(3).replace(/\.?0+$/, "")},PRECISE=YES`);
-    }
-    if (!tags.length) return out;
-
-    const seqIdx = out.findIndex(line => /^#EXT-X-MEDIA-SEQUENCE:/i.test(line));
-    if (seqIdx >= 0) out.splice(seqIdx + 1, 0, ...tags);
-    else {
-        const m3uIdx = out.findIndex(line => /^#EXTM3U/i.test(line));
-        if (m3uIdx >= 0) out.splice(m3uIdx + 1, 0, ...tags);
-        else out.unshift(...tags);
-    }
-    return out;
-}
-
-// ffmpeg produces the local rolling HLS playlist. Kronos then exposes only an
-// older slice of that playlist, so Stremio cannot run into the fragile real edge.
-// This is stronger than just hinting HOLD-BACK: the newest local segments are
-// intentionally absent from the manifest served to the player.
-function buildServedPlaylist(raw, ingest) {
-    const parsed = parseLocalHlsPlaylist(raw);
-    if (!parsed.segments.length) return null;
-
-    const publishable = trimUnpublishableTail(ingest, parsed.segments);
-    const { keep, rawBufferSec, delaySec, visibleSec } = trimSegmentsBehindLiveEdge(publishable.keep);
-    if (!keep.length) return null;
-
-    const out = insertLiveControlTags(parsed.header, visibleSec);
-    keep.forEach(seg => out.push(...seg.lines));
-    return {
-        playlist: out.join("\n") + "\n",
-        segCount: keep.length,
-        bufferSec: visibleSec,
-        rawBufferSec,
-        delaySec,
-        withheldSec: sumSegmentDuration(parsed.segments) - rawBufferSec,
-        withheldSegments: publishable.withheld
-    };
-}
-
-function stopIngest(ingest, reason) {
-    ingest.stopping = true;
-    if (ingest.respawnTimer) { clearTimeout(ingest.respawnTimer); ingest.respawnTimer = null; }
-    stopFeeder(ingest);
-    const proc = ingest.proc;
-    try { if (proc && proc.stdin && proc.stdin.writable) proc.stdin.end(); } catch {}
-    try { if (proc && !ingest.exited) proc.kill("SIGTERM"); } catch {}
-    setTimeout(() => { try { if (proc && !ingest.exited) proc.kill("SIGKILL"); } catch {} }, 4000);
-    ingests.delete(ingest.key);
-    setTimeout(() => { try { fs.rmSync(ingest.dir, { recursive: true, force: true }); } catch {} }, 5000);
-    console.log(`[INGEST STOP] channel="${ingest.label}" key=${ingest.shortKey} reason=${reason}`);
-}
-
-function startIngestReaper() {
-    if (ingestReaperStarted) return;
-    ingestReaperStarted = true;
-    const timer = setInterval(() => {
-        const now = Date.now();
-        for (const ingest of [...ingests.values()]) {
-            if (now - ingest.lastAccess > INGEST_IDLE_TIMEOUT_MS) {
-                stopIngest(ingest, `idle ${Math.round((now - ingest.lastAccess) / 1000)}s`);
-            }
-        }
-    }, INGEST_REAP_INTERVAL_MS);
-    timer.unref?.();
-}
-
-// Player fetches the channel manifest -> ensure ffmpeg is ingesting (stopping any
-// other channel), prebuffer the cushion, then serve a clean local playlist.
-app.get("/:base64Config/live/:cid/index.m3u8", async (req, res) => {
-    const started = Date.now();
-    const reqId = nextPlaybackRequestId("L");
+// Relay (and rewrite) an HLS manifest.
+app.get("/:base64Config/proxy/live.m3u8", async (req, res) => {
     const configKey = req.params.base64Config;
-    const cid = req.params.cid;
-    const client = playbackClientTag(req);
-    let label = "live";
     try {
-        const config = decodeConfig(configKey);
-        const ch = await getChannelById(configKey, config, cid);
-        if (!ch || !ch.url) return res.status(404).type("text/plain").send("#EXTM3U\n");
-        label = ch.name || "live";
-        const ingestKey = `${configKey}:${cid}`;
-        // Zapping: stop any other channel and wait for its upstream connection to
-        // close before we connect this one (the upstream allows only N at once).
-        if (!ingests.has(ingestKey) || ingests.get(ingestKey)?.exited) await freeConnectionSlot(ingestKey);
-        const ingest = ensureIngest(ingestKey, ch.url, label);
-        ingest.lastAccess = Date.now();
-
-        // First serve: prebuffer the cushion so the player has runway from frame
-        // one. Later requests serve immediately from ffmpeg's current playlist.
-        let warmupMs = 0;
-        let raw = readIngestPlaylist(ingest);
-        if (!ingest.served || !raw) {
-            const w0 = Date.now();
-            raw = await waitForPrebuffer(ingest, INGEST_PREBUFFER_SECONDS, INGEST_FIRST_SEGMENT_TIMEOUT_MS);
-            warmupMs = Date.now() - w0;
-            ingest.lastAccess = Date.now();
-            if (!raw) {
-                console.error(`[LIVE TIMEOUT] id=${reqId} channel="${label}" key=${ingest.shortKey} warmup=${warmupMs}ms exited=${ingest.exited ? 1 : 0} plFails=${ingest.plFails || 0} tail=${(ingest.stderrTail || "").trim().split("\n").pop() || ""}`);
-                return res.status(504).type("text/plain").send("#EXTM3U\n");
-            }
-            ingest.served = true;
-        }
-        const served = buildServedPlaylist(raw, ingest);
-        if (!served) {
-            console.error(`[LIVE EMPTY] id=${reqId} channel="${label}" key=${ingest.shortKey} warmup=${warmupMs}ms`);
-            return res.status(504).type("text/plain").send("#EXTM3U\n");
-        }
+        decodeConfig(configKey);
+        const upstream = decodeProxyUrl(req.query.u || "");
+        if (!isHttpUrl(upstream)) return res.status(400).type("text/plain").send("#EXTM3U\n");
+        const r = await axios.get(upstream, {
+            responseType: "text", timeout: HLS_REQUEST_TIMEOUT, maxRedirects: 5,
+            headers: RELAY_HEADERS, ...upstreamAgentOptions(), validateStatus: s => s >= 200 && s < 400
+        });
+        const finalUrl = r.request?.res?.responseUrl || upstream;
         setPlaylistHeaders(res);
-        res.send(served.playlist);
-        console.log(`[LIVE SERVE] id=${reqId} channel="${label}" key=${ingest.shortKey} segs=${served.segCount} buffer=${served.bufferSec.toFixed(0)}s raw=${served.rawBufferSec.toFixed(0)}s delay=${served.delaySec.toFixed(0)}s withheld=${served.withheldSec.toFixed(0)}s/${served.withheldSegments} fed=${ingest.fed || 0} skip=${ingest.skipped || 0} segFails=${ingest.segFails || 0} plFails=${ingest.plFails || 0} warmup=${warmupMs}ms client=${client} time=${Date.now() - started}ms`);
+        res.send(rewriteManifest(String(r.data), finalUrl, getPublicHost(req), configKey));
     } catch (err) {
-        console.error(`[LIVE ERROR] id=${reqId} channel="${label}" cid=${cid} reason=${err.message}`);
+        console.error(`[PROXY M3U8] ${err?.message || err}`);
         if (!res.headersSent) res.status(502).type("text/plain").send("#EXTM3U\n");
     }
 });
 
-// Serve a locally-produced segment file. No upstream contact here: ffmpeg already
-// pulled it via the VPN and remuxed it.
-function waitForLocalSegment(file, timeoutMs) {
-    const started = Date.now();
-    return new Promise(resolve => {
-        const check = () => {
-            fs.stat(file, (err, st) => {
-                if (!err && st.isFile()) return resolve({ st, waitedMs: Date.now() - started });
-                if (Date.now() - started >= timeoutMs) return resolve({ st: null, waitedMs: Date.now() - started });
-                setTimeout(check, LOCAL_SEGMENT_WAIT_POLL_MS).unref?.();
-            });
-        };
-        check();
-    });
-}
-
-function parseRangeHeader(rangeHeader, size) {
-    const m = String(rangeHeader || "").match(/^bytes=(\d*)-(\d*)$/);
-    if (!m) return null;
-    let start = m[1] === "" ? null : Number(m[1]);
-    let end = m[2] === "" ? null : Number(m[2]);
-    if (start === null && end === null) return null;
-    if (start === null) {
-        const suffix = Math.max(0, end || 0);
-        start = Math.max(0, size - suffix);
-        end = size - 1;
-    } else {
-        end = end === null ? size - 1 : end;
-    }
-    if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start || start >= size) return null;
-    return { start, end: Math.min(end, size - 1) };
-}
-
-app.get("/:base64Config/live/:cid/:seg", async (req, res) => {
-    const started = Date.now();
-    const { base64Config: configKey, cid, seg } = req.params;
-    if (!/^seg_\d+\.ts$/.test(seg)) return res.status(400).end();
-    const ingestKey = `${configKey}:${cid}`;
-    const ingest = ingests.get(ingestKey);
-    if (ingest) ingest.lastAccess = Date.now();
-    const file = path.join(ingestDirFor(ingestKey), seg);
-    const { st, waitedMs } = await waitForLocalSegment(file, LOCAL_SEGMENT_WAIT_MS);
-    if (!st) {
-        console.warn(`[SEG LOCAL MISS] key=${hashKey(ingestKey).slice(0, 10)} seg=${seg} waited=${waitedMs}ms active=${ingests.has(ingestKey) ? 1 : 0}`);
-        return res.status(404).end();
-    }
-
-    const range = parseRangeHeader(req.headers.range, st.size);
-    const start = range?.start ?? 0;
-    const end = range?.end ?? st.size - 1;
-    const length = end - start + 1;
-    let completed = false;
-
-    res.setHeader("Content-Type", "video/mp2t");
-    res.setHeader("Cache-Control", "no-store");
-    res.setHeader("Accept-Ranges", "bytes");
-    res.setHeader("Content-Length", length);
-    if (range) {
-        res.status(206);
-        res.setHeader("Content-Range", `bytes ${start}-${end}/${st.size}`);
-    }
-
-    const logSegment = reason => {
-        const elapsed = Date.now() - started;
-        if (waitedMs > 0 || elapsed >= LOCAL_SEGMENT_SLOW_LOG_MS || reason !== "finish") {
-            const mbps = elapsed > 0 ? ((length * 8) / elapsed / 1000).toFixed(1) : "inf";
-            console.log(`[SEG ${reason.toUpperCase()}] key=${hashKey(ingestKey).slice(0, 10)} seg=${seg} bytes=${length}/${st.size} range=${range ? 1 : 0} waited=${waitedMs}ms time=${elapsed}ms mbps=${mbps}`);
+// Relay a segment (or any raw stream) byte-for-byte, forwarding Range for seeking.
+app.get("/:base64Config/proxy/seg", async (req, res) => {
+    try {
+        decodeConfig(req.params.base64Config);
+        const upstream = decodeProxyUrl(req.query.u || "");
+        if (!isHttpUrl(upstream)) return res.status(400).end();
+        const headers = { ...RELAY_HEADERS };
+        if (req.headers.range) headers.Range = req.headers.range;
+        const r = await axios.get(upstream, {
+            responseType: "stream", timeout: SEG_REQUEST_TIMEOUT, maxRedirects: 5, headers,
+            ...upstreamAgentOptions(), decompress: false, maxContentLength: Infinity, maxBodyLength: Infinity,
+            validateStatus: s => s >= 200 && s < 400
+        });
+        res.status(r.status);
+        for (const h of ["content-type", "content-length", "content-range", "accept-ranges", "last-modified", "etag"]) {
+            if (r.headers[h]) res.setHeader(h, r.headers[h]);
         }
-    };
-
-    res.on("finish", () => { completed = true; logSegment("finish"); });
-    res.on("close", () => { if (!completed) logSegment("abort"); });
-
-    const stream = fs.createReadStream(file, { start, end, highWaterMark: 1024 * 1024 });
-    stream.on("error", () => { if (!res.headersSent) res.status(404).end(); else res.destroy(); });
-    stream.pipe(res);
+        res.setHeader("Cache-Control", "no-store");
+        r.data.on("error", () => { if (!res.headersSent) res.status(502).end(); else res.destroy(); });
+        res.on("close", () => { try { r.data.destroy(); } catch {} });
+        r.data.pipe(res);
+    } catch (err) {
+        if (!res.headersSent) res.status(502).end();
+    }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2025,7 +1358,6 @@ app.get("/:base64Config/stream/:type/:id.json", async (req, res) => {
         const config = decodeConfig(configKey);
         const ch = await getChannelById(configKey, config, req.params.id);
         if (!ch) return res.status(404).json({ streams: [] });
-        preflightHLSStream(ch, configKey);
         res.json({ streams: [buildStream(ch, getPublicHost(req), configKey)] });
     } catch (err) {
         console.error("[STREAM ERROR]", err.message);
@@ -2044,31 +1376,10 @@ app.get("/:base64Config/stats", (req, res) => {
             epgMaps: Object.keys(memoryCache.epgData).length,
             logos: Object.keys(memoryCache.logoData).length
         },
-        ingest: {
-            engine: "ffmpeg",
-            active: ingests.size,
-            maxConcurrent: INGEST_MAX_CONCURRENT,
-            cushionSeconds: INGEST_LIVE_OFFSET_SECONDS,
-            prebufferSeconds: INGEST_PREBUFFER_SECONDS,
-            channels: [...ingests.values()].map(i => ({
-                label: i.label,
-                pid: i.pid,
-                up: !i.exited,
-                restarts: i.restarts,
-                failures: i.failures || 0,
-                fed: i.fed || 0,
-                skipped: i.skipped || 0,
-                segmentFailures: i.segFails || 0,
-                playlistFailures: i.plFails || 0,
-                blockedSegment: i.blockedSegment ? {
-                    key: i.blockedSegment.key,
-                    attempts: i.blockedSegment.attempts,
-                    waitedSeconds: Math.round((Date.now() - i.blockedSegment.firstFailedAt) / 1000),
-                    lastError: i.blockedSegment.lastError
-                } : null,
-                ageSeconds: Math.round((Date.now() - (i.startedAt || Date.now())) / 1000),
-                idleSeconds: Math.round((Date.now() - i.lastAccess) / 1000)
-            }))
+        playback: {
+            mode: "transparent-relay",
+            vpn: false,
+            startOffsetSeconds: PROXY_START_OFFSET_SECONDS
         }
     });
 });
@@ -2107,25 +1418,8 @@ app.get("/:base64Config/debug", async (req, res) => {
             })),
             groups: [...new Set(channels.map(c => c.group))].slice(0, 50),
             constants: {
-                ADDON_TYPE, RELEASE_VERSION, PLAYBACK_MODE, HLS_REQUEST_TIMEOUT, SEG_REQUEST_TIMEOUT,
-                HLS_UPSTREAM_RETRIES, HLS_UPSTREAM_RETRY_DELAY_MS,
-                HLS_COLD_START_WAIT_MS, HLS_COLD_START_RETRY_MS,
-                HLS_LIVE_MIN_SEGMENTS, HLS_LIVE_MIN_VISIBLE_SEGMENTS, HLS_LIVE_HOLDBACK_SEGMENTS,
-                HLS_STALE_HOLDBACK_RELEASE_TARGETS, HLS_START_OFFSET_TARGETS, HLS_STREAM_PREFLIGHT,
-                HLS_LIVE_WARMUP_WAIT_MS, HLS_LIVE_WARMUP_POLL_MS,
-                HLS_STALE_MANIFEST_TTL_MS, HLS_STALE_LIVE_TARGETS, HLS_STALE_FORBIDDEN_TARGETS,
-                HLS_FORBIDDEN_BACKOFF_MS, HLS_FORBIDDEN_SOURCE_REFRESH,
-                HLS_WAITING_MANIFEST_ON_ERROR, HLS_WAITING_TARGET_DURATION,
-                PLAYBACK_ACTIVITY_TTL_MS, PLAYBACK_ACTIVITY_MAX,
-                ACTIVE_STREAM_TTL_MS,
-                SEGMENT_UPSTREAM_CONCURRENCY, SEGMENT_UPSTREAM_RETRIES, SEGMENT_UPSTREAM_RETRY_DELAY_MS,
-                INGEST_WINDOW_SEGMENTS, INGEST_LIVE_OFFSET_SECONDS, INGEST_MIN_VISIBLE_SECONDS,
-                INGEST_TARGET_VISIBLE_SECONDS,
-                INGEST_MIN_VISIBLE_SEGMENTS, INGEST_PLAYER_HOLDBACK_SECONDS, INGEST_PREBUFFER_SECONDS,
-                INGEST_FIRST_SEGMENT_TIMEOUT_MS, INGEST_IDLE_TIMEOUT_MS, INGEST_BLOCKED_SEGMENT_MAX_MS,
-                INGEST_BLOCKED_SEGMENT_MAX_ATTEMPTS, INGEST_STDIN_DRAIN_TIMEOUT_MS,
-                INGEST_PUBLISH_DELAY_SECONDS, INGEST_MAX_VARIANT_BANDWIDTH,
-                LOCAL_SEGMENT_WAIT_MS, LOCAL_SEGMENT_WAIT_POLL_MS, LOCAL_SEGMENT_SLOW_LOG_MS,
+                ADDON_TYPE, RELEASE_VERSION, PLAYBACK_MODE,
+                HLS_REQUEST_TIMEOUT, SEG_REQUEST_TIMEOUT, PROXY_START_OFFSET_SECONDS,
                 UPSTREAM_KEEPALIVE_MAX_SOCKETS, UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS, UPSTREAM_KEEPALIVE_MS,
                 PLAYLIST_REQUEST_TIMEOUT, PLAYLIST_RETRY_WINDOW_MS, PLAYLIST_RETRY_DELAY_MS
             }
@@ -2140,9 +1434,7 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log("=".repeat(60));
     console.log(`🌐 http://0.0.0.0:${PORT}`);
     console.log(`📦 Node ${process.version}`);
-    console.log(`🎬 playback=${PLAYBACK_MODE} engine=ffmpeg(-c copy) bin=${FFMPEG_BIN}`);
-    console.log(`🎥 ingest mode=feeder-pipe seg=${INGEST_SEGMENT_SECONDS}s window=${INGEST_WINDOW_SEGMENTS} cushion=${INGEST_LIVE_OFFSET_SECONDS}s minVisible=${INGEST_MIN_VISIBLE_SECONDS}s targetVisible=${INGEST_TARGET_VISIBLE_SECONDS}s prebuffer=${INGEST_PREBUFFER_SECONDS}s holdback=${INGEST_PLAYER_HOLDBACK_SECONDS}s publishDelay=${INGEST_PUBLISH_DELAY_SECONDS}s poll=${INGEST_POLL_MS}ms(auto) maxConcurrent=${INGEST_MAX_CONCURRENT} idle=${INGEST_IDLE_TIMEOUT_MS / 1000}s firstSegTimeout=${INGEST_FIRST_SEGMENT_TIMEOUT_MS / 1000}s`);
-    console.log(`🔁 ingest respawn=${INGEST_RESPAWN_DELAY_MS}ms forbidden=${INGEST_FORBIDDEN_RESPAWN_DELAY_MS}ms drain=${INGEST_DRAIN_GRACE_MS}ms healthyRun=${INGEST_HEALTHY_RUN_MS / 1000}s maxRestarts=${INGEST_MAX_RESTARTS}`);
+    console.log(`🎬 playback=transparent-relay vpn=off remux=off startOffset=${PROXY_START_OFFSET_SECONDS}s hlsTimeout=${HLS_REQUEST_TIMEOUT / 1000}s segTimeout=${SEG_REQUEST_TIMEOUT / 1000}s`);
     console.log(`🔌 upstream keepAlive=1 sockets=${UPSTREAM_KEEPALIVE_MAX_SOCKETS} free=${UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS} ms=${UPSTREAM_KEEPALIVE_MS}`);
     console.log(`🩺 playback telemetry=1 ttl=${PLAYBACK_ACTIVITY_TTL_MS / 1000}s max=${PLAYBACK_ACTIVITY_MAX}`);
     console.log(`📋 playlist retryWindow=${PLAYLIST_RETRY_WINDOW_MS / 1000}s delay=${PLAYLIST_RETRY_DELAY_MS / 1000}s`);
