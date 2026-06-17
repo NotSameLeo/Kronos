@@ -51,7 +51,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "4.3.1";
+const RELEASE_VERSION = "4.3.2";
 const ADDON_TYPE = "tv";
 const PLAYBACK_MODE = "transparent-relay";
 const CATALOG_TTL = 30 * 60 * 1000;
@@ -1039,20 +1039,11 @@ function getExtraParams(extra) {
     });
     return params;
 }
-function fromCatalogHex(value) { return Buffer.from(String(value || ""), "hex").toString("utf8"); }
-function getCatalogTarget(id) {
-    const raw = String(id || "");
-    if (raw.startsWith("kronos_group_")) {
-        const parts = raw.replace("kronos_group_", "").split("_");
-        if (parts.length >= 2) return { sourceName: fromCatalogHex(parts[0]), group: fromCatalogHex(parts.slice(1).join("_")) };
-    }
-    if (raw.startsWith("kronos_list_")) return { sourceName: fromCatalogHex(raw.replace("kronos_list_", "")), group: null };
-    return { sourceName: null, group: null };
+function getCatalogSourceName(id) {
+    if (!String(id || "").startsWith("kronos_list_")) return null;
+    return Buffer.from(id.replace("kronos_list_", ""), "hex").toString("utf8");
 }
 function toCatalogId(name) { return `kronos_list_${Buffer.from(name).toString("hex")}`; }
-function toCategoryCatalogId(sourceName, groupName) {
-    return `kronos_group_${Buffer.from(sourceName).toString("hex")}_${Buffer.from(groupName).toString("hex")}`;
-}
 function sortChannelsByName(list) {
     return list.slice().sort((a, b) => a.name.localeCompare(b.name, "it", { sensitivity: "base" }));
 }
@@ -1250,30 +1241,19 @@ app.get("/:base64Config/manifest.json", async (req, res) => {
         const channels = await getChannelsFromCache(configKey, config);
         const host = getPublicHost(req);
 
-        const hasCustomCategories = getCategoryCustomizations(config).length > 0;
-        const catalogs = getConfiguredLists(config).flatMap(list => {
+        const catalogs = getConfiguredLists(config).map(list => {
             const catalogChannels = channels.filter(c => c.sourceName === list.name);
             const groups = sortGroupsForManifest(config, [...new Set(catalogChannels.map(c => c.group))]
                 .filter(g => g && g.trim()));
             const extra = [{ name: "search", isRequired: false }];
-            const listCatalog = { id: toCatalogId(list.name), type: ADDON_TYPE, name: list.name, extra: extra.slice() };
-            if (!hasCustomCategories) {
-                if (groups.length > 0) listCatalog.extra.push({ name: "genre", options: groups, isRequired: false });
-                return [listCatalog];
-            }
-            const categoryCatalogs = groups.map(group => ({
-                id: toCategoryCatalogId(list.name, group),
-                type: ADDON_TYPE,
-                name: group,
-                extra
-            }));
-            return [listCatalog, ...categoryCatalogs];
+            if (groups.length > 0) extra.push({ name: "genre", options: groups, isRequired: false });
+            return { id: toCatalogId(list.name), type: ADDON_TYPE, name: list.name, extra };
         });
 
         res.json({
             id: "org.stremio.kronos.channel",
             version: RELEASE_VERSION,
-            name: "TV", description: "TV",
+            name: "Canali TV", description: "Canali TV",
             logo: `${host}/logo.svg`,
             resources: ["catalog", "meta", "stream"],
             types: [ADDON_TYPE],
@@ -1352,9 +1332,8 @@ async function catalogResponse(req, res) {
             ...getExtraParams(req.params.extra),
             ...Object.fromEntries(Object.entries(req.query || {}).map(([k, v]) => [k, Array.isArray(v) ? v[0] : v]))
         };
-        const targetCatalog = getCatalogTarget(req.params.id);
-        const targetGroup = targetCatalog.group || params.genre || null;
-        const targetSource = targetCatalog.sourceName;
+        const targetGroup = params.genre || null;
+        const targetSource = getCatalogSourceName(req.params.id);
         const search = params.search ? String(params.search).trim() : null;
         const host = getPublicHost(req);
         const channels = await getChannelsFromCache(configKey, config);
