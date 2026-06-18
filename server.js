@@ -51,7 +51,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "4.3.6";
+const RELEASE_VERSION = "4.3.7";
 const ADDON_TYPE = "tv";
 const PLAYBACK_MODE = "transparent-relay";
 const CATALOG_TTL = 30 * 60 * 1000;
@@ -242,6 +242,24 @@ function getRequestConfig(req) {
         config: req.kronosConfig || decodeConfig(configKey),
         routeKey: req.kronosRouteKey || configKey
     };
+}
+
+function attachDefaultConfig(req, res, next) {
+    try {
+        const configKey = readFrontendPreloadConfigKey();
+        if (!configKey) throw new Error("Default configuration not found");
+        req.params.base64Config = configKey;
+        req.kronosConfig = decodeConfig(configKey);
+        req.kronosRouteKey = "";
+        next();
+    } catch (err) {
+        console.error("[DEFAULT CONFIG ERROR]", err.message);
+        res.status(404).json({ error: "Configurazione non trovata" });
+    }
+}
+
+function routeBase(host, routeKey) {
+    return routeKey ? `${host}/${routeKey}` : host;
 }
 
 function parseCatalogPreloadConfigs(raw) {
@@ -1258,17 +1276,18 @@ async function getLogoDataUri(logoUrl) {
 }
 
 function buildStream(channel, host, configKey) {
+    const base = routeBase(host, configKey);
     if (isHlsUrl(channel.url)) {
         return {
             title: channel.name, name: "TV",
-            url: `${host}/${configKey}/proxy/live.m3u8?u=${encodeProxyUrl(channel.url)}`,
+            url: `${base}/proxy/live.m3u8?u=${encodeProxyUrl(channel.url)}`,
             behaviorHints: { notWebReady: true, bingeGroup: `kronos-${channel.id}` }
         };
     }
     if (isPlayableHttpUrl(channel.url)) {
         return {
             title: channel.name, name: "TV",
-            url: `${host}/${configKey}/proxy/seg?u=${encodeProxyUrl(channel.url)}`,
+            url: `${base}/proxy/seg?u=${encodeProxyUrl(channel.url)}`,
             behaviorHints: { notWebReady: true, bingeGroup: `kronos-${channel.id}` }
         };
     }
@@ -1280,7 +1299,7 @@ function toMeta(channel, host, configKey = "", options = {}) {
     const poster = options.shortPoster
         ? `${host}/poster/${channel.id}.svg?v=${encodeURIComponent(RELEASE_VERSION)}`
         : (configKey
-            ? `${host}/${configKey}/poster/${channel.id}.svg?v=${encodeURIComponent(RELEASE_VERSION)}`
+            ? `${routeBase(host, configKey)}/poster/${channel.id}.svg?v=${encodeURIComponent(RELEASE_VERSION)}`
             : (channel.logo || fallbackLogo));
     const logo = channel.logo || poster || fallbackLogo;
     const includeVideos = options.includeVideos !== false;
@@ -1336,6 +1355,7 @@ app.get("/health", (req, res) => {
 });
 
 app.get("/configure", (req, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
+app.get("/manifest.json/configure", (req, res) => res.redirect("/"));
 app.get("/c/:shortConfig/configure", (req, res) =>
     res.redirect(`/?short=${encodeURIComponent(req.params.shortConfig)}`));
 app.get("/:base64Config/configure", (req, res) =>
@@ -1376,6 +1396,7 @@ async function manifestResponse(req, res) {
         res.status(500).json({ error: "Errore Token" });
     }
 }
+app.get("/manifest.json", attachDefaultConfig, manifestResponse);
 app.get("/c/:shortConfig/manifest.json", attachShortConfig, manifestResponse);
 app.get("/:base64Config/manifest.json", manifestResponse);
 
@@ -1490,6 +1511,9 @@ async function catalogResponse(req, res) {
         res.status(500).json({ metas: [] });
     }
 }
+app.get("/catalog/:type/:id.json", attachDefaultConfig, catalogResponse);
+app.get("/catalog/:type/:id/:extra.json", attachDefaultConfig, catalogResponse);
+app.get("/catalog/:type/:id/:extra", attachDefaultConfig, catalogResponse);
 app.get("/c/:shortConfig/catalog/:type/:id.json", attachShortConfig, catalogResponse);
 app.get("/c/:shortConfig/catalog/:type/:id/:extra.json", attachShortConfig, catalogResponse);
 app.get("/c/:shortConfig/catalog/:type/:id/:extra", attachShortConfig, catalogResponse);
@@ -1503,6 +1527,7 @@ async function metaResponse(req, res) {
     if (!ch) return res.status(404).json({ meta: null });
     res.json({ meta: toMeta(ch, getPublicHost(req), routeKey) });
 }
+app.get("/meta/:type/:id.json", attachDefaultConfig, metaResponse);
 app.get("/c/:shortConfig/meta/:type/:id.json", attachShortConfig, metaResponse);
 app.get("/:base64Config/meta/:type/:id.json", metaResponse);
 
@@ -1555,6 +1580,7 @@ async function configPosterResponse(req, res) {
         await sendPosterSvg(res, ch);
     } catch { res.status(404).send(""); }
 }
+app.get("/poster-config/:id.svg", attachDefaultConfig, configPosterResponse);
 app.get("/c/:shortConfig/poster/:id.svg", attachShortConfig, configPosterResponse);
 app.get("/:base64Config/poster/:id.svg", configPosterResponse);
 
@@ -1955,6 +1981,7 @@ async function proxyManifestResponse(req, res) {
         if (!res.headersSent) res.status(502).type("text/plain").send("#EXTM3U\n");
     }
 }
+app.get("/proxy/live.m3u8", attachDefaultConfig, proxyManifestResponse);
 app.get("/c/:shortConfig/proxy/live.m3u8", attachShortConfig, proxyManifestResponse);
 app.get("/:base64Config/proxy/live.m3u8", proxyManifestResponse);
 
@@ -1983,6 +2010,7 @@ async function proxySegmentResponse(req, res) {
         if (!res.headersSent) res.status(502).end();
     }
 }
+app.get("/proxy/seg", attachDefaultConfig, proxySegmentResponse);
 app.get("/c/:shortConfig/proxy/seg", attachShortConfig, proxySegmentResponse);
 app.get("/:base64Config/proxy/seg", proxySegmentResponse);
 
@@ -2000,6 +2028,7 @@ async function streamResponse(req, res) {
         res.status(500).json({ streams: [] });
     }
 }
+app.get("/stream/:type/:id.json", attachDefaultConfig, streamResponse);
 app.get("/c/:shortConfig/stream/:type/:id.json", attachShortConfig, streamResponse);
 app.get("/:base64Config/stream/:type/:id.json", streamResponse);
 

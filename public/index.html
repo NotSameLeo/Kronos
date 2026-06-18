@@ -1693,9 +1693,9 @@
             const token = toBase64Url(JSON.stringify(config));
             if (shouldRemember) {
                 const saved = await rememberPreloadConfig(token, config);
-                if (saved?.token) {
-                    setCurrentManifestFromToken(saved.token);
-                    return saved.token;
+                if (saved?.manifestPath) {
+                    setCurrentManifestFromToken('manifest.json');
+                    return 'manifest.json';
                 }
             }
             setCurrentManifestFromToken(token);
