@@ -104,6 +104,7 @@ const LIVE_EDGE_HOLD_BACK_SECONDS = Math.max(0, Number(process.env.LIVE_EDGE_HOL
 const LIVE_EDGE_MIN_SEGMENTS = Math.max(1, Number(process.env.LIVE_EDGE_MIN_SEGMENTS || 3));
 const LIVE_EDGE_BATCH_SEGMENTS = Math.max(1, Number(process.env.LIVE_EDGE_BATCH_SEGMENTS || 2));
 const LIVE_EDGE_BATCH_MAX_WAIT_MS = Math.max(0, Number(process.env.LIVE_EDGE_BATCH_MAX_WAIT_MS || 35000));
+const LIVE_EDGE_BATCH_MIN_WAIT_MS = Math.max(0, Number(process.env.LIVE_EDGE_BATCH_MIN_WAIT_MS || 20000));
 const SEGMENT_TOKEN_HEALING = String(process.env.SEGMENT_TOKEN_HEALING || "1") !== "0";
 
 const upstreamHttpAgent = new http.Agent({
@@ -1657,7 +1658,7 @@ function rememberEdgeSegmentRequest(configKey, parentPlaylistUrl, sequence) {
     state.edgeWaitFromSeq = sequence;
     state.edgeWaitStartedAt = Date.now();
     state.edgeWaitLogged = false;
-    console.warn(`[HLS EDGE HIT] seq=${sequence} target=${sequence + LIVE_EDGE_BATCH_SEGMENTS}`);
+    console.warn(`[HLS EDGE HIT] seq=${sequence} target=${sequence + LIVE_EDGE_BATCH_SEGMENTS} minWait=${Math.round(LIVE_EDGE_BATCH_MIN_WAIT_MS / 1000)}s`);
 }
 
 function applyLiveEdgeBatch(configKey, parentPlaylistUrl, segments, isEnded) {
@@ -1676,10 +1677,11 @@ function applyLiveEdgeBatch(configKey, parentPlaylistUrl, segments, isEnded) {
     if (Number.isFinite(state.edgeWaitFromSeq)) {
         const advanced = endSeq - state.edgeWaitFromSeq;
         const waited = now - (state.edgeWaitStartedAt || now);
-        if (advanced < LIVE_EDGE_BATCH_SEGMENTS && waited < LIVE_EDGE_BATCH_MAX_WAIT_MS && state.segments?.length) {
+        const minWaitPending = waited < LIVE_EDGE_BATCH_MIN_WAIT_MS;
+        if ((advanced < LIVE_EDGE_BATCH_SEGMENTS || minWaitPending) && waited < LIVE_EDGE_BATCH_MAX_WAIT_MS && state.segments?.length) {
             if (!state.edgeWaitLogged) {
                 state.edgeWaitLogged = true;
-                console.warn(`[HLS EDGE WAIT] from=${state.edgeWaitFromSeq} current=${endSeq} need=${LIVE_EDGE_BATCH_SEGMENTS}`);
+                console.warn(`[HLS EDGE WAIT] from=${state.edgeWaitFromSeq} current=${endSeq} need=${LIVE_EDGE_BATCH_SEGMENTS} minWait=${Math.round(LIVE_EDGE_BATCH_MIN_WAIT_MS / 1000)}s`);
             }
             return state.segments;
         }
@@ -1858,6 +1860,7 @@ app.get("/:base64Config/stats", (req, res) => {
             liveEdgeMinSegments: LIVE_EDGE_MIN_SEGMENTS,
             liveEdgeBatchSegments: LIVE_EDGE_BATCH_SEGMENTS,
             liveEdgeBatchMaxWaitMs: LIVE_EDGE_BATCH_MAX_WAIT_MS,
+            liveEdgeBatchMinWaitMs: LIVE_EDGE_BATCH_MIN_WAIT_MS,
             segmentTokenHealing: SEGMENT_TOKEN_HEALING,
             manifestRetries: HLS_MANIFEST_RETRIES,
             staleManifestTtlMs: HLS_STALE_MANIFEST_TTL_MS,
@@ -1904,7 +1907,7 @@ app.get("/:base64Config/debug", async (req, res) => {
                 ADDON_TYPE, RELEASE_VERSION, PLAYBACK_MODE,
                 HLS_REQUEST_TIMEOUT, SEG_REQUEST_TIMEOUT, PROXY_START_OFFSET_SECONDS,
                 LIVE_EDGE_HOLD_BACK_SECONDS, LIVE_EDGE_MIN_SEGMENTS, LIVE_EDGE_BATCH_SEGMENTS,
-                LIVE_EDGE_BATCH_MAX_WAIT_MS, SEGMENT_TOKEN_HEALING,
+                LIVE_EDGE_BATCH_MAX_WAIT_MS, LIVE_EDGE_BATCH_MIN_WAIT_MS, SEGMENT_TOKEN_HEALING,
                 HLS_MANIFEST_RETRIES, HLS_MANIFEST_RETRY_DELAY_MS, HLS_STALE_MANIFEST_TTL_MS,
                 SEGMENT_UPSTREAM_RETRIES, SEGMENT_UPSTREAM_RETRY_DELAY_MS,
                 UPSTREAM_KEEPALIVE_MAX_SOCKETS, UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS, UPSTREAM_KEEPALIVE_MS,
@@ -1922,7 +1925,7 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`🌐 http://0.0.0.0:${PORT}`);
     console.log(`📦 Node ${process.version}`);
     console.log(`🎬 playback=transparent-relay vpn=off remux=off startOffset=${PROXY_START_OFFSET_SECONDS}s hlsTimeout=${HLS_REQUEST_TIMEOUT / 1000}s segTimeout=${SEG_REQUEST_TIMEOUT / 1000}s`);
-    console.log(`🛡️ live edge holdBack=${LIVE_EDGE_HOLD_BACK_SECONDS}s minSegments=${LIVE_EDGE_MIN_SEGMENTS} edgeCatchupSegments=${LIVE_EDGE_BATCH_SEGMENTS} edgeCatchupMaxWait=${LIVE_EDGE_BATCH_MAX_WAIT_MS / 1000}s tokenHealing=${SEGMENT_TOKEN_HEALING ? 1 : 0}`);
+    console.log(`🛡️ live edge holdBack=${LIVE_EDGE_HOLD_BACK_SECONDS}s minSegments=${LIVE_EDGE_MIN_SEGMENTS} edgeCatchupSegments=${LIVE_EDGE_BATCH_SEGMENTS} edgeCatchupMinWait=${LIVE_EDGE_BATCH_MIN_WAIT_MS / 1000}s edgeCatchupMaxWait=${LIVE_EDGE_BATCH_MAX_WAIT_MS / 1000}s tokenHealing=${SEGMENT_TOKEN_HEALING ? 1 : 0}`);
     console.log(`🔌 upstream keepAlive=1 sockets=${UPSTREAM_KEEPALIVE_MAX_SOCKETS} free=${UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS} ms=${UPSTREAM_KEEPALIVE_MS}`);
     console.log(`📋 playlist retryWindow=${PLAYLIST_RETRY_WINDOW_MS / 1000}s delay=${PLAYLIST_RETRY_DELAY_MS / 1000}s`);
     console.log(`🎞️ hls retries=${HLS_MANIFEST_RETRIES} staleTtl=${HLS_STALE_MANIFEST_TTL_MS / 1000}s segmentRetries=${SEGMENT_UPSTREAM_RETRIES} rangeForward=1`);
