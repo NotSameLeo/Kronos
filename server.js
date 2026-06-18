@@ -102,8 +102,8 @@ const EPG_TIME_ZONE = process.env.EPG_TIME_ZONE || "Europe/Rome";
 const PROXY_START_OFFSET_SECONDS = Math.max(0, Number(process.env.PROXY_START_OFFSET_SECONDS || 18));
 const LIVE_EDGE_HOLD_BACK_SECONDS = Math.max(0, Number(process.env.LIVE_EDGE_HOLD_BACK_SECONDS || 16));
 const LIVE_EDGE_MIN_SEGMENTS = Math.max(1, Number(process.env.LIVE_EDGE_MIN_SEGMENTS || 3));
-const LIVE_EDGE_BATCH_SEGMENTS = Math.max(1, Number(process.env.LIVE_EDGE_BATCH_SEGMENTS || 1));
-const LIVE_EDGE_BATCH_MAX_WAIT_MS = Math.max(0, Number(process.env.LIVE_EDGE_BATCH_MAX_WAIT_MS || 0));
+const LIVE_EDGE_BATCH_SEGMENTS = Math.max(1, Number(process.env.LIVE_EDGE_BATCH_SEGMENTS || 2));
+const LIVE_EDGE_BATCH_MAX_WAIT_MS = Math.max(0, Number(process.env.LIVE_EDGE_BATCH_MAX_WAIT_MS || 35000));
 const SEGMENT_TOKEN_HEALING = String(process.env.SEGMENT_TOKEN_HEALING || "1") !== "0";
 
 const upstreamHttpAgent = new http.Agent({
@@ -1651,6 +1651,11 @@ function applyLiveEdgeBatch(configKey, parentPlaylistUrl, segments, isEnded) {
     const now = Date.now();
     const state = memoryCache.hlsEdgeState[key];
 
+    if (state && endSeq < state.endSeq) {
+        memoryCache.hlsEdgeState[key] = { endSeq, servedAt: now, segments };
+        return segments;
+    }
+
     if (state && endSeq > state.endSeq) {
         const advanced = endSeq - state.endSeq;
         const age = now - state.servedAt;
@@ -1663,6 +1668,27 @@ function applyLiveEdgeBatch(configKey, parentPlaylistUrl, segments, isEnded) {
         memoryCache.hlsEdgeState[key] = { endSeq, servedAt: now, segments };
     }
     return segments;
+}
+
+function rewritePreambleForSegments(preamble, segments, baseUrl, makeSegmentUrl) {
+    const firstSeq = segments[0]?.sequence;
+    let wroteMediaSequence = false;
+    const out = preamble
+        .filter(line => !/^#EXT-X-START\b/i.test(line.trim()))
+        .map(line => {
+            const t = line.trim();
+            if (/^#EXT-X-MEDIA-SEQUENCE:/i.test(t) && Number.isFinite(firstSeq)) {
+                wroteMediaSequence = true;
+                return `#EXT-X-MEDIA-SEQUENCE:${firstSeq}`;
+            }
+            return t.startsWith("#") ? rewriteUriAttributes(line, baseUrl, makeSegmentUrl) : line;
+        });
+
+    if (!wroteMediaSequence && Number.isFinite(firstSeq)) {
+        const insertAt = out[0]?.trim() === "#EXTM3U" ? 1 : 0;
+        out.splice(insertAt, 0, `#EXT-X-MEDIA-SEQUENCE:${firstSeq}`);
+    }
+    return out;
 }
 
 function rewriteMediaManifest(text, baseUrl, host, configKey, parentPlaylistUrl = baseUrl) {
@@ -1679,9 +1705,7 @@ function rewriteMediaManifest(text, baseUrl, host, configKey, parentPlaylistUrl 
     );
 
     const makeSegmentUrl = abs => segmentProxyUrl(host, configKey, abs, parentPlaylistUrl);
-    const out = parsed.preamble
-        .filter(line => !/^#EXT-X-START\b/i.test(line.trim()))
-        .map(line => line.trim().startsWith("#") ? rewriteUriAttributes(line, baseUrl, makeSegmentUrl) : line);
+    const out = rewritePreambleForSegments(parsed.preamble, stableSegments, baseUrl, makeSegmentUrl);
 
     if (!parsed.isEnded && PROXY_START_OFFSET_SECONDS > 0) {
         out.push(`#EXT-X-START:TIME-OFFSET=-${PROXY_START_OFFSET_SECONDS},PRECISE=YES`);
