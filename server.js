@@ -51,10 +51,11 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "4.3.3";
+const RELEASE_VERSION = "4.3.4";
 const ADDON_TYPE = "tv";
 const PLAYBACK_MODE = "transparent-relay";
 const CATALOG_TTL = 30 * 60 * 1000;
+const CATALOG_PAGE_SIZE = Math.max(24, Math.min(300, Number(process.env.CATALOG_PAGE_SIZE || 100)));
 // Periodically re-fetch the preloaded (frontend) playlist so the catalog stays
 // warm even with no requests, and so frontend changes are picked up. 0 disables.
 const CATALOG_REFRESH_INTERVAL_MS = Math.max(0, Number(process.env.CATALOG_REFRESH_INTERVAL_MS || CATALOG_TTL));
@@ -95,6 +96,9 @@ const PLAYLIST_REQUEST_TIMEOUT = Number(process.env.PLAYLIST_REQUEST_TIMEOUT || 
 const PLAYLIST_RETRY_WINDOW_MS = Number(process.env.PLAYLIST_RETRY_WINDOW_MS || 30000);
 const PLAYLIST_RETRY_DELAY_MS = Number(process.env.PLAYLIST_RETRY_DELAY_MS || 2000);
 const EPG_TIME_ZONE = process.env.EPG_TIME_ZONE || "Europe/Rome";
+const LOGO_REQUEST_TIMEOUT = Number(process.env.LOGO_REQUEST_TIMEOUT || 4000);
+const LOGO_FAILURE_TTL_MS = Number(process.env.LOGO_FAILURE_TTL_MS || 60 * 60 * 1000);
+const LOGO_MAX_CACHE_ITEMS = Math.max(50, Number(process.env.LOGO_MAX_CACHE_ITEMS || 500));
 
 // ── Transparent relay configuration ───────────────────────────────────────────
 // No VPN and no ffmpeg re-mux: Kronos keeps the stream HLS-native, but exposes a
@@ -144,6 +148,7 @@ const memoryCache = {
     epgSubscribers: {},   // epgUrl -> Set<configKey>
     configByKey: {},      // configKey -> decoded config
     logoData: {},         // logoUrl -> data: URI
+    logoFailures: {},     // logoUrl -> timestamp of last failed fetch
     hlsManifestData: {},  // hash(configKey|url) -> { text, updatedAt }
     hlsManifestInflight: {},
     hlsEdgeState: {},     // hash(configKey|playlist) -> last exposed stable edge
@@ -1018,7 +1023,11 @@ function getDisplayGroupName(config, group) {
     return custom?.name || cleanGroupName(group);
 }
 function sortGroupsForManifest(config, groups) {
-    const order = new Map(getCategoryCustomizations(config).map((item, index) => [normalizeGroupName(item.name), index]));
+    const order = new Map();
+    getCategoryCustomizations(config).forEach((item, index) => {
+        order.set(normalizeGroupName(item.id), index);
+        order.set(normalizeGroupName(item.name), index);
+    });
     return groups.slice().sort((a, b) => {
         const ai = order.has(normalizeGroupName(a)) ? order.get(normalizeGroupName(a)) : Number.MAX_SAFE_INTEGER;
         const bi = order.has(normalizeGroupName(b)) ? order.get(normalizeGroupName(b)) : Number.MAX_SAFE_INTEGER;
@@ -1151,9 +1160,11 @@ async function getChannelById(configKey, config, id) {
 async function getLogoDataUri(logoUrl) {
     if (!isHttpUrl(logoUrl)) return "";
     if (memoryCache.logoData[logoUrl]) return memoryCache.logoData[logoUrl];
+    const failedAt = memoryCache.logoFailures[logoUrl] || 0;
+    if (failedAt && Date.now() - failedAt < LOGO_FAILURE_TTL_MS) return "";
     try {
         const r = await axios.get(logoUrl, {
-            responseType: "arraybuffer", timeout: 10000, maxContentLength: 2 * 1024 * 1024,
+            responseType: "arraybuffer", timeout: LOGO_REQUEST_TIMEOUT, maxContentLength: 2 * 1024 * 1024,
             ...upstreamAgentOptions(),
             headers: {
                 "User-Agent": `Kronos/${RELEASE_VERSION}`,
@@ -1162,9 +1173,16 @@ async function getLogoDataUri(logoUrl) {
         });
         const ct = String(r.headers["content-type"] || "image/png").split(";")[0];
         const dataUri = `data:${ct};base64,${Buffer.from(r.data).toString("base64")}`;
+        if (Object.keys(memoryCache.logoData).length >= LOGO_MAX_CACHE_ITEMS) {
+            delete memoryCache.logoData[Object.keys(memoryCache.logoData)[0]];
+        }
         memoryCache.logoData[logoUrl] = dataUri;
+        delete memoryCache.logoFailures[logoUrl];
         return dataUri;
-    } catch { return ""; }
+    } catch {
+        memoryCache.logoFailures[logoUrl] = Date.now();
+        return "";
+    }
 }
 
 function buildStream(channel, host, configKey) {
@@ -1185,24 +1203,28 @@ function buildStream(channel, host, configKey) {
     return { title: `${channel.name} - sorgente web`, name: "TV", externalUrl: channel.url };
 }
 
-function toMeta(channel, host, configKey = "") {
+function toMeta(channel, host, configKey = "", options = {}) {
     const fallbackLogo = `${host}/logo.svg`;
     const poster = configKey
         ? `${host}/${configKey}/poster/${channel.id}.svg?v=${encodeURIComponent(RELEASE_VERSION)}`
         : (channel.logo || fallbackLogo);
     const logo = channel.logo || poster || fallbackLogo;
-    const stream = configKey ? buildStream(channel, host, configKey) : null;
-    return {
+    const includeVideos = options.includeVideos !== false;
+    const stream = includeVideos && configKey ? buildStream(channel, host, configKey) : null;
+    const meta = {
         id: channel.id, type: ADDON_TYPE, name: channel.name,
         poster, logo, description: channel.description, posterShape: "square", background: poster,
         genres: channel.group ? [channel.group] : undefined,
-        behaviorHints: { defaultVideoId: channel.id, hasScheduledVideos: false },
-        videos: [{
+        behaviorHints: { defaultVideoId: channel.id, hasScheduledVideos: false }
+    };
+    if (includeVideos) {
+        meta.videos = [{
             id: channel.id, title: channel.name, released: new Date(0).toISOString(),
             thumbnail: poster, overview: channel.description, available: true,
             streams: stream ? [stream] : undefined
-        }]
-    };
+        }];
+    }
+    return meta;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1253,7 +1275,7 @@ app.get("/:base64Config/manifest.json", async (req, res) => {
             const catalogChannels = channels.filter(c => c.sourceName === list.name);
             const groups = sortGroupsForManifest(config, [...new Set(catalogChannels.map(c => c.group))]
                 .filter(g => g && g.trim()));
-            const extra = [{ name: "search", isRequired: false }];
+            const extra = [{ name: "search", isRequired: false }, { name: "skip", isRequired: false }];
             if (groups.length > 0) extra.push({ name: "genre", options: groups, isRequired: false });
             return { id: toCatalogId(list.name), type: ADDON_TYPE, name: list.name, extra };
         });
@@ -1334,6 +1356,7 @@ async function catalogResponse(req, res) {
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
     res.setHeader("Content-Type", "application/json; charset=utf-8");
     try {
+        const startedAt = Date.now();
         const configKey = req.params.base64Config;
         const config = decodeConfig(configKey);
         const params = {
@@ -1351,7 +1374,16 @@ async function catalogResponse(req, res) {
             const matchSearch = matchesChannelSearch(c, search);
             return matchSrc && matchGrp && matchSearch;
         }));
-        res.json({ metas: filtered.map(c => toMeta(c, host, configKey)) });
+        const skip = Math.max(0, Number.parseInt(params.skip, 10) || 0);
+        const page = filtered.slice(skip, skip + CATALOG_PAGE_SIZE);
+        const elapsed = Date.now() - startedAt;
+        if (elapsed > 100 || filtered.length > CATALOG_PAGE_SIZE) {
+            console.log(`[CATALOG SERVE] id=${req.params.id} total=${filtered.length} skip=${skip} page=${page.length} ms=${elapsed}`);
+        }
+        res.setHeader("X-Kronos-Total", String(filtered.length));
+        res.setHeader("X-Kronos-Skip", String(skip));
+        res.setHeader("X-Kronos-Limit", String(CATALOG_PAGE_SIZE));
+        res.json({ metas: page.map(c => toMeta(c, host, configKey, { includeVideos: false })) });
     } catch (err) {
         console.error("[CATALOG ERROR]", err.message);
         res.status(500).json({ metas: [] });
