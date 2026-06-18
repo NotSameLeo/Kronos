@@ -51,7 +51,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "4.3.4";
+const RELEASE_VERSION = "4.3.5";
 const ADDON_TYPE = "tv";
 const PLAYBACK_MODE = "transparent-relay";
 const CATALOG_TTL = 30 * 60 * 1000;
@@ -282,6 +282,7 @@ function getEffectiveEpgUrl(config, lists = []) {
 }
 
 function hashKey(value) { return crypto.createHash("sha1").update(String(value)).digest("hex").slice(0, 20); }
+function manifestAddonId(configKey) { return `org.stremio.kronos.channel.${hashKey(configKey)}`; }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 function isHttpUrl(v) { return /^https?:\/\//i.test(String(v || "")); }
@@ -1205,18 +1206,25 @@ function buildStream(channel, host, configKey) {
 
 function toMeta(channel, host, configKey = "", options = {}) {
     const fallbackLogo = `${host}/logo.svg`;
-    const poster = configKey
-        ? `${host}/${configKey}/poster/${channel.id}.svg?v=${encodeURIComponent(RELEASE_VERSION)}`
-        : (channel.logo || fallbackLogo);
+    const poster = options.shortPoster
+        ? `${host}/poster/${channel.id}.svg?v=${encodeURIComponent(RELEASE_VERSION)}`
+        : (configKey
+            ? `${host}/${configKey}/poster/${channel.id}.svg?v=${encodeURIComponent(RELEASE_VERSION)}`
+            : (channel.logo || fallbackLogo));
     const logo = channel.logo || poster || fallbackLogo;
     const includeVideos = options.includeVideos !== false;
     const stream = includeVideos && configKey ? buildStream(channel, host, configKey) : null;
     const meta = {
         id: channel.id, type: ADDON_TYPE, name: channel.name,
-        poster, logo, description: channel.description, posterShape: "square", background: poster,
-        genres: channel.group ? [channel.group] : undefined,
-        behaviorHints: { defaultVideoId: channel.id, hasScheduledVideos: false }
+        poster, posterShape: "square"
     };
+    if (channel.group) meta.genres = [channel.group];
+    if (!options.catalogLite) {
+        meta.logo = logo;
+        meta.description = channel.description;
+        meta.background = poster;
+        meta.behaviorHints = { defaultVideoId: channel.id, hasScheduledVideos: false };
+    }
     if (includeVideos) {
         meta.videos = [{
             id: channel.id, title: channel.name, released: new Date(0).toISOString(),
@@ -1281,7 +1289,7 @@ app.get("/:base64Config/manifest.json", async (req, res) => {
         });
 
         res.json({
-            id: "org.stremio.kronos.channel",
+            id: manifestAddonId(configKey),
             version: RELEASE_VERSION,
             name: "Canali TV", description: "Canali TV",
             logo: `${host}/logo.svg`,
@@ -1383,7 +1391,11 @@ async function catalogResponse(req, res) {
         res.setHeader("X-Kronos-Total", String(filtered.length));
         res.setHeader("X-Kronos-Skip", String(skip));
         res.setHeader("X-Kronos-Limit", String(CATALOG_PAGE_SIZE));
-        res.json({ metas: page.map(c => toMeta(c, host, configKey, { includeVideos: false })) });
+        res.json({ metas: page.map(c => toMeta(c, host, configKey, {
+            includeVideos: false,
+            catalogLite: true,
+            shortPoster: true
+        })) });
     } catch (err) {
         console.error("[CATALOG ERROR]", err.message);
         res.status(500).json({ metas: [] });
@@ -1401,32 +1413,54 @@ app.get("/:base64Config/meta/:type/:id.json", async (req, res) => {
     res.json({ meta: toMeta(ch, getPublicHost(req), configKey) });
 });
 
+function findCachedChannelById(id) {
+    for (const index of Object.values(memoryCache.channelIndex)) {
+        if (index?.[id]) return index[id];
+    }
+    for (const channels of Object.values(memoryCache.channelItems)) {
+        const ch = Array.isArray(channels) ? channels.find(c => c.id === id) : null;
+        if (ch) return ch;
+    }
+    return null;
+}
+
+async function sendPosterSvg(res, ch) {
+    const logoUri = await getLogoDataUri(ch?.logo || "");
+    const name = stripInitialCountryPrefix(ch?.name || "Kronos");
+    const initials = name.replace(/\([^)]*\)/g, "").split(/\s+/).filter(Boolean).slice(0, 2)
+        .map(p => p[0]).join("").toUpperCase() || "TV";
+    const logoMarkup = logoUri
+        ? `<image href="${escapeXml(logoUri)}" x="58" y="74" width="396" height="286" preserveAspectRatio="xMidYMid meet"/>`
+        : `<text x="256" y="274" text-anchor="middle" fill="#111827" font-family="Arial, sans-serif" font-size="86" font-weight="800">${escapeXml(initials)}</text>`;
+    res.setHeader("Content-Type", "image/svg+xml");
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    res.send(`
+        <svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+            <defs><linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+                <stop offset="0" stop-color="#111827"/><stop offset="1" stop-color="#050814"/>
+            </linearGradient></defs>
+            <rect width="512" height="512" rx="56" fill="url(#bg)"/>
+            <rect x="28" y="28" width="456" height="456" rx="44" fill="rgba(255,255,255,0.05)" stroke="rgba(255,255,255,0.16)"/>
+            <rect x="46" y="58" width="420" height="318" rx="32" fill="#d9dee7"/>
+            ${logoMarkup}
+            <text x="256" y="424" text-anchor="middle" fill="#f5f7fb" font-family="Arial, sans-serif" font-size="30" font-weight="700">${escapeXml(name.slice(0, 34))}</text>
+        </svg>
+    `);
+}
+
+app.get("/poster/:id.svg", async (req, res) => {
+    try {
+        const ch = findCachedChannelById(req.params.id);
+        await sendPosterSvg(res, ch);
+    } catch { res.status(404).send(""); }
+});
+
 app.get("/:base64Config/poster/:id.svg", async (req, res) => {
     try {
         const configKey = req.params.base64Config;
         const config = decodeConfig(configKey);
         const ch = await getChannelById(configKey, config, req.params.id);
-        const logoUri = await getLogoDataUri(ch?.logo || "");
-        const name = stripInitialCountryPrefix(ch?.name || "Kronos");
-        const initials = name.replace(/\([^)]*\)/g, "").split(/\s+/).filter(Boolean).slice(0, 2)
-            .map(p => p[0]).join("").toUpperCase() || "TV";
-        const logoMarkup = logoUri
-            ? `<image href="${escapeXml(logoUri)}" x="58" y="74" width="396" height="286" preserveAspectRatio="xMidYMid meet"/>`
-            : `<text x="256" y="274" text-anchor="middle" fill="#111827" font-family="Arial, sans-serif" font-size="86" font-weight="800">${escapeXml(initials)}</text>`;
-        res.setHeader("Content-Type", "image/svg+xml");
-        res.setHeader("Cache-Control", "public, max-age=3600");
-        res.send(`
-            <svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
-                <defs><linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
-                    <stop offset="0" stop-color="#111827"/><stop offset="1" stop-color="#050814"/>
-                </linearGradient></defs>
-                <rect width="512" height="512" rx="56" fill="url(#bg)"/>
-                <rect x="28" y="28" width="456" height="456" rx="44" fill="rgba(255,255,255,0.05)" stroke="rgba(255,255,255,0.16)"/>
-                <rect x="46" y="58" width="420" height="318" rx="32" fill="#d9dee7"/>
-                ${logoMarkup}
-                <text x="256" y="424" text-anchor="middle" fill="#f5f7fb" font-family="Arial, sans-serif" font-size="30" font-weight="700">${escapeXml(name.slice(0, 34))}</text>
-            </svg>
-        `);
+        await sendPosterSvg(res, ch);
     } catch { res.status(404).send(""); }
 });
 
