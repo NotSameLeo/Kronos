@@ -1681,7 +1681,11 @@
         }
 
         function setCurrentManifestFromToken(token) {
-            currentManifestUrl = `${window.location.origin}/${token}/manifest.json`;
+            const raw = String(token || '').replace(/^\/+/, '');
+            const path = raw.endsWith('/manifest.json') || raw === 'manifest.json'
+                ? raw
+                : `${raw}/manifest.json`;
+            currentManifestUrl = `${window.location.origin}/${path}`;
             stremioLink.href = getStremioInstallUrl(currentManifestUrl);
             stremioLink.textContent = 'Installa in Stremio';
             manifestText.textContent = currentManifestUrl;
