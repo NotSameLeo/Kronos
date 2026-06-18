@@ -46,12 +46,22 @@ app.use((req, res, next) => {
 });
 app.use(express.json({ limit: "1mb" }));
 app.use(express.static(path.join(__dirname, "public")));
+app.use((req, res, next) => {
+    const startedAt = Date.now();
+    res.on("finish", () => {
+        const ua = String(req.get("user-agent") || "");
+        const interesting = /stremio/i.test(ua) || /(?:manifest\.json|\/catalog\/|\/configure$|\/api\/preload-config)/i.test(req.path);
+        if (!interesting) return;
+        console.log(`[HTTP] ${req.method} ${req.path} status=${res.statusCode} ms=${Date.now() - startedAt} ua=${ua.slice(0, 120) || "-"}`);
+    });
+    next();
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "4.3.8";
+const RELEASE_VERSION = "4.3.9";
 const ADDON_TYPE = "tv";
 const PLAYBACK_MODE = "transparent-relay";
 const CATALOG_TTL = 30 * 60 * 1000;
@@ -219,7 +229,7 @@ function getShortConfig(short) {
     const entry = readShortConfigStore()[id];
     if (!entry?.configKey) throw new Error("Short configuration not found");
     const config = entry.config && typeof entry.config === "object" ? entry.config : decodeConfig(entry.configKey);
-    return { configKey: entry.configKey, config, routeKey: `c/${id}` };
+    return { configKey: entry.configKey, config, routeKey: id };
 }
 
 function attachShortConfig(req, res, next) {
@@ -1356,6 +1366,8 @@ app.get("/health", (req, res) => {
 
 app.get("/configure", (req, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
 app.get("/manifest.json/configure", (req, res) => res.redirect("/"));
+app.get("/:shortConfig([a-f0-9]{8,20})/configure", (req, res) =>
+    res.redirect(`/?short=${encodeURIComponent(req.params.shortConfig)}`));
 app.get("/c/:shortConfig/configure", (req, res) =>
     res.redirect(`/?short=${encodeURIComponent(req.params.shortConfig)}`));
 app.get("/:base64Config/configure", (req, res) =>
@@ -1397,6 +1409,7 @@ async function manifestResponse(req, res) {
     }
 }
 app.get("/manifest.json", attachDefaultConfig, manifestResponse);
+app.get("/:shortConfig([a-f0-9]{8,20})/manifest.json", attachShortConfig, manifestResponse);
 app.get("/c/:shortConfig/manifest.json", attachShortConfig, manifestResponse);
 app.get("/:base64Config/manifest.json", manifestResponse);
 
@@ -1417,8 +1430,9 @@ app.post("/api/preload-config", async (req, res) => {
             ok: true,
             saved,
             short,
-            token: `c/${short}`,
-            manifestPath: `/c/${short}/manifest.json`
+            token: short,
+            manifestPath: `/${short}/manifest.json`,
+            configurePath: `/${short}/configure`
         });
     } catch (err) {
         res.status(400).json({ ok: false, error: "Configurazione non valida" });
@@ -1514,6 +1528,9 @@ async function catalogResponse(req, res) {
 app.get("/catalog/:type/:id.json", attachDefaultConfig, catalogResponse);
 app.get("/catalog/:type/:id/:extra.json", attachDefaultConfig, catalogResponse);
 app.get("/catalog/:type/:id/:extra", attachDefaultConfig, catalogResponse);
+app.get("/:shortConfig([a-f0-9]{8,20})/catalog/:type/:id.json", attachShortConfig, catalogResponse);
+app.get("/:shortConfig([a-f0-9]{8,20})/catalog/:type/:id/:extra.json", attachShortConfig, catalogResponse);
+app.get("/:shortConfig([a-f0-9]{8,20})/catalog/:type/:id/:extra", attachShortConfig, catalogResponse);
 app.get("/c/:shortConfig/catalog/:type/:id.json", attachShortConfig, catalogResponse);
 app.get("/c/:shortConfig/catalog/:type/:id/:extra.json", attachShortConfig, catalogResponse);
 app.get("/c/:shortConfig/catalog/:type/:id/:extra", attachShortConfig, catalogResponse);
@@ -1528,6 +1545,7 @@ async function metaResponse(req, res) {
     res.json({ meta: toMeta(ch, getPublicHost(req), routeKey) });
 }
 app.get("/meta/:type/:id.json", attachDefaultConfig, metaResponse);
+app.get("/:shortConfig([a-f0-9]{8,20})/meta/:type/:id.json", attachShortConfig, metaResponse);
 app.get("/c/:shortConfig/meta/:type/:id.json", attachShortConfig, metaResponse);
 app.get("/:base64Config/meta/:type/:id.json", metaResponse);
 
@@ -1581,6 +1599,7 @@ async function configPosterResponse(req, res) {
     } catch { res.status(404).send(""); }
 }
 app.get("/poster-config/:id.svg", attachDefaultConfig, configPosterResponse);
+app.get("/:shortConfig([a-f0-9]{8,20})/poster/:id.svg", attachShortConfig, configPosterResponse);
 app.get("/c/:shortConfig/poster/:id.svg", attachShortConfig, configPosterResponse);
 app.get("/:base64Config/poster/:id.svg", configPosterResponse);
 
@@ -1982,6 +2001,7 @@ async function proxyManifestResponse(req, res) {
     }
 }
 app.get("/proxy/live.m3u8", attachDefaultConfig, proxyManifestResponse);
+app.get("/:shortConfig([a-f0-9]{8,20})/proxy/live.m3u8", attachShortConfig, proxyManifestResponse);
 app.get("/c/:shortConfig/proxy/live.m3u8", attachShortConfig, proxyManifestResponse);
 app.get("/:base64Config/proxy/live.m3u8", proxyManifestResponse);
 
@@ -2011,6 +2031,7 @@ async function proxySegmentResponse(req, res) {
     }
 }
 app.get("/proxy/seg", attachDefaultConfig, proxySegmentResponse);
+app.get("/:shortConfig([a-f0-9]{8,20})/proxy/seg", attachShortConfig, proxySegmentResponse);
 app.get("/c/:shortConfig/proxy/seg", attachShortConfig, proxySegmentResponse);
 app.get("/:base64Config/proxy/seg", proxySegmentResponse);
 
@@ -2029,6 +2050,7 @@ async function streamResponse(req, res) {
     }
 }
 app.get("/stream/:type/:id.json", attachDefaultConfig, streamResponse);
+app.get("/:shortConfig([a-f0-9]{8,20})/stream/:type/:id.json", attachShortConfig, streamResponse);
 app.get("/c/:shortConfig/stream/:type/:id.json", attachShortConfig, streamResponse);
 app.get("/:base64Config/stream/:type/:id.json", streamResponse);
 
