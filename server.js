@@ -240,7 +240,7 @@ function getRequestConfig(req) {
     return {
         configKey,
         config: req.kronosConfig || decodeConfig(configKey),
-        routeKey: req.kronosRouteKey || configKey
+        routeKey: req.kronosRouteKey === undefined ? configKey : req.kronosRouteKey
     };
 }
 
