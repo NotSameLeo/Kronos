@@ -102,8 +102,8 @@ const EPG_TIME_ZONE = process.env.EPG_TIME_ZONE || "Europe/Rome";
 const PROXY_START_OFFSET_SECONDS = Math.max(0, Number(process.env.PROXY_START_OFFSET_SECONDS || 18));
 const LIVE_EDGE_HOLD_BACK_SECONDS = Math.max(0, Number(process.env.LIVE_EDGE_HOLD_BACK_SECONDS || 16));
 const LIVE_EDGE_MIN_SEGMENTS = Math.max(1, Number(process.env.LIVE_EDGE_MIN_SEGMENTS || 3));
-const LIVE_EDGE_BATCH_SEGMENTS = Math.max(1, Number(process.env.LIVE_EDGE_BATCH_SEGMENTS || 3));
-const LIVE_EDGE_BATCH_MAX_WAIT_MS = Math.max(0, Number(process.env.LIVE_EDGE_BATCH_MAX_WAIT_MS || 45000));
+const LIVE_EDGE_BATCH_SEGMENTS = Math.max(1, Number(process.env.LIVE_EDGE_BATCH_SEGMENTS || 1));
+const LIVE_EDGE_BATCH_MAX_WAIT_MS = Math.max(0, Number(process.env.LIVE_EDGE_BATCH_MAX_WAIT_MS || 0));
 const SEGMENT_TOKEN_HEALING = String(process.env.SEGMENT_TOKEN_HEALING || "1") !== "0";
 
 const upstreamHttpAgent = new http.Agent({
