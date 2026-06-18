@@ -104,7 +104,6 @@ const LIVE_EDGE_HOLD_BACK_SECONDS = Math.max(0, Number(process.env.LIVE_EDGE_HOL
 const LIVE_EDGE_MIN_SEGMENTS = Math.max(1, Number(process.env.LIVE_EDGE_MIN_SEGMENTS || 3));
 const LIVE_EDGE_BATCH_SEGMENTS = Math.max(1, Number(process.env.LIVE_EDGE_BATCH_SEGMENTS || 2));
 const LIVE_EDGE_BATCH_MAX_WAIT_MS = Math.max(0, Number(process.env.LIVE_EDGE_BATCH_MAX_WAIT_MS || 35000));
-const LIVE_EDGE_BATCH_COOLDOWN_MS = Math.max(0, Number(process.env.LIVE_EDGE_BATCH_COOLDOWN_MS || 120000));
 const SEGMENT_TOKEN_HEALING = String(process.env.SEGMENT_TOKEN_HEALING || "1") !== "0";
 
 const upstreamHttpAgent = new http.Agent({
@@ -1554,12 +1553,13 @@ async function fetchSegmentWithHealing(configKey, upstream, headers, req) {
     }
 }
 
-function segmentProxyUrl(host, configKey, abs, parentPlaylistUrl = "") {
+function segmentProxyUrl(host, configKey, abs, parentPlaylistUrl = "", sequence = null) {
     const params = new URLSearchParams({ u: encodeProxyUrl(abs) });
     if (SEGMENT_TOKEN_HEALING && parentPlaylistUrl && isHttpUrl(parentPlaylistUrl)) {
         params.set("p", encodeProxyUrl(parentPlaylistUrl));
         params.set("s", segmentIdentity(abs));
     }
+    if (Number.isFinite(sequence)) params.set("q", String(sequence));
     return `${host}/${configKey}/proxy/seg?${params.toString()}`;
 }
 
@@ -1644,43 +1644,49 @@ function applyLiveEdgeHoldBack(segments, targetDuration, isEnded) {
     return segments.slice(0, keep);
 }
 
+function edgeStateKey(configKey, parentPlaylistUrl) {
+    return hlsManifestCacheKey(configKey, `${parentPlaylistUrl}|edge`);
+}
+
+function rememberEdgeSegmentRequest(configKey, parentPlaylistUrl, sequence) {
+    if (!Number.isFinite(sequence) || !isHttpUrl(parentPlaylistUrl)) return;
+    const key = edgeStateKey(configKey, parentPlaylistUrl);
+    const state = memoryCache.hlsEdgeState[key];
+    if (!state || !Number.isFinite(state.endSeq) || sequence < state.endSeq) return;
+    if (state.edgeWaitFromSeq === sequence) return;
+    state.edgeWaitFromSeq = sequence;
+    state.edgeWaitStartedAt = Date.now();
+    state.edgeWaitLogged = false;
+    console.warn(`[HLS EDGE HIT] seq=${sequence} target=${sequence + LIVE_EDGE_BATCH_SEGMENTS}`);
+}
+
 function applyLiveEdgeBatch(configKey, parentPlaylistUrl, segments, isEnded) {
     if (isEnded || LIVE_EDGE_BATCH_SEGMENTS <= 1 || LIVE_EDGE_BATCH_MAX_WAIT_MS <= 0 || !segments.length) return segments;
-    const key = hlsManifestCacheKey(configKey, `${parentPlaylistUrl}|edge`);
+    const key = edgeStateKey(configKey, parentPlaylistUrl);
     const endSeq = segments[segments.length - 1]?.sequence;
     if (!Number.isFinite(endSeq)) return segments;
     const now = Date.now();
     const state = memoryCache.hlsEdgeState[key];
 
-    if (state?.cooldownUntil && now < state.cooldownUntil) {
-        if (endSeq >= state.endSeq) {
-            memoryCache.hlsEdgeState[key] = { ...state, endSeq, servedAt: now, segments };
-        }
-        return segments;
-    }
-
-    if (state && endSeq < state.endSeq) {
+    if (!state || endSeq < state.endSeq) {
         memoryCache.hlsEdgeState[key] = { endSeq, servedAt: now, segments };
         return segments;
     }
 
-    if (state && endSeq > state.endSeq) {
-        const advanced = endSeq - state.endSeq;
-        const age = now - state.servedAt;
-        if (advanced < LIVE_EDGE_BATCH_SEGMENTS && age < LIVE_EDGE_BATCH_MAX_WAIT_MS && state.segments?.length) {
+    if (Number.isFinite(state.edgeWaitFromSeq)) {
+        const advanced = endSeq - state.edgeWaitFromSeq;
+        const waited = now - (state.edgeWaitStartedAt || now);
+        if (advanced < LIVE_EDGE_BATCH_SEGMENTS && waited < LIVE_EDGE_BATCH_MAX_WAIT_MS && state.segments?.length) {
+            if (!state.edgeWaitLogged) {
+                state.edgeWaitLogged = true;
+                console.warn(`[HLS EDGE WAIT] from=${state.edgeWaitFromSeq} current=${endSeq} need=${LIVE_EDGE_BATCH_SEGMENTS}`);
+            }
             return state.segments;
         }
+        console.warn(`[HLS EDGE RELEASE] from=${state.edgeWaitFromSeq} current=${endSeq} advanced=${advanced} waited=${Math.round(waited / 1000)}s`);
     }
 
-    if (!state || endSeq >= state.endSeq || now - state.servedAt >= LIVE_EDGE_BATCH_MAX_WAIT_MS) {
-        const advanced = state ? Math.max(0, endSeq - state.endSeq) : 0;
-        memoryCache.hlsEdgeState[key] = {
-            endSeq,
-            servedAt: now,
-            segments,
-            cooldownUntil: advanced >= LIVE_EDGE_BATCH_SEGMENTS ? now + LIVE_EDGE_BATCH_COOLDOWN_MS : 0
-        };
-    }
+    memoryCache.hlsEdgeState[key] = { endSeq, servedAt: now, segments };
     return segments;
 }
 
@@ -1732,7 +1738,7 @@ function rewriteMediaManifest(text, baseUrl, host, configKey, parentPlaylistUrl 
             if (t.startsWith("#")) {
                 out.push(rewriteUriAttributes(line, baseUrl, makeSegmentUrl));
             } else {
-                out.push(makeSegmentUrl(toAbsoluteUrl(t, baseUrl)));
+                out.push(segmentProxyUrl(host, configKey, toAbsoluteUrl(t, baseUrl), parentPlaylistUrl, segment.sequence));
             }
         }
     }
@@ -1796,6 +1802,9 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
         decodeConfig(configKey);
         const upstream = decodeProxyUrl(req.query.u || "");
         if (!isHttpUrl(upstream)) return res.status(400).end();
+        const parentPlaylistUrl = decodeProxyUrl(req.query.p || "");
+        const sequence = Number(req.query.q);
+        rememberEdgeSegmentRequest(configKey, parentPlaylistUrl, sequence);
         const headers = { ...RELAY_HEADERS };
         if (req.headers.range) headers.Range = req.headers.range;
         const r = await fetchSegmentWithHealing(configKey, upstream, headers, req);
@@ -1849,7 +1858,6 @@ app.get("/:base64Config/stats", (req, res) => {
             liveEdgeMinSegments: LIVE_EDGE_MIN_SEGMENTS,
             liveEdgeBatchSegments: LIVE_EDGE_BATCH_SEGMENTS,
             liveEdgeBatchMaxWaitMs: LIVE_EDGE_BATCH_MAX_WAIT_MS,
-            liveEdgeBatchCooldownMs: LIVE_EDGE_BATCH_COOLDOWN_MS,
             segmentTokenHealing: SEGMENT_TOKEN_HEALING,
             manifestRetries: HLS_MANIFEST_RETRIES,
             staleManifestTtlMs: HLS_STALE_MANIFEST_TTL_MS,
@@ -1896,7 +1904,7 @@ app.get("/:base64Config/debug", async (req, res) => {
                 ADDON_TYPE, RELEASE_VERSION, PLAYBACK_MODE,
                 HLS_REQUEST_TIMEOUT, SEG_REQUEST_TIMEOUT, PROXY_START_OFFSET_SECONDS,
                 LIVE_EDGE_HOLD_BACK_SECONDS, LIVE_EDGE_MIN_SEGMENTS, LIVE_EDGE_BATCH_SEGMENTS,
-                LIVE_EDGE_BATCH_MAX_WAIT_MS, LIVE_EDGE_BATCH_COOLDOWN_MS, SEGMENT_TOKEN_HEALING,
+                LIVE_EDGE_BATCH_MAX_WAIT_MS, SEGMENT_TOKEN_HEALING,
                 HLS_MANIFEST_RETRIES, HLS_MANIFEST_RETRY_DELAY_MS, HLS_STALE_MANIFEST_TTL_MS,
                 SEGMENT_UPSTREAM_RETRIES, SEGMENT_UPSTREAM_RETRY_DELAY_MS,
                 UPSTREAM_KEEPALIVE_MAX_SOCKETS, UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS, UPSTREAM_KEEPALIVE_MS,
@@ -1914,7 +1922,7 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`🌐 http://0.0.0.0:${PORT}`);
     console.log(`📦 Node ${process.version}`);
     console.log(`🎬 playback=transparent-relay vpn=off remux=off startOffset=${PROXY_START_OFFSET_SECONDS}s hlsTimeout=${HLS_REQUEST_TIMEOUT / 1000}s segTimeout=${SEG_REQUEST_TIMEOUT / 1000}s`);
-    console.log(`🛡️ live edge holdBack=${LIVE_EDGE_HOLD_BACK_SECONDS}s minSegments=${LIVE_EDGE_MIN_SEGMENTS} catchupSegments=${LIVE_EDGE_BATCH_SEGMENTS} catchupMaxWait=${LIVE_EDGE_BATCH_MAX_WAIT_MS / 1000}s rollingCooldown=${LIVE_EDGE_BATCH_COOLDOWN_MS / 1000}s tokenHealing=${SEGMENT_TOKEN_HEALING ? 1 : 0}`);
+    console.log(`🛡️ live edge holdBack=${LIVE_EDGE_HOLD_BACK_SECONDS}s minSegments=${LIVE_EDGE_MIN_SEGMENTS} edgeCatchupSegments=${LIVE_EDGE_BATCH_SEGMENTS} edgeCatchupMaxWait=${LIVE_EDGE_BATCH_MAX_WAIT_MS / 1000}s tokenHealing=${SEGMENT_TOKEN_HEALING ? 1 : 0}`);
     console.log(`🔌 upstream keepAlive=1 sockets=${UPSTREAM_KEEPALIVE_MAX_SOCKETS} free=${UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS} ms=${UPSTREAM_KEEPALIVE_MS}`);
     console.log(`📋 playlist retryWindow=${PLAYLIST_RETRY_WINDOW_MS / 1000}s delay=${PLAYLIST_RETRY_DELAY_MS / 1000}s`);
     console.log(`🎞️ hls retries=${HLS_MANIFEST_RETRIES} staleTtl=${HLS_STALE_MANIFEST_TTL_MS / 1000}s segmentRetries=${SEGMENT_UPSTREAM_RETRIES} rangeForward=1`);
