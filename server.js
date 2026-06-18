@@ -1492,7 +1492,7 @@ async function getRewrittenManifest(configKey, upstream, host) {
     const promise = (async () => {
         try {
             const fetched = await fetchUpstreamManifest(upstream);
-            const text = rewriteManifest(fetched.data, fetched.finalUrl, host, configKey);
+            const text = rewriteManifest(fetched.data, fetched.finalUrl, host, configKey, upstream);
             memoryCache.hlsManifestData[key] = { text, updatedAt: Date.now(), upstream };
             return { text, stale: false };
         } catch (err) {
@@ -1665,20 +1665,20 @@ function applyLiveEdgeBatch(configKey, parentPlaylistUrl, segments, isEnded) {
     return segments;
 }
 
-function rewriteMediaManifest(text, baseUrl, host, configKey) {
+function rewriteMediaManifest(text, baseUrl, host, configKey, parentPlaylistUrl = baseUrl) {
     const parsed = parseMediaPlaylist(text);
     for (const segment of parsed.segments) {
-        if (segment.uri) rememberSegmentUrl(configKey, baseUrl, toAbsoluteUrl(segment.uri, baseUrl));
+        if (segment.uri) rememberSegmentUrl(configKey, parentPlaylistUrl, toAbsoluteUrl(segment.uri, baseUrl));
     }
 
     const stableSegments = applyLiveEdgeBatch(
         configKey,
-        baseUrl,
+        parentPlaylistUrl,
         applyLiveEdgeHoldBack(parsed.segments, parsed.targetDuration, parsed.isEnded),
         parsed.isEnded
     );
 
-    const makeSegmentUrl = abs => segmentProxyUrl(host, configKey, abs, baseUrl);
+    const makeSegmentUrl = abs => segmentProxyUrl(host, configKey, abs, parentPlaylistUrl);
     const out = parsed.preamble
         .filter(line => !/^#EXT-X-START\b/i.test(line.trim()))
         .map(line => line.trim().startsWith("#") ? rewriteUriAttributes(line, baseUrl, makeSegmentUrl) : line);
@@ -1710,10 +1710,10 @@ function rewriteMediaManifest(text, baseUrl, host, configKey) {
 // Rewrite an upstream HLS manifest so every URL points back through our relay.
 // Master variants are kept as manifests; media segments and key URIs go through
 // /proxy/seg with enough parent context to recover if the provider rotates tokens.
-function rewriteManifest(text, baseUrl, host, configKey) {
+function rewriteManifest(text, baseUrl, host, configKey, parentPlaylistUrl = baseUrl) {
     const isMaster = /#EXT-X-STREAM-INF/i.test(text);
     if (!isMaster && /#EXTINF:/i.test(text)) {
-        return rewriteMediaManifest(text, baseUrl, host, configKey);
+        return rewriteMediaManifest(text, baseUrl, host, configKey, parentPlaylistUrl);
     }
 
     const out = [];
@@ -1722,13 +1722,13 @@ function rewriteManifest(text, baseUrl, host, configKey) {
         if (!t) { out.push(line); continue; }
         if (t.startsWith("#")) {
             out.push(/URI=/i.test(t)
-                ? rewriteUriAttributes(line, baseUrl, abs => segmentProxyUrl(host, configKey, abs, baseUrl))
+                ? rewriteUriAttributes(line, baseUrl, abs => segmentProxyUrl(host, configKey, abs, parentPlaylistUrl))
                 : line);
             continue;
         }
         const abs = toAbsoluteUrl(t, baseUrl);
         if (isMaster || isHlsUrl(abs)) { out.push(manifestProxyUrl(host, configKey, abs)); continue; }
-        out.push(segmentProxyUrl(host, configKey, abs, baseUrl));
+        out.push(segmentProxyUrl(host, configKey, abs, parentPlaylistUrl));
     }
     return out.join("\n");
 }
