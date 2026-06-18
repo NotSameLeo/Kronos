@@ -51,7 +51,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "4.3.5";
+const RELEASE_VERSION = "4.3.6";
 const ADDON_TYPE = "tv";
 const PLAYBACK_MODE = "transparent-relay";
 const CATALOG_TTL = 30 * 60 * 1000;
@@ -71,6 +71,9 @@ const EPG_PRELOAD_URLS = parseUrlList(process.env.EPG_PRELOAD_URLS || EPG_PRELOA
 const EPG_STARTUP_WATCH_MS = Number(process.env.EPG_STARTUP_WATCH_MS || 30000);
 const CATALOG_PRELOAD_CONFIGS = parseCatalogPreloadConfigs(process.env.CATALOG_PRELOAD_CONFIGS || process.env.KRONOS_PRELOAD_CONFIGS || "");
 const FRONTEND_PRELOAD_FILE = String(process.env.FRONTEND_PRELOAD_FILE || "").trim();
+const SHORT_CONFIG_FILE = String(process.env.SHORT_CONFIG_FILE || (FRONTEND_PRELOAD_FILE
+    ? path.join(path.dirname(FRONTEND_PRELOAD_FILE), "short-configs.json")
+    : "")).trim();
 // Denylist of upstream playlists (substring match on the URL, e.g. an old host).
 // Blocked playlists are filtered out everywhere — never fetched, never saved as
 // the frontend preload, never shown — so a stale client that still references an
@@ -147,6 +150,7 @@ const memoryCache = {
     epgStatus: {},        // epgUrl -> diagnostics
     epgSubscribers: {},   // epgUrl -> Set<configKey>
     configByKey: {},      // configKey -> decoded config
+    shortConfigs: null,   // short id -> { configKey, config, savedAt }
     logoData: {},         // logoUrl -> data: URI
     logoFailures: {},     // logoUrl -> timestamp of last failed fetch
     hlsManifestData: {},  // hash(configKey|url) -> { text, updatedAt }
@@ -171,6 +175,73 @@ function decodeConfig(configKey) {
 
 function encodeConfig(config) {
     return Buffer.from(JSON.stringify(config), "utf8").toString("base64url");
+}
+
+function readShortConfigStore() {
+    if (!SHORT_CONFIG_FILE) return {};
+    if (memoryCache.shortConfigs) return memoryCache.shortConfigs;
+    try {
+        const parsed = JSON.parse(fs.readFileSync(SHORT_CONFIG_FILE, "utf8"));
+        memoryCache.shortConfigs = parsed && typeof parsed === "object" ? parsed : {};
+    } catch (err) {
+        if (err?.code !== "ENOENT") console.warn(`[SHORT CONFIG READ] ${err.message}`);
+        memoryCache.shortConfigs = {};
+    }
+    return memoryCache.shortConfigs;
+}
+
+function writeShortConfigStore(store) {
+    if (!SHORT_CONFIG_FILE) return false;
+    try {
+        fs.mkdirSync(path.dirname(SHORT_CONFIG_FILE), { recursive: true });
+        const tmp = `${SHORT_CONFIG_FILE}.tmp`;
+        fs.writeFileSync(tmp, JSON.stringify(store, null, 2));
+        fs.renameSync(tmp, SHORT_CONFIG_FILE);
+        memoryCache.shortConfigs = store;
+        return true;
+    } catch (err) {
+        console.warn(`[SHORT CONFIG SAVE] ${err.message}`);
+        return false;
+    }
+}
+
+function saveShortConfig(configKey, config) {
+    const short = hashKey(configKey).slice(0, 12);
+    const store = { ...readShortConfigStore() };
+    store[short] = { configKey, config, savedAt: new Date().toISOString() };
+    writeShortConfigStore(store);
+    return short;
+}
+
+function getShortConfig(short) {
+    const id = String(short || "").trim();
+    if (!/^[a-f0-9]{8,20}$/i.test(id)) throw new Error("Invalid short configuration token");
+    const entry = readShortConfigStore()[id];
+    if (!entry?.configKey) throw new Error("Short configuration not found");
+    const config = entry.config && typeof entry.config === "object" ? entry.config : decodeConfig(entry.configKey);
+    return { configKey: entry.configKey, config, routeKey: `c/${id}` };
+}
+
+function attachShortConfig(req, res, next) {
+    try {
+        const resolved = getShortConfig(req.params.shortConfig);
+        req.params.base64Config = resolved.configKey;
+        req.kronosConfig = resolved.config;
+        req.kronosRouteKey = resolved.routeKey;
+        next();
+    } catch (err) {
+        console.error("[SHORT CONFIG ERROR]", err.message);
+        res.status(404).json({ error: "Configurazione non trovata" });
+    }
+}
+
+function getRequestConfig(req) {
+    const configKey = req.params.base64Config;
+    return {
+        configKey,
+        config: req.kronosConfig || decodeConfig(configKey),
+        routeKey: req.kronosRouteKey || configKey
+    };
 }
 
 function parseCatalogPreloadConfigs(raw) {
@@ -1265,16 +1336,17 @@ app.get("/health", (req, res) => {
 });
 
 app.get("/configure", (req, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
+app.get("/c/:shortConfig/configure", (req, res) =>
+    res.redirect(`/?short=${encodeURIComponent(req.params.shortConfig)}`));
 app.get("/:base64Config/configure", (req, res) =>
     res.redirect(`/?config=${encodeURIComponent(req.params.base64Config)}`));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Manifest
 // ─────────────────────────────────────────────────────────────────────────────
-app.get("/:base64Config/manifest.json", async (req, res) => {
+async function manifestResponse(req, res) {
     try {
-        const configKey = req.params.base64Config;
-        const config = decodeConfig(configKey);
+        const { configKey, config } = getRequestConfig(req);
         saveFrontendPreloadConfig(configKey, config, "manifest");
         const channels = await getChannelsFromCache(configKey, config);
         const host = getPublicHost(req);
@@ -1303,7 +1375,9 @@ app.get("/:base64Config/manifest.json", async (req, res) => {
         console.error("[MANIFEST ERROR]", err.message);
         res.status(500).json({ error: "Errore Token" });
     }
-});
+}
+app.get("/c/:shortConfig/manifest.json", attachShortConfig, manifestResponse);
+app.get("/:base64Config/manifest.json", manifestResponse);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configurator API (used by public/index.html)
@@ -1315,11 +1389,27 @@ app.post("/api/preload-config", async (req, res) => {
         if (!config || typeof config !== "object") throw new Error("Missing config");
         const effectiveKey = configKey || encodeConfig(config);
         decodeConfig(effectiveKey);
+        const short = saveShortConfig(effectiveKey, config);
         const saved = saveFrontendPreloadConfig(effectiveKey, config, "frontend");
         fetchAndProcessChannels(effectiveKey, config).catch(err => console.error("[FRONTEND PRELOAD WARM]", err.message));
-        res.json({ ok: true, saved });
+        res.json({
+            ok: true,
+            saved,
+            short,
+            token: `c/${short}`,
+            manifestPath: `/c/${short}/manifest.json`
+        });
     } catch (err) {
         res.status(400).json({ ok: false, error: "Configurazione non valida" });
+    }
+});
+
+app.get("/api/config/:shortConfig", (req, res) => {
+    try {
+        const resolved = getShortConfig(req.params.shortConfig);
+        res.json({ ok: true, config: resolved.config, token: resolved.routeKey });
+    } catch (err) {
+        res.status(404).json({ ok: false, error: "Configurazione non trovata" });
     }
 });
 
@@ -1365,8 +1455,7 @@ async function catalogResponse(req, res) {
     res.setHeader("Content-Type", "application/json; charset=utf-8");
     try {
         const startedAt = Date.now();
-        const configKey = req.params.base64Config;
-        const config = decodeConfig(configKey);
+        const { configKey, config, routeKey } = getRequestConfig(req);
         const params = {
             ...getExtraParams(req.params.extra),
             ...Object.fromEntries(Object.entries(req.query || {}).map(([k, v]) => [k, Array.isArray(v) ? v[0] : v]))
@@ -1391,7 +1480,7 @@ async function catalogResponse(req, res) {
         res.setHeader("X-Kronos-Total", String(filtered.length));
         res.setHeader("X-Kronos-Skip", String(skip));
         res.setHeader("X-Kronos-Limit", String(CATALOG_PAGE_SIZE));
-        res.json({ metas: page.map(c => toMeta(c, host, configKey, {
+        res.json({ metas: page.map(c => toMeta(c, host, routeKey, {
             includeVideos: false,
             catalogLite: true,
             shortPoster: true
@@ -1401,17 +1490,21 @@ async function catalogResponse(req, res) {
         res.status(500).json({ metas: [] });
     }
 }
+app.get("/c/:shortConfig/catalog/:type/:id.json", attachShortConfig, catalogResponse);
+app.get("/c/:shortConfig/catalog/:type/:id/:extra.json", attachShortConfig, catalogResponse);
+app.get("/c/:shortConfig/catalog/:type/:id/:extra", attachShortConfig, catalogResponse);
 app.get("/:base64Config/catalog/:type/:id.json", catalogResponse);
 app.get("/:base64Config/catalog/:type/:id/:extra.json", catalogResponse);
 app.get("/:base64Config/catalog/:type/:id/:extra", catalogResponse);
 
-app.get("/:base64Config/meta/:type/:id.json", async (req, res) => {
-    const configKey = req.params.base64Config;
-    const config = decodeConfig(configKey);
+async function metaResponse(req, res) {
+    const { configKey, config, routeKey } = getRequestConfig(req);
     const ch = await getChannelById(configKey, config, req.params.id);
     if (!ch) return res.status(404).json({ meta: null });
-    res.json({ meta: toMeta(ch, getPublicHost(req), configKey) });
-});
+    res.json({ meta: toMeta(ch, getPublicHost(req), routeKey) });
+}
+app.get("/c/:shortConfig/meta/:type/:id.json", attachShortConfig, metaResponse);
+app.get("/:base64Config/meta/:type/:id.json", metaResponse);
 
 function findCachedChannelById(id) {
     for (const index of Object.values(memoryCache.channelIndex)) {
@@ -1455,14 +1548,15 @@ app.get("/poster/:id.svg", async (req, res) => {
     } catch { res.status(404).send(""); }
 });
 
-app.get("/:base64Config/poster/:id.svg", async (req, res) => {
+async function configPosterResponse(req, res) {
     try {
-        const configKey = req.params.base64Config;
-        const config = decodeConfig(configKey);
+        const { configKey, config } = getRequestConfig(req);
         const ch = await getChannelById(configKey, config, req.params.id);
         await sendPosterSvg(res, ch);
     } catch { res.status(404).send(""); }
-});
+}
+app.get("/c/:shortConfig/poster/:id.svg", attachShortConfig, configPosterResponse);
+app.get("/:base64Config/poster/:id.svg", configPosterResponse);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Playback — UHF-like direct HLS relay
@@ -1846,10 +1940,9 @@ function rewriteManifest(text, baseUrl, host, configKey, parentPlaylistUrl = bas
 }
 
 // Relay (and rewrite) an HLS manifest.
-app.get("/:base64Config/proxy/live.m3u8", async (req, res) => {
-    const configKey = req.params.base64Config;
+async function proxyManifestResponse(req, res) {
+    const { configKey } = getRequestConfig(req);
     try {
-        decodeConfig(configKey);
         const upstream = decodeProxyUrl(req.query.u || "");
         if (!isHttpUrl(upstream)) return res.status(400).type("text/plain").send("#EXTM3U\n");
         const manifest = await getRewrittenManifest(configKey, upstream, getPublicHost(req));
@@ -1861,13 +1954,14 @@ app.get("/:base64Config/proxy/live.m3u8", async (req, res) => {
         console.error(`[PROXY M3U8] ${err?.message || err}`);
         if (!res.headersSent) res.status(502).type("text/plain").send("#EXTM3U\n");
     }
-});
+}
+app.get("/c/:shortConfig/proxy/live.m3u8", attachShortConfig, proxyManifestResponse);
+app.get("/:base64Config/proxy/live.m3u8", proxyManifestResponse);
 
 // Relay a segment (or any raw stream) byte-for-byte, forwarding Range for seeking.
-app.get("/:base64Config/proxy/seg", async (req, res) => {
+async function proxySegmentResponse(req, res) {
     try {
-        const configKey = req.params.base64Config;
-        decodeConfig(configKey);
+        const { configKey } = getRequestConfig(req);
         const upstream = decodeProxyUrl(req.query.u || "");
         if (!isHttpUrl(upstream)) return res.status(400).end();
         const parentPlaylistUrl = decodeProxyUrl(req.query.p || "");
@@ -1888,23 +1982,26 @@ app.get("/:base64Config/proxy/seg", async (req, res) => {
     } catch (err) {
         if (!res.headersSent) res.status(502).end();
     }
-});
+}
+app.get("/c/:shortConfig/proxy/seg", attachShortConfig, proxySegmentResponse);
+app.get("/:base64Config/proxy/seg", proxySegmentResponse);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Stream + stats + debug
 // ─────────────────────────────────────────────────────────────────────────────
-app.get("/:base64Config/stream/:type/:id.json", async (req, res) => {
+async function streamResponse(req, res) {
     try {
-        const configKey = req.params.base64Config;
-        const config = decodeConfig(configKey);
+        const { configKey, config, routeKey } = getRequestConfig(req);
         const ch = await getChannelById(configKey, config, req.params.id);
         if (!ch) return res.status(404).json({ streams: [] });
-        res.json({ streams: [buildStream(ch, getPublicHost(req), configKey)] });
+        res.json({ streams: [buildStream(ch, getPublicHost(req), routeKey)] });
     } catch (err) {
         console.error("[STREAM ERROR]", err.message);
         res.status(500).json({ streams: [] });
     }
-});
+}
+app.get("/c/:shortConfig/stream/:type/:id.json", attachShortConfig, streamResponse);
+app.get("/:base64Config/stream/:type/:id.json", streamResponse);
 
 app.get("/:base64Config/stats", (req, res) => {
     res.json({

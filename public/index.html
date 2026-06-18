@@ -1632,7 +1632,7 @@
                 chips.appendChild(chip);
             }
             if (ready && currentManifestUrl && resultSection.classList.contains('is-visible')) {
-                setCurrentManifestFromConfig(config, false);
+                previewHint.textContent = 'Premi Genera setup per aggiornare il link manifest.';
             }
         }
 
@@ -1689,22 +1689,31 @@
             resultSection.classList.add('is-visible');
         }
 
-        function setCurrentManifestFromConfig(config, shouldRemember = false) {
+        async function setCurrentManifestFromConfig(config, shouldRemember = false) {
             const token = toBase64Url(JSON.stringify(config));
+            if (shouldRemember) {
+                const saved = await rememberPreloadConfig(token, config);
+                if (saved?.token) {
+                    setCurrentManifestFromToken(saved.token);
+                    return saved.token;
+                }
+            }
             setCurrentManifestFromToken(token);
-            if (shouldRemember) rememberPreloadConfig(token, config);
             return token;
         }
 
         async function rememberPreloadConfig(token, config) {
             try {
-                await fetch('/api/preload-config', {
+                const response = await fetch('/api/preload-config', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ token, config })
                 });
+                if (!response.ok) return null;
+                return await response.json();
             } catch (err) {
                 // Il link resta valido anche se il salvataggio preload fallisce.
+                return null;
             }
         }
 
@@ -1731,7 +1740,22 @@
             updatePreview();
         }
 
-        function loadConfigFromUrl() {
+        async function loadConfigFromUrl() {
+            const short = new URLSearchParams(window.location.search).get('short');
+            if (short) {
+                try {
+                    const response = await fetch(`/api/config/${encodeURIComponent(short)}`);
+                    if (!response.ok) throw new Error('config not found');
+                    const data = await response.json();
+                    applyConfig(data.config, data.token || `c/${short}`);
+                    showToast('Settaggi caricati');
+                    return true;
+                } catch (err) {
+                    showToast('Non ho potuto caricare i settaggi');
+                    return false;
+                }
+            }
+
             const token = new URLSearchParams(window.location.search).get('config');
             if (!token) return false;
 
@@ -1805,7 +1829,7 @@
             const config = await prepareConfigForSubmit();
             if (!config) return;
 
-            setCurrentManifestFromConfig(config, true);
+            await setCurrentManifestFromConfig(config, true);
             resultSection.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
         });
 
@@ -1867,10 +1891,12 @@
             element.addEventListener('change', updatePreview);
         });
 
-        if (!loadConfigFromUrl()) {
-            createPlaylistRow({ n: 'Lista 1', u: '' });
-            updatePreview();
-        }
+        (async function init() {
+            if (!(await loadConfigFromUrl())) {
+                createPlaylistRow({ n: 'Lista 1', u: '' });
+                updatePreview();
+            }
+        })();
     </script>
 </body>
 </html>
