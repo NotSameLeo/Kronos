@@ -61,9 +61,9 @@ app.use((req, res, next) => {
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "4.3.9";
+const RELEASE_VERSION = "4.4.0";
 const ADDON_TYPE = "tv";
-const PLAYBACK_MODE = "transparent-relay";
+const PLAYBACK_MODE = "passive-hls-relay";
 const CATALOG_TTL = 30 * 60 * 1000;
 const CATALOG_PAGE_SIZE = Math.max(24, Math.min(300, Number(process.env.CATALOG_PAGE_SIZE || 100)));
 // Periodically re-fetch the preloaded (frontend) playlist so the catalog stays
@@ -99,7 +99,7 @@ const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 15000);
 const SEG_REQUEST_TIMEOUT = Number(process.env.SEG_REQUEST_TIMEOUT || 45000);
 const HLS_MANIFEST_RETRIES = Math.max(0, Number(process.env.HLS_MANIFEST_RETRIES || 2));
 const HLS_MANIFEST_RETRY_DELAY_MS = Math.max(0, Number(process.env.HLS_MANIFEST_RETRY_DELAY_MS || 700));
-const HLS_STALE_MANIFEST_TTL_MS = Math.max(0, Number(process.env.HLS_STALE_MANIFEST_TTL_MS || 120000));
+const HLS_STALE_MANIFEST_TTL_MS = Math.max(0, Number(process.env.HLS_STALE_MANIFEST_TTL_MS || 0));
 const SEGMENT_UPSTREAM_RETRIES = Math.max(0, Number(process.env.SEGMENT_UPSTREAM_RETRIES || 2));
 const SEGMENT_UPSTREAM_RETRY_DELAY_MS = Math.max(0, Number(process.env.SEGMENT_UPSTREAM_RETRY_DELAY_MS || 500));
 const UPSTREAM_KEEPALIVE_MAX_SOCKETS = Math.max(1, Number(process.env.UPSTREAM_KEEPALIVE_MAX_SOCKETS || 16));
@@ -114,14 +114,28 @@ const LOGO_FAILURE_TTL_MS = Number(process.env.LOGO_FAILURE_TTL_MS || 60 * 60 * 
 const LOGO_MAX_CACHE_ITEMS = Math.max(50, Number(process.env.LOGO_MAX_CACHE_ITEMS || 500));
 
 // ── Transparent relay configuration ───────────────────────────────────────────
-// No VPN and no ffmpeg re-mux: Kronos keeps the stream HLS-native, but exposes a
-// slightly delayed live edge so Stremio does not glue itself to the last segment.
-const PROXY_START_OFFSET_SECONDS = Math.max(0, Number(process.env.PROXY_START_OFFSET_SECONDS || 18));
-const LIVE_EDGE_HOLD_BACK_SECONDS = Math.max(0, Number(process.env.LIVE_EDGE_HOLD_BACK_SECONDS || 16));
+// No VPN and no ffmpeg re-mux: Kronos keeps the stream HLS-native and lets the
+// player own live latency. Edge manipulation stays opt-in for unstable providers.
+const HLS_INJECT_START_OFFSET = String(process.env.HLS_INJECT_START_OFFSET || "0") !== "0";
+const HLS_EDGE_HOLD_BACK = String(process.env.HLS_EDGE_HOLD_BACK || "0") !== "0";
+const HLS_EDGE_BATCHING = String(process.env.HLS_EDGE_BATCHING || "0") !== "0";
+const STREAM_NOT_WEB_READY = String(process.env.STREAM_NOT_WEB_READY || "0") !== "0";
+const PROXY_START_OFFSET_SECONDS = HLS_INJECT_START_OFFSET
+    ? Math.max(0, Number(process.env.PROXY_START_OFFSET_SECONDS || 0))
+    : 0;
+const LIVE_EDGE_HOLD_BACK_SECONDS = HLS_EDGE_HOLD_BACK
+    ? Math.max(0, Number(process.env.LIVE_EDGE_HOLD_BACK_SECONDS || 0))
+    : 0;
 const LIVE_EDGE_MIN_SEGMENTS = Math.max(1, Number(process.env.LIVE_EDGE_MIN_SEGMENTS || 3));
-const LIVE_EDGE_BATCH_SEGMENTS = Math.max(1, Number(process.env.LIVE_EDGE_BATCH_SEGMENTS || 2));
-const LIVE_EDGE_BATCH_MAX_WAIT_MS = Math.max(0, Number(process.env.LIVE_EDGE_BATCH_MAX_WAIT_MS || 35000));
-const LIVE_EDGE_BATCH_MIN_WAIT_MS = Math.max(0, Number(process.env.LIVE_EDGE_BATCH_MIN_WAIT_MS || 20000));
+const LIVE_EDGE_BATCH_SEGMENTS = HLS_EDGE_BATCHING
+    ? Math.max(1, Number(process.env.LIVE_EDGE_BATCH_SEGMENTS || 2))
+    : 1;
+const LIVE_EDGE_BATCH_MAX_WAIT_MS = HLS_EDGE_BATCHING
+    ? Math.max(0, Number(process.env.LIVE_EDGE_BATCH_MAX_WAIT_MS || 35000))
+    : 0;
+const LIVE_EDGE_BATCH_MIN_WAIT_MS = HLS_EDGE_BATCHING
+    ? Math.max(0, Number(process.env.LIVE_EDGE_BATCH_MIN_WAIT_MS || 20000))
+    : 0;
 const SEGMENT_TOKEN_HEALING = String(process.env.SEGMENT_TOKEN_HEALING || "1") !== "0";
 
 const upstreamHttpAgent = new http.Agent({
@@ -166,6 +180,7 @@ const memoryCache = {
     hlsManifestData: {},  // hash(configKey|url) -> { text, updatedAt }
     hlsManifestInflight: {},
     hlsEdgeState: {},     // hash(configKey|playlist) -> last exposed stable edge
+    hlsPlaybackState: {}, // hash(configKey|playlist) -> inferred segment/edge diagnostics
     hlsSegmentMap: {},    // hash(configKey|playlist) -> stable segment id -> latest URL
     isUpdating: {}
 };
@@ -1287,18 +1302,20 @@ async function getLogoDataUri(logoUrl) {
 
 function buildStream(channel, host, configKey) {
     const base = routeBase(host, configKey);
+    const behaviorHints = { bingeGroup: `kronos-${channel.id}` };
+    if (STREAM_NOT_WEB_READY) behaviorHints.notWebReady = true;
     if (isHlsUrl(channel.url)) {
         return {
             title: channel.name, name: "TV",
             url: `${base}/proxy/live.m3u8?u=${encodeProxyUrl(channel.url)}`,
-            behaviorHints: { notWebReady: true, bingeGroup: `kronos-${channel.id}` }
+            behaviorHints
         };
     }
     if (isPlayableHttpUrl(channel.url)) {
         return {
             title: channel.name, name: "TV",
             url: `${base}/proxy/seg?u=${encodeProxyUrl(channel.url)}`,
-            behaviorHints: { notWebReady: true, bingeGroup: `kronos-${channel.id}` }
+            behaviorHints
         };
     }
     return { title: `${channel.name} - sorgente web`, name: "TV", externalUrl: channel.url };
@@ -1613,11 +1630,9 @@ function setPlaylistHeaders(res) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Transparent relay. The playlist is NOT geo-blocked anymore, so Kronos no longer
-// needs a VPN, an ffmpeg re-mux, or a local buffer. It just relays bytes upstream
-// with the right User-Agent and lets Stremio's own player do the HLS work. The
-// only tuning is a small EXT-X-START so playback begins a touch behind the live
-// edge (a stable runway) instead of glued to the edge.
+// Passive relay. Kronos rewrites URLs so headers, retries and token healing still
+// work, but it does not move the live edge unless an opt-in env flag enables it.
+// This keeps KSPlayer/libVLC/MPV close to the upstream IPTV behavior.
 // ─────────────────────────────────────────────────────────────────────────────
 function encodeProxyUrl(url) { return Buffer.from(String(url), "utf8").toString("base64url"); }
 function decodeProxyUrl(enc) { return Buffer.from(String(enc), "base64url").toString("utf8"); }
@@ -1704,7 +1719,7 @@ async function getRewrittenManifest(configKey, upstream, host) {
         } catch (err) {
             const cached = memoryCache.hlsManifestData[key];
             const age = cached ? Date.now() - cached.updatedAt : Infinity;
-            if (cached && age <= HLS_STALE_MANIFEST_TTL_MS) {
+            if (HLS_STALE_MANIFEST_TTL_MS > 0 && cached && age <= HLS_STALE_MANIFEST_TTL_MS) {
                 console.warn(`[PROXY M3U8 STALE] age=${Math.round(age / 1000)}s reason=${err.message}`);
                 return { text: cached.text, stale: true };
             }
@@ -1854,6 +1869,73 @@ function edgeStateKey(configKey, parentPlaylistUrl) {
     return hlsManifestCacheKey(configKey, `${parentPlaylistUrl}|edge`);
 }
 
+function playbackStateKey(configKey, parentPlaylistUrl) {
+    return hlsManifestCacheKey(configKey, `${parentPlaylistUrl}|playback`);
+}
+
+function rememberManifestWindow(configKey, parentPlaylistUrl, segments, targetDuration, isEnded) {
+    if (!isHttpUrl(parentPlaylistUrl) || !segments.length) return;
+    const key = playbackStateKey(configKey, parentPlaylistUrl);
+    const previous = memoryCache.hlsPlaybackState[key] || {};
+    const firstSeq = segments[0]?.sequence;
+    const endSeq = segments[segments.length - 1]?.sequence;
+    memoryCache.hlsPlaybackState[key] = {
+        ...previous,
+        configHash: hashKey(configKey),
+        playlistHash: hashKey(parentPlaylistUrl),
+        firstSeq,
+        endSeq,
+        segmentCount: segments.length,
+        targetDuration,
+        isEnded,
+        manifestUpdatedAt: Date.now()
+    };
+}
+
+function rememberPlaybackSegmentRequest(configKey, parentPlaylistUrl, sequence) {
+    if (!Number.isFinite(sequence) || !isHttpUrl(parentPlaylistUrl)) return;
+    const key = playbackStateKey(configKey, parentPlaylistUrl);
+    const state = memoryCache.hlsPlaybackState[key] || {
+        configHash: hashKey(configKey),
+        playlistHash: hashKey(parentPlaylistUrl)
+    };
+    const edgeDistanceSegments = Number.isFinite(state.endSeq) ? state.endSeq - sequence : null;
+    const approxEdgeDistanceSeconds = Number.isFinite(edgeDistanceSegments)
+        ? Math.max(0, edgeDistanceSegments * (Number(state.targetDuration) || 0))
+        : null;
+    memoryCache.hlsPlaybackState[key] = {
+        ...state,
+        lastRequestedSeq: sequence,
+        edgeDistanceSegments,
+        approxEdgeDistanceSeconds,
+        nearAdvertisedEdge: Number.isFinite(edgeDistanceSegments) ? edgeDistanceSegments <= 1 : null,
+        lastRequestAt: Date.now()
+    };
+}
+
+function getRecentPlaybackDiagnostics(configKey = "") {
+    const configHash = configKey ? hashKey(configKey) : "";
+    return Object.values(memoryCache.hlsPlaybackState)
+        .filter(state => !configHash || state.configHash === configHash)
+        .sort((a, b) => (b.lastRequestAt || b.manifestUpdatedAt || 0) - (a.lastRequestAt || a.manifestUpdatedAt || 0))
+        .slice(0, 10)
+        .map(state => ({
+            playlistHash: state.playlistHash,
+            segmentWindow: {
+                first: state.firstSeq,
+                end: state.endSeq,
+                count: state.segmentCount,
+                targetDuration: state.targetDuration
+            },
+            lastRequestedSeq: state.lastRequestedSeq,
+            edgeDistanceSegments: state.edgeDistanceSegments,
+            approxEdgeDistanceSeconds: state.approxEdgeDistanceSeconds,
+            nearAdvertisedEdge: state.nearAdvertisedEdge,
+            manifestUpdatedAt: state.manifestUpdatedAt,
+            lastRequestAt: state.lastRequestAt
+        }));
+}
+
 function rememberEdgeSegmentRequest(configKey, parentPlaylistUrl, sequence) {
     if (!Number.isFinite(sequence) || !isHttpUrl(parentPlaylistUrl)) return;
     const key = edgeStateKey(configKey, parentPlaylistUrl);
@@ -1930,11 +2012,12 @@ function rewriteMediaManifest(text, baseUrl, host, configKey, parentPlaylistUrl 
         applyLiveEdgeHoldBack(parsed.segments, parsed.targetDuration, parsed.isEnded),
         parsed.isEnded
     );
+    rememberManifestWindow(configKey, parentPlaylistUrl, stableSegments, parsed.targetDuration, parsed.isEnded);
 
     const makeSegmentUrl = abs => segmentProxyUrl(host, configKey, abs, parentPlaylistUrl);
     const out = rewritePreambleForSegments(parsed.preamble, stableSegments, baseUrl, makeSegmentUrl);
 
-    if (!parsed.isEnded && PROXY_START_OFFSET_SECONDS > 0) {
+    if (!parsed.isEnded && HLS_INJECT_START_OFFSET && PROXY_START_OFFSET_SECONDS > 0) {
         out.push(`#EXT-X-START:TIME-OFFSET=-${PROXY_START_OFFSET_SECONDS},PRECISE=YES`);
     }
 
@@ -2013,6 +2096,7 @@ async function proxySegmentResponse(req, res) {
         if (!isHttpUrl(upstream)) return res.status(400).end();
         const parentPlaylistUrl = decodeProxyUrl(req.query.p || "");
         const sequence = Number(req.query.q);
+        rememberPlaybackSegmentRequest(configKey, parentPlaylistUrl, sequence);
         rememberEdgeSegmentRequest(configKey, parentPlaylistUrl, sequence);
         const headers = { ...RELAY_HEADERS };
         if (req.headers.range) headers.Range = req.headers.range;
@@ -2064,11 +2148,18 @@ app.get("/:base64Config/stats", (req, res) => {
             channels: Object.values(memoryCache.channelItems).reduce((s, l) => s + l.length, 0),
             epgMaps: Object.keys(memoryCache.epgData).length,
             logos: Object.keys(memoryCache.logoData).length,
-            hlsManifests: Object.keys(memoryCache.hlsManifestData).length
+            hlsManifests: Object.keys(memoryCache.hlsManifestData).length,
+            hlsPlaybackStates: Object.keys(memoryCache.hlsPlaybackState).length
         },
         playback: {
-            mode: "transparent-relay",
+            mode: PLAYBACK_MODE,
             vpn: false,
+            exactPlayerPositionKnown: false,
+            positionInference: "Kronos only sees manifest and segment HTTP requests; edge distance is inferred from requested segment sequence.",
+            injectStartOffset: HLS_INJECT_START_OFFSET,
+            edgeHoldBackEnabled: HLS_EDGE_HOLD_BACK,
+            edgeBatchingEnabled: HLS_EDGE_BATCHING,
+            streamNotWebReady: STREAM_NOT_WEB_READY,
             startOffsetSeconds: PROXY_START_OFFSET_SECONDS,
             liveEdgeHoldBackSeconds: LIVE_EDGE_HOLD_BACK_SECONDS,
             liveEdgeMinSegments: LIVE_EDGE_MIN_SEGMENTS,
@@ -2079,7 +2170,8 @@ app.get("/:base64Config/stats", (req, res) => {
             manifestRetries: HLS_MANIFEST_RETRIES,
             staleManifestTtlMs: HLS_STALE_MANIFEST_TTL_MS,
             segmentRetries: SEGMENT_UPSTREAM_RETRIES
-        }
+        },
+        recentPlayback: getRecentPlaybackDiagnostics(req.params.base64Config)
     });
 });
 
@@ -2110,7 +2202,8 @@ app.get("/:base64Config/debug", async (req, res) => {
                     url: effectiveEpgUrl,
                     ...(memoryCache.epgStatus[effectiveEpgUrl] || { state: "idle" }),
                     inflight: !!memoryCache.epgInflight[effectiveEpgUrl]
-                } : null
+                } : null,
+                recentPlayback: getRecentPlaybackDiagnostics(configKey)
             },
             sampleChannels: channels.slice(0, 5).map(c => ({
                 id: c.id, name: c.name, group: c.group, sourceName: c.sourceName,
@@ -2119,6 +2212,7 @@ app.get("/:base64Config/debug", async (req, res) => {
             groups: [...new Set(channels.map(c => c.group))].slice(0, 50),
             constants: {
                 ADDON_TYPE, RELEASE_VERSION, PLAYBACK_MODE,
+                HLS_INJECT_START_OFFSET, HLS_EDGE_HOLD_BACK, HLS_EDGE_BATCHING, STREAM_NOT_WEB_READY,
                 HLS_REQUEST_TIMEOUT, SEG_REQUEST_TIMEOUT, PROXY_START_OFFSET_SECONDS,
                 LIVE_EDGE_HOLD_BACK_SECONDS, LIVE_EDGE_MIN_SEGMENTS, LIVE_EDGE_BATCH_SEGMENTS,
                 LIVE_EDGE_BATCH_MAX_WAIT_MS, LIVE_EDGE_BATCH_MIN_WAIT_MS, SEGMENT_TOKEN_HEALING,
@@ -2134,12 +2228,12 @@ app.get("/:base64Config/debug", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 app.listen(PORT, "0.0.0.0", () => {
     console.log("\n" + "=".repeat(60));
-    console.log(`K.R.O.N.O.S. ${RELEASE_VERSION} - UHF-like direct relay`);
+    console.log(`K.R.O.N.O.S. ${RELEASE_VERSION} - passive HLS relay`);
     console.log("=".repeat(60));
     console.log(`🌐 http://0.0.0.0:${PORT}`);
     console.log(`📦 Node ${process.version}`);
-    console.log(`🎬 playback=transparent-relay vpn=off remux=off startOffset=${PROXY_START_OFFSET_SECONDS}s hlsTimeout=${HLS_REQUEST_TIMEOUT / 1000}s segTimeout=${SEG_REQUEST_TIMEOUT / 1000}s`);
-    console.log(`🛡️ live edge holdBack=${LIVE_EDGE_HOLD_BACK_SECONDS}s minSegments=${LIVE_EDGE_MIN_SEGMENTS} edgeCatchupSegments=${LIVE_EDGE_BATCH_SEGMENTS} edgeCatchupMinWait=${LIVE_EDGE_BATCH_MIN_WAIT_MS / 1000}s edgeCatchupMaxWait=${LIVE_EDGE_BATCH_MAX_WAIT_MS / 1000}s tokenHealing=${SEGMENT_TOKEN_HEALING ? 1 : 0}`);
+    console.log(`🎬 playback=${PLAYBACK_MODE} vpn=off remux=off hlsTimeout=${HLS_REQUEST_TIMEOUT / 1000}s segTimeout=${SEG_REQUEST_TIMEOUT / 1000}s`);
+    console.log(`🛡️ startOffset=${HLS_INJECT_START_OFFSET ? PROXY_START_OFFSET_SECONDS : 0}s holdBack=${HLS_EDGE_HOLD_BACK ? LIVE_EDGE_HOLD_BACK_SECONDS : 0}s batching=${HLS_EDGE_BATCHING ? 1 : 0} batchSegments=${LIVE_EDGE_BATCH_SEGMENTS} tokenHealing=${SEGMENT_TOKEN_HEALING ? 1 : 0}`);
     console.log(`🔌 upstream keepAlive=1 sockets=${UPSTREAM_KEEPALIVE_MAX_SOCKETS} free=${UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS} ms=${UPSTREAM_KEEPALIVE_MS}`);
     console.log(`📋 playlist retryWindow=${PLAYLIST_RETRY_WINDOW_MS / 1000}s delay=${PLAYLIST_RETRY_DELAY_MS / 1000}s`);
     console.log(`🎞️ hls retries=${HLS_MANIFEST_RETRIES} staleTtl=${HLS_STALE_MANIFEST_TTL_MS / 1000}s segmentRetries=${SEGMENT_UPSTREAM_RETRIES} rangeForward=1`);
