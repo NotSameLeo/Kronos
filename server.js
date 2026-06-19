@@ -61,7 +61,7 @@ app.use((req, res, next) => {
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 const UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const RELEASE_VERSION = "4.4.0";
+const RELEASE_VERSION = "4.5.0";
 const ADDON_TYPE = "tv";
 const PLAYBACK_MODE = "passive-hls-relay";
 const CATALOG_TTL = 30 * 60 * 1000;
@@ -99,7 +99,6 @@ const HLS_REQUEST_TIMEOUT = Number(process.env.HLS_REQUEST_TIMEOUT || 15000);
 const SEG_REQUEST_TIMEOUT = Number(process.env.SEG_REQUEST_TIMEOUT || 45000);
 const HLS_MANIFEST_RETRIES = Math.max(0, Number(process.env.HLS_MANIFEST_RETRIES || 2));
 const HLS_MANIFEST_RETRY_DELAY_MS = Math.max(0, Number(process.env.HLS_MANIFEST_RETRY_DELAY_MS || 700));
-const HLS_STALE_MANIFEST_TTL_MS = Math.max(0, Number(process.env.HLS_STALE_MANIFEST_TTL_MS || 0));
 const SEGMENT_UPSTREAM_RETRIES = Math.max(0, Number(process.env.SEGMENT_UPSTREAM_RETRIES || 2));
 const SEGMENT_UPSTREAM_RETRY_DELAY_MS = Math.max(0, Number(process.env.SEGMENT_UPSTREAM_RETRY_DELAY_MS || 500));
 const UPSTREAM_KEEPALIVE_MAX_SOCKETS = Math.max(1, Number(process.env.UPSTREAM_KEEPALIVE_MAX_SOCKETS || 16));
@@ -113,29 +112,8 @@ const LOGO_REQUEST_TIMEOUT = Number(process.env.LOGO_REQUEST_TIMEOUT || 4000);
 const LOGO_FAILURE_TTL_MS = Number(process.env.LOGO_FAILURE_TTL_MS || 60 * 60 * 1000);
 const LOGO_MAX_CACHE_ITEMS = Math.max(50, Number(process.env.LOGO_MAX_CACHE_ITEMS || 500));
 
-// ── Transparent relay configuration ───────────────────────────────────────────
-// No VPN and no ffmpeg re-mux: Kronos keeps the stream HLS-native and lets the
-// player own live latency. Edge manipulation stays opt-in for unstable providers.
-const HLS_INJECT_START_OFFSET = String(process.env.HLS_INJECT_START_OFFSET || "0") !== "0";
-const HLS_EDGE_HOLD_BACK = String(process.env.HLS_EDGE_HOLD_BACK || "0") !== "0";
-const HLS_EDGE_BATCHING = String(process.env.HLS_EDGE_BATCHING || "0") !== "0";
-const STREAM_NOT_WEB_READY = String(process.env.STREAM_NOT_WEB_READY || "0") !== "0";
-const PROXY_START_OFFSET_SECONDS = HLS_INJECT_START_OFFSET
-    ? Math.max(0, Number(process.env.PROXY_START_OFFSET_SECONDS || 0))
-    : 0;
-const LIVE_EDGE_HOLD_BACK_SECONDS = HLS_EDGE_HOLD_BACK
-    ? Math.max(0, Number(process.env.LIVE_EDGE_HOLD_BACK_SECONDS || 0))
-    : 0;
-const LIVE_EDGE_MIN_SEGMENTS = Math.max(1, Number(process.env.LIVE_EDGE_MIN_SEGMENTS || 3));
-const LIVE_EDGE_BATCH_SEGMENTS = HLS_EDGE_BATCHING
-    ? Math.max(1, Number(process.env.LIVE_EDGE_BATCH_SEGMENTS || 2))
-    : 1;
-const LIVE_EDGE_BATCH_MAX_WAIT_MS = HLS_EDGE_BATCHING
-    ? Math.max(0, Number(process.env.LIVE_EDGE_BATCH_MAX_WAIT_MS || 35000))
-    : 0;
-const LIVE_EDGE_BATCH_MIN_WAIT_MS = HLS_EDGE_BATCHING
-    ? Math.max(0, Number(process.env.LIVE_EDGE_BATCH_MIN_WAIT_MS || 20000))
-    : 0;
+// ── Playback relay configuration ─────────────────────────────────────────────
+// Keep playback boring: no live-edge shaping, no remux, no player simulation.
 const SEGMENT_TOKEN_HEALING = String(process.env.SEGMENT_TOKEN_HEALING || "1") !== "0";
 
 const upstreamHttpAgent = new http.Agent({
@@ -177,10 +155,7 @@ const memoryCache = {
     shortConfigs: null,   // short id -> { configKey, config, savedAt }
     logoData: {},         // logoUrl -> data: URI
     logoFailures: {},     // logoUrl -> timestamp of last failed fetch
-    hlsManifestData: {},  // hash(configKey|url) -> { text, updatedAt }
     hlsManifestInflight: {},
-    hlsEdgeState: {},     // hash(configKey|playlist) -> last exposed stable edge
-    hlsPlaybackState: {}, // hash(configKey|playlist) -> inferred segment/edge diagnostics
     hlsSegmentMap: {},    // hash(configKey|playlist) -> stable segment id -> latest URL
     isUpdating: {}
 };
@@ -1303,7 +1278,6 @@ async function getLogoDataUri(logoUrl) {
 function buildStream(channel, host, configKey) {
     const base = routeBase(host, configKey);
     const behaviorHints = { bingeGroup: `kronos-${channel.id}` };
-    if (STREAM_NOT_WEB_READY) behaviorHints.notWebReady = true;
     if (isHlsUrl(channel.url)) {
         return {
             title: channel.name, name: "TV",
@@ -1640,10 +1614,6 @@ function toAbsoluteUrl(value, baseUrl) { try { return new URL(value, baseUrl).to
 
 const RELAY_HEADERS = { "User-Agent": UPSTREAM_UA, "Accept": "*/*" };
 
-function hlsManifestCacheKey(configKey, upstream) {
-    return hashKey(`${configKey}|${upstream}`);
-}
-
 function hlsSegmentMapKey(configKey, parentPlaylistUrl) {
     return hashKey(`${configKey}|segments|${parentPlaylistUrl}`);
 }
@@ -1711,20 +1681,8 @@ async function getRewrittenManifest(configKey, upstream, host, routeKey = config
     if (memoryCache.hlsManifestInflight[key]) return memoryCache.hlsManifestInflight[key];
 
     const promise = (async () => {
-        try {
-            const fetched = await fetchUpstreamManifest(upstream);
-            const text = rewriteManifest(fetched.data, fetched.finalUrl, host, configKey, upstream, routeKey);
-            memoryCache.hlsManifestData[key] = { text, updatedAt: Date.now(), upstream };
-            return { text, stale: false };
-        } catch (err) {
-            const cached = memoryCache.hlsManifestData[key];
-            const age = cached ? Date.now() - cached.updatedAt : Infinity;
-            if (HLS_STALE_MANIFEST_TTL_MS > 0 && cached && age <= HLS_STALE_MANIFEST_TTL_MS) {
-                console.warn(`[PROXY M3U8 STALE] age=${Math.round(age / 1000)}s reason=${err.message}`);
-                return { text: cached.text, stale: true };
-            }
-            throw err;
-        }
+        const fetched = await fetchUpstreamManifest(upstream);
+        return { text: rewriteManifest(fetched.data, fetched.finalUrl, host, configKey, upstream, routeKey) };
     })();
 
     memoryCache.hlsManifestInflight[key] = promise;
@@ -1774,13 +1732,12 @@ async function fetchSegmentWithHealing(configKey, routeKey, upstream, headers, r
     }
 }
 
-function segmentProxyUrl(host, configKey, abs, parentPlaylistUrl = "", sequence = null) {
+function segmentProxyUrl(host, configKey, abs, parentPlaylistUrl = "") {
     const params = new URLSearchParams({ u: encodeProxyUrl(abs) });
     if (SEGMENT_TOKEN_HEALING && parentPlaylistUrl && isHttpUrl(parentPlaylistUrl)) {
         params.set("p", encodeProxyUrl(parentPlaylistUrl));
         params.set("s", segmentIdentity(abs));
     }
-    if (Number.isFinite(sequence)) params.set("q", String(sequence));
     return `${routeBase(host, configKey)}/proxy/seg?${params.toString()}`;
 }
 
@@ -1792,263 +1749,11 @@ function rewriteUriAttributes(line, baseUrl, makeUrl) {
     return line.replace(/URI=(["'])(.*?)\1/gi, (_m, q, uri) => `URI=${q}${makeUrl(toAbsoluteUrl(uri, baseUrl))}${q}`);
 }
 
-function isSegmentPreludeTag(line) {
-    return /^#EXT-X-(PROGRAM-DATE-TIME|DISCONTINUITY|BYTERANGE|GAP|KEY|MAP|PART|PRELOAD-HINT)\b/i.test(line);
-}
-
-function parseMediaPlaylist(text) {
-    const lines = String(text || "").split(/\r?\n/);
-    const preamble = [];
-    const segments = [];
-    const footer = [];
-    let pending = [];
-    let current = null;
-    let targetDuration = 6;
-    let mediaSequence = 0;
-    let sawSegment = false;
-
-    for (const line of lines) {
-        const t = line.trim();
-        const targetMatch = t.match(/^#EXT-X-TARGETDURATION:(\d+(?:\.\d+)?)/i);
-        if (targetMatch) targetDuration = Number(targetMatch[1]) || targetDuration;
-        const seqMatch = t.match(/^#EXT-X-MEDIA-SEQUENCE:(\d+)/i);
-        if (seqMatch) mediaSequence = Number(seqMatch[1]) || 0;
-
-        if (/^#EXTINF:/i.test(t)) {
-            const duration = Number((t.match(/^#EXTINF:([\d.]+)/i) || [])[1]) || targetDuration;
-            current = {
-                lines: [...pending, line],
-                duration,
-                uri: "",
-                sequence: mediaSequence + segments.length
-            };
-            pending = [];
-            continue;
-        }
-
-        if (current) {
-            current.lines.push(line);
-            if (t && !t.startsWith("#")) {
-                current.uri = t;
-                segments.push(current);
-                current = null;
-                sawSegment = true;
-            }
-            continue;
-        }
-
-        if (sawSegment && isSegmentPreludeTag(t)) {
-            pending.push(line);
-        } else if (sawSegment) {
-            footer.push(...pending, line);
-            pending = [];
-        } else if (isSegmentPreludeTag(t) && !/^#EXT-X-(KEY|MAP)\b/i.test(t)) {
-            pending.push(line);
-        } else {
-            preamble.push(line);
-        }
-    }
-
-    if (current?.lines.length) footer.push(...current.lines);
-    if (pending.length) footer.push(...pending);
-    return { preamble, segments, footer, targetDuration, mediaSequence, isEnded: /#EXT-X-ENDLIST/i.test(text) };
-}
-
-function applyLiveEdgeHoldBack(segments, targetDuration, isEnded) {
-    if (isEnded || LIVE_EDGE_HOLD_BACK_SECONDS <= 0 || segments.length <= LIVE_EDGE_MIN_SEGMENTS) return segments;
-    let keep = segments.length;
-    let hiddenDuration = 0;
-    while (keep > LIVE_EDGE_MIN_SEGMENTS && hiddenDuration < LIVE_EDGE_HOLD_BACK_SECONDS) {
-        keep -= 1;
-        hiddenDuration += Number(segments[keep]?.duration) || targetDuration || 6;
-    }
-    return segments.slice(0, keep);
-}
-
-function edgeStateKey(configKey, parentPlaylistUrl) {
-    return hlsManifestCacheKey(configKey, `${parentPlaylistUrl}|edge`);
-}
-
-function playbackStateKey(configKey, parentPlaylistUrl) {
-    return hlsManifestCacheKey(configKey, `${parentPlaylistUrl}|playback`);
-}
-
-function rememberManifestWindow(configKey, parentPlaylistUrl, segments, targetDuration, isEnded) {
-    if (!isHttpUrl(parentPlaylistUrl) || !segments.length) return;
-    const key = playbackStateKey(configKey, parentPlaylistUrl);
-    const previous = memoryCache.hlsPlaybackState[key] || {};
-    const firstSeq = segments[0]?.sequence;
-    const endSeq = segments[segments.length - 1]?.sequence;
-    memoryCache.hlsPlaybackState[key] = {
-        ...previous,
-        configHash: hashKey(configKey),
-        playlistHash: hashKey(parentPlaylistUrl),
-        firstSeq,
-        endSeq,
-        segmentCount: segments.length,
-        targetDuration,
-        isEnded,
-        manifestUpdatedAt: Date.now()
-    };
-}
-
-function rememberPlaybackSegmentRequest(configKey, parentPlaylistUrl, sequence) {
-    if (!Number.isFinite(sequence) || !isHttpUrl(parentPlaylistUrl)) return;
-    const key = playbackStateKey(configKey, parentPlaylistUrl);
-    const state = memoryCache.hlsPlaybackState[key] || {
-        configHash: hashKey(configKey),
-        playlistHash: hashKey(parentPlaylistUrl)
-    };
-    const edgeDistanceSegments = Number.isFinite(state.endSeq) ? state.endSeq - sequence : null;
-    const approxEdgeDistanceSeconds = Number.isFinite(edgeDistanceSegments)
-        ? Math.max(0, edgeDistanceSegments * (Number(state.targetDuration) || 0))
-        : null;
-    memoryCache.hlsPlaybackState[key] = {
-        ...state,
-        lastRequestedSeq: sequence,
-        edgeDistanceSegments,
-        approxEdgeDistanceSeconds,
-        nearAdvertisedEdge: Number.isFinite(edgeDistanceSegments) ? edgeDistanceSegments <= 1 : null,
-        lastRequestAt: Date.now()
-    };
-}
-
-function getRecentPlaybackDiagnostics(configKey = "") {
-    const configHash = configKey ? hashKey(configKey) : "";
-    return Object.values(memoryCache.hlsPlaybackState)
-        .filter(state => !configHash || state.configHash === configHash)
-        .sort((a, b) => (b.lastRequestAt || b.manifestUpdatedAt || 0) - (a.lastRequestAt || a.manifestUpdatedAt || 0))
-        .slice(0, 10)
-        .map(state => ({
-            playlistHash: state.playlistHash,
-            segmentWindow: {
-                first: state.firstSeq,
-                end: state.endSeq,
-                count: state.segmentCount,
-                targetDuration: state.targetDuration
-            },
-            lastRequestedSeq: state.lastRequestedSeq,
-            edgeDistanceSegments: state.edgeDistanceSegments,
-            approxEdgeDistanceSeconds: state.approxEdgeDistanceSeconds,
-            nearAdvertisedEdge: state.nearAdvertisedEdge,
-            manifestUpdatedAt: state.manifestUpdatedAt,
-            lastRequestAt: state.lastRequestAt
-        }));
-}
-
-function rememberEdgeSegmentRequest(configKey, parentPlaylistUrl, sequence) {
-    if (!Number.isFinite(sequence) || !isHttpUrl(parentPlaylistUrl)) return;
-    const key = edgeStateKey(configKey, parentPlaylistUrl);
-    const state = memoryCache.hlsEdgeState[key];
-    if (!state || !Number.isFinite(state.endSeq) || sequence < state.endSeq) return;
-    if (state.edgeWaitFromSeq === sequence) return;
-    state.edgeWaitFromSeq = sequence;
-    state.edgeWaitStartedAt = Date.now();
-    state.edgeWaitLogged = false;
-    console.warn(`[HLS EDGE HIT] seq=${sequence} target=${sequence + LIVE_EDGE_BATCH_SEGMENTS} minWait=${Math.round(LIVE_EDGE_BATCH_MIN_WAIT_MS / 1000)}s`);
-}
-
-function applyLiveEdgeBatch(configKey, parentPlaylistUrl, segments, isEnded) {
-    if (isEnded || LIVE_EDGE_BATCH_SEGMENTS <= 1 || LIVE_EDGE_BATCH_MAX_WAIT_MS <= 0 || !segments.length) return segments;
-    const key = edgeStateKey(configKey, parentPlaylistUrl);
-    const endSeq = segments[segments.length - 1]?.sequence;
-    if (!Number.isFinite(endSeq)) return segments;
-    const now = Date.now();
-    const state = memoryCache.hlsEdgeState[key];
-
-    if (!state || endSeq < state.endSeq) {
-        memoryCache.hlsEdgeState[key] = { endSeq, servedAt: now, segments };
-        return segments;
-    }
-
-    if (Number.isFinite(state.edgeWaitFromSeq)) {
-        const advanced = endSeq - state.edgeWaitFromSeq;
-        const waited = now - (state.edgeWaitStartedAt || now);
-        const minWaitPending = waited < LIVE_EDGE_BATCH_MIN_WAIT_MS;
-        if ((advanced < LIVE_EDGE_BATCH_SEGMENTS || minWaitPending) && waited < LIVE_EDGE_BATCH_MAX_WAIT_MS && state.segments?.length) {
-            if (!state.edgeWaitLogged) {
-                state.edgeWaitLogged = true;
-                console.warn(`[HLS EDGE WAIT] from=${state.edgeWaitFromSeq} current=${endSeq} need=${LIVE_EDGE_BATCH_SEGMENTS} minWait=${Math.round(LIVE_EDGE_BATCH_MIN_WAIT_MS / 1000)}s`);
-            }
-            return state.segments;
-        }
-        console.warn(`[HLS EDGE RELEASE] from=${state.edgeWaitFromSeq} current=${endSeq} advanced=${advanced} waited=${Math.round(waited / 1000)}s`);
-    }
-
-    memoryCache.hlsEdgeState[key] = { endSeq, servedAt: now, segments };
-    return segments;
-}
-
-function rewritePreambleForSegments(preamble, segments, baseUrl, makeSegmentUrl) {
-    const firstSeq = segments[0]?.sequence;
-    let wroteMediaSequence = false;
-    const out = preamble
-        .filter(line => !/^#EXT-X-START\b/i.test(line.trim()))
-        .map(line => {
-            const t = line.trim();
-            if (/^#EXT-X-MEDIA-SEQUENCE:/i.test(t) && Number.isFinite(firstSeq)) {
-                wroteMediaSequence = true;
-                return `#EXT-X-MEDIA-SEQUENCE:${firstSeq}`;
-            }
-            return t.startsWith("#") ? rewriteUriAttributes(line, baseUrl, makeSegmentUrl) : line;
-        });
-
-    if (!wroteMediaSequence && Number.isFinite(firstSeq)) {
-        const insertAt = out[0]?.trim() === "#EXTM3U" ? 1 : 0;
-        out.splice(insertAt, 0, `#EXT-X-MEDIA-SEQUENCE:${firstSeq}`);
-    }
-    return out;
-}
-
-function rewriteMediaManifest(text, baseUrl, host, configKey, parentPlaylistUrl = baseUrl, routeKey = configKey) {
-    const parsed = parseMediaPlaylist(text);
-    for (const segment of parsed.segments) {
-        if (segment.uri) rememberSegmentUrl(configKey, parentPlaylistUrl, toAbsoluteUrl(segment.uri, baseUrl));
-    }
-
-    const stableSegments = applyLiveEdgeBatch(
-        configKey,
-        parentPlaylistUrl,
-        applyLiveEdgeHoldBack(parsed.segments, parsed.targetDuration, parsed.isEnded),
-        parsed.isEnded
-    );
-    rememberManifestWindow(configKey, parentPlaylistUrl, stableSegments, parsed.targetDuration, parsed.isEnded);
-
-    const makeSegmentUrl = abs => segmentProxyUrl(host, routeKey, abs, parentPlaylistUrl);
-    const out = rewritePreambleForSegments(parsed.preamble, stableSegments, baseUrl, makeSegmentUrl);
-
-    if (!parsed.isEnded && HLS_INJECT_START_OFFSET && PROXY_START_OFFSET_SECONDS > 0) {
-        out.push(`#EXT-X-START:TIME-OFFSET=-${PROXY_START_OFFSET_SECONDS},PRECISE=YES`);
-    }
-
-    for (const segment of stableSegments) {
-        for (const line of segment.lines) {
-            const t = line.trim();
-            if (!t) { out.push(line); continue; }
-            if (t.startsWith("#")) {
-                out.push(rewriteUriAttributes(line, baseUrl, makeSegmentUrl));
-            } else {
-                out.push(segmentProxyUrl(host, routeKey, toAbsoluteUrl(t, baseUrl), parentPlaylistUrl, segment.sequence));
-            }
-        }
-    }
-
-    for (const line of parsed.footer) {
-        if (/^#EXT-X-START\b/i.test(line.trim())) continue;
-        out.push(line.trim().startsWith("#") ? rewriteUriAttributes(line, baseUrl, makeSegmentUrl) : line);
-    }
-
-    return out.join("\n");
-}
-
-// Rewrite an upstream HLS manifest so every URL points back through our relay.
-// Master variants are kept as manifests; media segments and key URIs go through
-// /proxy/seg with enough parent context to recover if the provider rotates tokens.
 function rewriteManifest(text, baseUrl, host, configKey, parentPlaylistUrl = baseUrl, routeKey = configKey) {
     const isMaster = /#EXT-X-STREAM-INF/i.test(text);
-    if (!isMaster && /#EXTINF:/i.test(text)) {
-        return rewriteMediaManifest(text, baseUrl, host, configKey, parentPlaylistUrl, routeKey);
-    }
+    const rewriteTagUri = abs => isHlsUrl(abs)
+        ? manifestProxyUrl(host, routeKey, abs)
+        : segmentProxyUrl(host, routeKey, abs, parentPlaylistUrl);
 
     const out = [];
     for (const line of text.split(/\r?\n/)) {
@@ -2056,12 +1761,13 @@ function rewriteManifest(text, baseUrl, host, configKey, parentPlaylistUrl = bas
         if (!t) { out.push(line); continue; }
         if (t.startsWith("#")) {
             out.push(/URI=/i.test(t)
-                ? rewriteUriAttributes(line, baseUrl, abs => segmentProxyUrl(host, routeKey, abs, parentPlaylistUrl))
+                ? rewriteUriAttributes(line, baseUrl, rewriteTagUri)
                 : line);
             continue;
         }
         const abs = toAbsoluteUrl(t, baseUrl);
         if (isMaster || isHlsUrl(abs)) { out.push(manifestProxyUrl(host, routeKey, abs)); continue; }
+        rememberSegmentUrl(configKey, parentPlaylistUrl, abs);
         out.push(segmentProxyUrl(host, routeKey, abs, parentPlaylistUrl));
     }
     return out.join("\n");
@@ -2076,7 +1782,6 @@ async function proxyManifestResponse(req, res) {
         const manifest = await getRewrittenManifest(configKey, upstream, getPublicHost(req), routeKey);
         setPlaylistHeaders(res);
         res.setHeader("X-Kronos-Relay", "1");
-        res.setHeader("X-Kronos-Cache", manifest.stale ? "stale" : "fresh");
         res.send(manifest.text);
     } catch (err) {
         console.error(`[PROXY M3U8] ${err?.message || err}`);
@@ -2094,10 +1799,6 @@ async function proxySegmentResponse(req, res) {
         const { configKey, routeKey } = getRequestConfig(req);
         const upstream = decodeProxyUrl(req.query.u || "");
         if (!isHttpUrl(upstream)) return res.status(400).end();
-        const parentPlaylistUrl = decodeProxyUrl(req.query.p || "");
-        const sequence = Number(req.query.q);
-        rememberPlaybackSegmentRequest(configKey, parentPlaylistUrl, sequence);
-        rememberEdgeSegmentRequest(configKey, parentPlaylistUrl, sequence);
         const headers = { ...RELAY_HEADERS };
         if (req.headers.range) headers.Range = req.headers.range;
         const r = await fetchSegmentWithHealing(configKey, routeKey, upstream, headers, req);
@@ -2148,30 +1849,17 @@ app.get("/:base64Config/stats", (req, res) => {
             channels: Object.values(memoryCache.channelItems).reduce((s, l) => s + l.length, 0),
             epgMaps: Object.keys(memoryCache.epgData).length,
             logos: Object.keys(memoryCache.logoData).length,
-            hlsManifests: Object.keys(memoryCache.hlsManifestData).length,
-            hlsPlaybackStates: Object.keys(memoryCache.hlsPlaybackState).length
+            hlsSegmentMaps: Object.keys(memoryCache.hlsSegmentMap).length
         },
         playback: {
             mode: PLAYBACK_MODE,
             vpn: false,
-            exactPlayerPositionKnown: false,
-            positionInference: "Kronos only sees manifest and segment HTTP requests; edge distance is inferred from requested segment sequence.",
-            injectStartOffset: HLS_INJECT_START_OFFSET,
-            edgeHoldBackEnabled: HLS_EDGE_HOLD_BACK,
-            edgeBatchingEnabled: HLS_EDGE_BATCHING,
-            streamNotWebReady: STREAM_NOT_WEB_READY,
-            startOffsetSeconds: PROXY_START_OFFSET_SECONDS,
-            liveEdgeHoldBackSeconds: LIVE_EDGE_HOLD_BACK_SECONDS,
-            liveEdgeMinSegments: LIVE_EDGE_MIN_SEGMENTS,
-            liveEdgeBatchSegments: LIVE_EDGE_BATCH_SEGMENTS,
-            liveEdgeBatchMaxWaitMs: LIVE_EDGE_BATCH_MAX_WAIT_MS,
-            liveEdgeBatchMinWaitMs: LIVE_EDGE_BATCH_MIN_WAIT_MS,
+            remux: false,
+            playerPositionKnown: false,
             segmentTokenHealing: SEGMENT_TOKEN_HEALING,
             manifestRetries: HLS_MANIFEST_RETRIES,
-            staleManifestTtlMs: HLS_STALE_MANIFEST_TTL_MS,
             segmentRetries: SEGMENT_UPSTREAM_RETRIES
-        },
-        recentPlayback: getRecentPlaybackDiagnostics(req.params.base64Config)
+        }
     });
 });
 
@@ -2202,8 +1890,7 @@ app.get("/:base64Config/debug", async (req, res) => {
                     url: effectiveEpgUrl,
                     ...(memoryCache.epgStatus[effectiveEpgUrl] || { state: "idle" }),
                     inflight: !!memoryCache.epgInflight[effectiveEpgUrl]
-                } : null,
-                recentPlayback: getRecentPlaybackDiagnostics(configKey)
+                } : null
             },
             sampleChannels: channels.slice(0, 5).map(c => ({
                 id: c.id, name: c.name, group: c.group, sourceName: c.sourceName,
@@ -2212,11 +1899,8 @@ app.get("/:base64Config/debug", async (req, res) => {
             groups: [...new Set(channels.map(c => c.group))].slice(0, 50),
             constants: {
                 ADDON_TYPE, RELEASE_VERSION, PLAYBACK_MODE,
-                HLS_INJECT_START_OFFSET, HLS_EDGE_HOLD_BACK, HLS_EDGE_BATCHING, STREAM_NOT_WEB_READY,
-                HLS_REQUEST_TIMEOUT, SEG_REQUEST_TIMEOUT, PROXY_START_OFFSET_SECONDS,
-                LIVE_EDGE_HOLD_BACK_SECONDS, LIVE_EDGE_MIN_SEGMENTS, LIVE_EDGE_BATCH_SEGMENTS,
-                LIVE_EDGE_BATCH_MAX_WAIT_MS, LIVE_EDGE_BATCH_MIN_WAIT_MS, SEGMENT_TOKEN_HEALING,
-                HLS_MANIFEST_RETRIES, HLS_MANIFEST_RETRY_DELAY_MS, HLS_STALE_MANIFEST_TTL_MS,
+                HLS_REQUEST_TIMEOUT, SEG_REQUEST_TIMEOUT, SEGMENT_TOKEN_HEALING,
+                HLS_MANIFEST_RETRIES, HLS_MANIFEST_RETRY_DELAY_MS,
                 SEGMENT_UPSTREAM_RETRIES, SEGMENT_UPSTREAM_RETRY_DELAY_MS,
                 UPSTREAM_KEEPALIVE_MAX_SOCKETS, UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS, UPSTREAM_KEEPALIVE_MS,
                 PLAYLIST_REQUEST_TIMEOUT, PLAYLIST_RETRY_WINDOW_MS, PLAYLIST_RETRY_DELAY_MS
@@ -2233,10 +1917,10 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`🌐 http://0.0.0.0:${PORT}`);
     console.log(`📦 Node ${process.version}`);
     console.log(`🎬 playback=${PLAYBACK_MODE} vpn=off remux=off hlsTimeout=${HLS_REQUEST_TIMEOUT / 1000}s segTimeout=${SEG_REQUEST_TIMEOUT / 1000}s`);
-    console.log(`🛡️ startOffset=${HLS_INJECT_START_OFFSET ? PROXY_START_OFFSET_SECONDS : 0}s holdBack=${HLS_EDGE_HOLD_BACK ? LIVE_EDGE_HOLD_BACK_SECONDS : 0}s batching=${HLS_EDGE_BATCHING ? 1 : 0} batchSegments=${LIVE_EDGE_BATCH_SEGMENTS} tokenHealing=${SEGMENT_TOKEN_HEALING ? 1 : 0}`);
+    console.log(`🛡️ tokenHealing=${SEGMENT_TOKEN_HEALING ? 1 : 0}`);
     console.log(`🔌 upstream keepAlive=1 sockets=${UPSTREAM_KEEPALIVE_MAX_SOCKETS} free=${UPSTREAM_KEEPALIVE_MAX_FREE_SOCKETS} ms=${UPSTREAM_KEEPALIVE_MS}`);
     console.log(`📋 playlist retryWindow=${PLAYLIST_RETRY_WINDOW_MS / 1000}s delay=${PLAYLIST_RETRY_DELAY_MS / 1000}s`);
-    console.log(`🎞️ hls retries=${HLS_MANIFEST_RETRIES} staleTtl=${HLS_STALE_MANIFEST_TTL_MS / 1000}s segmentRetries=${SEGMENT_UPSTREAM_RETRIES} rangeForward=1`);
+    console.log(`🎞️ hls retries=${HLS_MANIFEST_RETRIES} segmentRetries=${SEGMENT_UPSTREAM_RETRIES} rangeForward=1`);
     console.log(`📺 epg timezone=${EPG_TIME_ZONE} timeout=${EPG_REQUEST_TIMEOUT / 1000}s firstWait=${EPG_FIRST_CATALOG_WAIT_MS / 1000}s retryDelay=${EPG_RETRY_DELAY_MS / 1000}s cacheTTL=${EPG_CACHE_TTL / 1000}s refresh=${EPG_REFRESH_INTERVAL_MS / 1000}s preload=${EPG_PRELOAD_URLS.length} startupWatch=${EPG_STARTUP_WATCH_MS / 1000}s`);
     console.log(`📚 catalog preload=${CATALOG_PRELOAD_CONFIGS.length}`);
     console.log("=".repeat(60) + "\n");
