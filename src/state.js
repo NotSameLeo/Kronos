@@ -16,6 +16,8 @@ module.exports = {
     logoFailures: new Map(),
     manifestInflight: new Map(),
     segmentMaps: new Map(),
+    segmentMetadata: new Map(),
+    playbackSessions: new Map(),
     shortConfigs: null,
     updatingCatalog: new Set()
 };

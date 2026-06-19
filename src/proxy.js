@@ -8,6 +8,7 @@ const {
     hashKey,
     isHlsUrl,
     isHttpUrl,
+    redactUrl,
     routeBase,
     sleep,
     toAbsoluteUrl,
@@ -41,6 +42,7 @@ async function retryOperation(label, retries, delayMs, fn) {
 
 async function fetchUpstreamManifest(upstream) {
     return retryOperation("manifest", settings.HLS_MANIFEST_RETRIES, settings.HLS_MANIFEST_RETRY_DELAY_MS, async attempt => {
+        const startedAt = Date.now();
         const response = await axios.get(upstream, {
             responseType: "text",
             timeout: settings.HLS_REQUEST_TIMEOUT,
@@ -52,18 +54,41 @@ async function fetchUpstreamManifest(upstream) {
         const data = String(response.data || "");
         if (!data.trimStart().startsWith("#EXTM3U")) throw new Error("Invalid HLS manifest");
         if (attempt > 0) console.warn(`[PROXY M3U8 RECOVERED] attempt=${attempt + 1}`);
-        return { data, finalUrl: response.request?.res?.responseUrl || upstream };
+        return {
+            data,
+            finalUrl: response.request?.res?.responseUrl || upstream,
+            status: response.status,
+            upstreamMs: Date.now() - startedAt
+        };
     });
 }
 
-async function getRewrittenManifest(configKey, upstream, host, routeKey = configKey) {
+async function getRewrittenManifest(configKey, upstream, host, routeKey = configKey, req = null) {
     const key = hashKey(`${configKey}|${host}|${routeKey}|manifest|${upstream}`);
     if (state.manifestInflight.has(key)) return state.manifestInflight.get(key);
 
     const promise = (async () => {
+        const startedAt = Date.now();
         const fetched = await fetchUpstreamManifest(upstream);
+        const rewriteStartedAt = Date.now();
+        const text = rewriteManifest(fetched.data, fetched.finalUrl, host, configKey, upstream, routeKey);
+        const analysis = analyzeManifest(fetched.data, fetched.finalUrl);
+        logManifestEvent({
+            req,
+            configKey,
+            routeKey,
+            upstream,
+            finalUrl: fetched.finalUrl,
+            status: fetched.status,
+            upstreamMs: fetched.upstreamMs,
+            rewriteMs: Date.now() - rewriteStartedAt,
+            totalMs: Date.now() - startedAt,
+            bytes: fetched.data.length,
+            analysis
+        });
         return {
-            text: rewriteManifest(fetched.data, fetched.finalUrl, host, configKey, upstream, routeKey)
+            text,
+            analysis
         };
     })();
 
@@ -107,6 +132,24 @@ function getRememberedSegmentUrl(configKey, parentPlaylistUrl, identity) {
     return state.segmentMaps.get(segmentMapKey(configKey, parentPlaylistUrl))?.get(identity) || "";
 }
 
+function segmentMetadataMapKey(configKey, parentPlaylistUrl) {
+    return hashKey(`${configKey}|metadata|${parentPlaylistUrl}`);
+}
+
+function rememberSegmentMetadata(configKey, parentPlaylistUrl, metadata) {
+    if (!settings.HLS_DIAGNOSTICS || !isHttpUrl(parentPlaylistUrl) || !metadata?.identity) return;
+    const key = segmentMetadataMapKey(configKey, parentPlaylistUrl);
+    const map = state.segmentMetadata.get(key) || new Map();
+    map.set(metadata.identity, { ...metadata, seenAt: Date.now() });
+    while (map.size > 800) map.delete(map.keys().next().value);
+    state.segmentMetadata.set(key, map);
+}
+
+function getSegmentMetadata(configKey, parentPlaylistUrl, identity) {
+    if (!settings.HLS_DIAGNOSTICS || !identity) return null;
+    return state.segmentMetadata.get(segmentMetadataMapKey(configKey, parentPlaylistUrl))?.get(identity) || null;
+}
+
 function manifestProxyUrl(host, routeKey, url) {
     return `${routeBase(host, routeKey)}/proxy/live.m3u8?u=${encodeBase64Url(url)}`;
 }
@@ -128,11 +171,14 @@ function rewriteUriAttributes(line, baseUrl, makeUrl) {
 
 function rewriteManifest(text, baseUrl, host, configKey, parentPlaylistUrl = baseUrl, routeKey = configKey) {
     const isMaster = /#EXT-X-STREAM-INF/i.test(text);
+    const mediaSequence = readNumericTag(text, "#EXT-X-MEDIA-SEQUENCE");
+    let mediaIndex = 0;
     const rewriteTagUrl = url => isHlsUrl(url)
         ? manifestProxyUrl(host, routeKey, url)
         : segmentProxyUrl(host, routeKey, url, parentPlaylistUrl);
 
     const output = [];
+    let pendingDuration = null;
     for (const line of String(text || "").split(/\r?\n/)) {
         const trimmed = line.trim();
         if (!trimmed) {
@@ -141,6 +187,7 @@ function rewriteManifest(text, baseUrl, host, configKey, parentPlaylistUrl = bas
         }
 
         if (trimmed.startsWith("#")) {
+            if (/^#EXTINF:/i.test(trimmed)) pendingDuration = readExtinfDuration(trimmed);
             output.push(/URI=/i.test(trimmed) ? rewriteUriAttributes(line, baseUrl, rewriteTagUrl) : line);
             continue;
         }
@@ -152,14 +199,272 @@ function rewriteManifest(text, baseUrl, host, configKey, parentPlaylistUrl = bas
         }
 
         rememberSegmentUrl(configKey, parentPlaylistUrl, absolute);
+        const sequence = Number.isFinite(mediaSequence) ? mediaSequence + mediaIndex : null;
+        rememberSegmentMetadata(configKey, parentPlaylistUrl, {
+            identity: segmentIdentity(absolute),
+            sequence,
+            mediaIndex,
+            duration: pendingDuration,
+            urlHash: hashKey(absolute, 12)
+        });
+        mediaIndex++;
+        pendingDuration = null;
         output.push(segmentProxyUrl(host, routeKey, absolute, parentPlaylistUrl));
     }
 
     return output.join("\n");
 }
 
+function readNumericTag(text, tag) {
+    const pattern = new RegExp(`^${tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}:(\\d+)`, "im");
+    const value = Number((String(text || "").match(pattern) || [])[1]);
+    return Number.isFinite(value) ? value : null;
+}
+
+function readExtinfDuration(line) {
+    const value = Number((String(line || "").match(/^#EXTINF:([0-9.]+)/i) || [])[1]);
+    return Number.isFinite(value) ? value : null;
+}
+
+function analyzeManifest(text, baseUrl) {
+    const raw = String(text || "");
+    const lines = raw.split(/\r?\n/);
+    const isMaster = /#EXT-X-STREAM-INF/i.test(raw);
+    const mediaSequence = readNumericTag(raw, "#EXT-X-MEDIA-SEQUENCE");
+    const targetDuration = readNumericTag(raw, "#EXT-X-TARGETDURATION");
+    const discontinuitySequence = readNumericTag(raw, "#EXT-X-DISCONTINUITY-SEQUENCE");
+    let mediaIndex = 0;
+    let segmentCount = 0;
+    let variantCount = 0;
+    let keyCount = 0;
+    let mapCount = 0;
+    let totalDuration = 0;
+    let pendingDuration = null;
+    let firstSegment = null;
+    let lastSegment = null;
+    let firstVariant = null;
+    let lastVariant = null;
+
+    for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        if (/^#EXT-X-KEY/i.test(trimmed)) keyCount++;
+        if (/^#EXT-X-MAP/i.test(trimmed)) mapCount++;
+        if (/^#EXTINF:/i.test(trimmed)) {
+            pendingDuration = readExtinfDuration(trimmed);
+            continue;
+        }
+        if (trimmed.startsWith("#")) continue;
+
+        const absolute = toAbsoluteUrl(trimmed, baseUrl);
+        if (isMaster || isHlsUrl(absolute)) {
+            variantCount++;
+            const item = { urlHash: hashKey(absolute, 12), path: safePath(absolute) };
+            firstVariant ||= item;
+            lastVariant = item;
+            continue;
+        }
+
+        const sequence = Number.isFinite(mediaSequence) ? mediaSequence + mediaIndex : null;
+        const item = {
+            identity: segmentIdentity(absolute),
+            sequence,
+            mediaIndex,
+            duration: pendingDuration,
+            urlHash: hashKey(absolute, 12),
+            path: safePath(absolute)
+        };
+        segmentCount++;
+        mediaIndex++;
+        if (Number.isFinite(pendingDuration)) totalDuration += pendingDuration;
+        firstSegment ||= item;
+        lastSegment = item;
+        pendingDuration = null;
+    }
+
+    return {
+        kind: isMaster ? "master" : "media",
+        mediaSequence,
+        discontinuitySequence,
+        targetDuration,
+        segmentCount,
+        variantCount,
+        keyCount,
+        mapCount,
+        totalDuration: Math.round(totalDuration * 1000) / 1000,
+        firstSegment,
+        lastSegment,
+        firstVariant,
+        lastVariant,
+        endList: /#EXT-X-ENDLIST/i.test(raw)
+    };
+}
+
+function logManifestEvent(event) {
+    if (!settings.HLS_DIAGNOSTICS) return;
+    const analysis = event.analysis || {};
+    const first = analysis.firstSegment || analysis.firstVariant || null;
+    const last = analysis.lastSegment || analysis.lastVariant || null;
+    const fields = {
+        route: shortValue(event.routeKey),
+        cfg: hashKey(event.configKey, 10),
+        kind: analysis.kind,
+        status: event.status,
+        upstreamMs: event.upstreamMs,
+        rewriteMs: event.rewriteMs,
+        totalMs: event.totalMs,
+        bytes: event.bytes,
+        mediaSeq: valueOrDash(analysis.mediaSequence),
+        discSeq: valueOrDash(analysis.discontinuitySequence),
+        target: valueOrDash(analysis.targetDuration),
+        segs: analysis.segmentCount || 0,
+        variants: analysis.variantCount || 0,
+        keys: analysis.keyCount || 0,
+        maps: analysis.mapCount || 0,
+        duration: valueOrDash(analysis.totalDuration),
+        firstSeq: valueOrDash(first?.sequence),
+        lastSeq: valueOrDash(last?.sequence),
+        first: first?.urlHash || "-",
+        last: last?.urlHash || "-",
+        live: analysis.endList ? 0 : 1,
+        playerPositionKnown: 0,
+        playlist: hashKey(event.upstream, 12),
+        final: hashKey(event.finalUrl, 12),
+        ip: clientAddress(event.req),
+        ua: compactUserAgent(event.req)
+    };
+    if (settings.HLS_DIAGNOSTIC_URLS) {
+        fields.upstream = redactUrl(event.upstream);
+        fields.finalUrl = redactUrl(event.finalUrl);
+    }
+    console.log(`[HLS MANIFEST] ${formatFields(fields)}`);
+}
+
+function logSegmentRequest(context) {
+    if (!settings.HLS_DIAGNOSTICS) return;
+    const fields = {
+        sid: context.sessionKey,
+        route: shortValue(context.routeKey),
+        cfg: hashKey(context.configKey, 10),
+        seg: context.metadata?.urlHash || hashKey(context.upstream, 12),
+        seq: valueOrDash(context.metadata?.sequence),
+        idx: valueOrDash(context.metadata?.mediaIndex),
+        dur: valueOrDash(context.metadata?.duration),
+        movement: context.movement,
+        delta: valueOrDash(context.sequenceDelta),
+        sincePrevMs: valueOrDash(context.sincePreviousMs),
+        requests: context.session.requestCount,
+        repeats: context.session.repeats,
+        backtracks: context.session.backtracks,
+        range: context.range || "-",
+        parent: context.parentPlaylistUrl ? hashKey(context.parentPlaylistUrl, 12) : "-",
+        playerPositionKnown: 0,
+        ip: clientAddress(context.req),
+        ua: compactUserAgent(context.req)
+    };
+    if (settings.HLS_DIAGNOSTIC_URLS) fields.url = redactUrl(context.upstream);
+    if (settings.HLS_DIAGNOSTIC_HEADERS) fields.headers = headerSummary(context.req);
+    console.log(`[HLS SEG REQ] ${formatFields(fields)}`);
+}
+
+function logSegmentResult(context, response, options = {}) {
+    if (!settings.HLS_DIAGNOSTICS) return;
+    const fields = {
+        sid: context.sessionKey,
+        route: shortValue(context.routeKey),
+        seg: context.metadata?.urlHash || hashKey(context.upstream, 12),
+        seq: valueOrDash(context.metadata?.sequence),
+        movement: context.movement,
+        status: response.status,
+        upstreamMs: response.kronosUpstreamMs,
+        attempt: response.kronosAttempt,
+        healed: options.healed ? 1 : 0,
+        type: response.headers["content-type"] || "-",
+        len: response.headers["content-length"] || "-",
+        contentRange: response.headers["content-range"] || "-",
+        acceptRanges: response.headers["accept-ranges"] || "-",
+        cache: response.headers["cache-control"] || "-",
+        healedUrl: context.healedUrlHash || "-"
+    };
+    console.log(`[HLS SEG OK] ${formatFields(fields)}`);
+}
+
+function logSegmentError(context, err, options = {}) {
+    if (!settings.HLS_DIAGNOSTICS) return;
+    const fields = {
+        sid: context.sessionKey,
+        route: shortValue(context.routeKey),
+        seg: context.metadata?.urlHash || hashKey(context.upstream, 12),
+        seq: valueOrDash(context.metadata?.sequence),
+        movement: context.movement,
+        status: err?.response?.status || "-",
+        code: err?.code || "-",
+        healedAttempted: options.healedAttempted ? 1 : 0,
+        msg: compactMessage(err?.message || "segment error")
+    };
+    console.warn(`[HLS SEG ERR] ${formatFields(fields)}`);
+}
+
+function formatFields(fields) {
+    return Object.entries(fields)
+        .map(([key, value]) => `${key}=${quoteField(value)}`)
+        .join(" ");
+}
+
+function quoteField(value) {
+    const text = String(value === undefined || value === null || value === "" ? "-" : value);
+    return /[\s"]/u.test(text) ? JSON.stringify(text) : text;
+}
+
+function valueOrDash(value) {
+    return value === undefined || value === null || Number.isNaN(value) ? "-" : value;
+}
+
+function compactMessage(value) {
+    return String(value || "").replace(/\s+/g, " ").slice(0, 180);
+}
+
+function shortValue(value) {
+    const text = String(value || "");
+    if (!text) return "default";
+    return text.length > 24 ? `${text.slice(0, 12)}...${text.slice(-8)}` : text;
+}
+
+function userAgent(req) {
+    return String(req?.get?.("user-agent") || "");
+}
+
+function compactUserAgent(req) {
+    return userAgent(req).replace(/\s+/g, " ").slice(0, 90) || "-";
+}
+
+function clientAddress(req) {
+    const forwarded = String(req?.get?.("x-forwarded-for") || "").split(",")[0].trim();
+    return forwarded || req?.ip || req?.socket?.remoteAddress || "-";
+}
+
+function headerSummary(req) {
+    if (!req) return "-";
+    return JSON.stringify({
+        range: req.headers.range || "",
+        accept: req.headers.accept || "",
+        referer: req.headers.referer || "",
+        origin: req.headers.origin || ""
+    });
+}
+
+function safePath(value) {
+    try {
+        const parsed = new URL(value);
+        return parsed.pathname.split("/").filter(Boolean).slice(-2).join("/") || parsed.pathname;
+    } catch {
+        return "";
+    }
+}
+
 async function fetchSegmentStream(upstream, headers) {
     return retryOperation("segment", settings.SEGMENT_UPSTREAM_RETRIES, settings.SEGMENT_UPSTREAM_RETRY_DELAY_MS, async attempt => {
+        const startedAt = Date.now();
         const response = await axios.get(upstream, {
             responseType: "stream",
             timeout: settings.SEG_REQUEST_TIMEOUT,
@@ -172,6 +477,8 @@ async function fetchSegmentStream(upstream, headers) {
             validateStatus: status => status >= 200 && status < 300
         });
         if (attempt > 0) console.warn(`[PROXY SEG RECOVERED] attempt=${attempt + 1}`);
+        response.kronosUpstreamMs = Date.now() - startedAt;
+        response.kronosAttempt = attempt + 1;
         return response;
     });
 }
@@ -184,26 +491,90 @@ function isRecoverableSegmentError(err) {
 }
 
 async function fetchSegmentWithHealing(configKey, routeKey, upstream, headers, req) {
+    const context = buildSegmentContext(configKey, routeKey, upstream, headers, req);
+    logSegmentRequest(context);
     try {
-        return await fetchSegmentStream(upstream, headers);
+        const response = await fetchSegmentStream(upstream, headers);
+        logSegmentResult(context, response, { healed: false });
+        return response;
     } catch (err) {
         const parentPlaylistUrl = decodeBase64Url(req.query.p || "");
         const identity = String(req.query.s || segmentIdentity(upstream));
-        if (!settings.SEGMENT_TOKEN_HEALING || !isHttpUrl(parentPlaylistUrl) || !isRecoverableSegmentError(err)) throw err;
+        if (!settings.SEGMENT_TOKEN_HEALING || !isHttpUrl(parentPlaylistUrl) || !isRecoverableSegmentError(err)) {
+            logSegmentError(context, err, { healedAttempted: false });
+            throw err;
+        }
 
         try {
-            await getRewrittenManifest(configKey, parentPlaylistUrl, getPublicHost(req), routeKey);
+            await getRewrittenManifest(configKey, parentPlaylistUrl, getPublicHost(req), routeKey, req);
             const healedUrl = getRememberedSegmentUrl(configKey, parentPlaylistUrl, identity);
             if (healedUrl && healedUrl !== upstream) {
                 console.warn(`[PROXY SEG HEALED] status=${err?.response?.status || err?.code || "error"}`);
-                return fetchSegmentStream(healedUrl, headers);
+                const healedResponse = await fetchSegmentStream(healedUrl, headers);
+                logSegmentResult({ ...context, healedUrlHash: hashKey(healedUrl, 12) }, healedResponse, { healed: true });
+                return healedResponse;
             }
         } catch (healErr) {
             console.warn(`[PROXY SEG HEAL FAILED] ${healErr.message}`);
         }
 
+        logSegmentError(context, err, { healedAttempted: true });
         throw err;
     }
+}
+
+function buildSegmentContext(configKey, routeKey, upstream, headers, req) {
+    const parentPlaylistUrl = decodeBase64Url(req.query.p || "");
+    const identity = String(req.query.s || segmentIdentity(upstream));
+    const metadata = getSegmentMetadata(configKey, parentPlaylistUrl, identity);
+    const sessionKey = hashKey(`${routeKey}|${clientAddress(req)}|${userAgent(req)}|${parentPlaylistUrl}`, 16);
+    const previous = state.playbackSessions.get(sessionKey) || null;
+    const now = Date.now();
+    const sequence = Number.isFinite(metadata?.sequence) ? metadata.sequence : null;
+    let movement = "unknown";
+    let sequenceDelta = null;
+    if (Number.isFinite(sequence) && Number.isFinite(previous?.lastSequence)) {
+        sequenceDelta = sequence - previous.lastSequence;
+        if (sequenceDelta > 0) movement = "forward";
+        else if (sequenceDelta === 0) movement = "repeat";
+        else movement = "backtrack";
+    } else if (previous?.lastIdentity && previous.lastIdentity === identity) {
+        movement = "repeat";
+    }
+
+    const nextSession = {
+        lastIdentity: identity,
+        lastSequence: sequence,
+        lastAt: now,
+        requestCount: (previous?.requestCount || 0) + 1,
+        repeats: (previous?.repeats || 0) + (movement === "repeat" ? 1 : 0),
+        backtracks: (previous?.backtracks || 0) + (movement === "backtrack" ? 1 : 0)
+    };
+    state.playbackSessions.set(sessionKey, nextSession);
+    trimPlaybackSessions();
+
+    return {
+        configKey,
+        routeKey,
+        upstream,
+        parentPlaylistUrl,
+        identity,
+        metadata,
+        sessionKey,
+        previous,
+        session: nextSession,
+        movement,
+        sequenceDelta,
+        range: headers.Range || "",
+        sincePreviousMs: previous?.lastAt ? now - previous.lastAt : null,
+        req
+    };
+}
+
+function trimPlaybackSessions() {
+    if (state.playbackSessions.size <= 200) return;
+    const entries = [...state.playbackSessions.entries()].sort((a, b) => (a[1].lastAt || 0) - (b[1].lastAt || 0));
+    for (const [key] of entries.slice(0, state.playbackSessions.size - 200)) state.playbackSessions.delete(key);
 }
 
 function copyResponseHeaders(upstreamResponse, res) {
@@ -222,6 +593,7 @@ function copyResponseHeaders(upstreamResponse, res) {
 
 module.exports = {
     RELAY_HEADERS,
+    analyzeManifest,
     copyResponseHeaders,
     decodeProxyUrl: decodeBase64Url,
     fetchSegmentWithHealing,

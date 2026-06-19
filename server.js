@@ -112,6 +112,7 @@ app.listen(settings.PORT, "0.0.0.0", () => {
     console.log(`http://0.0.0.0:${settings.PORT}`);
     console.log(`Node ${process.version}`);
     console.log(`playback=${settings.PLAYBACK_MODE} playerPositionKnown=0 remux=0 vpn=0`);
+    console.log(`hlsDiagnostics=${settings.HLS_DIAGNOSTICS ? 1 : 0} diagnosticUrls=${settings.HLS_DIAGNOSTIC_URLS ? 1 : 0} diagnosticHeaders=${settings.HLS_DIAGNOSTIC_HEADERS ? 1 : 0}`);
     console.log(`hlsTimeout=${settings.HLS_REQUEST_TIMEOUT / 1000}s segmentTimeout=${settings.SEG_REQUEST_TIMEOUT / 1000}s`);
     console.log(`manifestRetries=${settings.HLS_MANIFEST_RETRIES} segmentRetries=${settings.SEGMENT_UPSTREAM_RETRIES}`);
     console.log(`tokenHealing=${settings.SEGMENT_TOKEN_HEALING ? 1 : 0} rangeForward=1`);
@@ -371,7 +372,7 @@ async function proxyManifestResponse(req, res) {
         const { configKey, routeKey } = getRequestConfig(req);
         const upstream = decodeProxyUrl(req.query.u || "");
         if (!isHttpUrl(upstream)) return res.status(400).type("text/plain").send("#EXTM3U\n");
-        const manifest = await getRewrittenManifest(configKey, upstream, getPublicHost(req), routeKey);
+        const manifest = await getRewrittenManifest(configKey, upstream, getPublicHost(req), routeKey, req);
         setPlaylistHeaders(res);
         res.setHeader("X-Kronos-Relay", "1");
         res.send(manifest.text);
@@ -515,7 +516,10 @@ function buildStats(configKey) {
             resolutionLimit: false,
             segmentTokenHealing: settings.SEGMENT_TOKEN_HEALING,
             manifestRetries: settings.HLS_MANIFEST_RETRIES,
-            segmentRetries: settings.SEGMENT_UPSTREAM_RETRIES
+            segmentRetries: settings.SEGMENT_UPSTREAM_RETRIES,
+            hlsDiagnostics: settings.HLS_DIAGNOSTICS,
+            hlsDiagnosticUrls: settings.HLS_DIAGNOSTIC_URLS,
+            hlsDiagnosticHeaders: settings.HLS_DIAGNOSTIC_HEADERS
         }
     };
 }

@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { rewriteManifest, segmentIdentity } = require("../src/proxy");
+const { analyzeManifest, rewriteManifest, segmentIdentity } = require("../src/proxy");
 
 test("rewriteManifest relays media playlist URLs without live-edge rules", () => {
     const upstream = "http://upstream.example/live/index.m3u8?token=abc";
@@ -48,4 +48,26 @@ test("segmentIdentity ignores volatile token parameters", () => {
     const first = segmentIdentity("http://cdn.example/path/seg.ts?token=old&track=a&expires=1");
     const second = segmentIdentity("http://cdn.example/path/seg.ts?token=new&track=a&expires=2");
     assert.equal(first, second);
+});
+
+test("analyzeManifest exposes live sequence diagnostics", () => {
+    const text = [
+        "#EXTM3U",
+        "#EXT-X-TARGETDURATION:6",
+        "#EXT-X-MEDIA-SEQUENCE:100",
+        "#EXTINF:6,",
+        "seg100.ts",
+        "#EXTINF:6,",
+        "seg101.ts"
+    ].join("\n");
+
+    const analysis = analyzeManifest(text, "http://upstream.example/live/index.m3u8");
+    assert.equal(analysis.kind, "media");
+    assert.equal(analysis.mediaSequence, 100);
+    assert.equal(analysis.targetDuration, 6);
+    assert.equal(analysis.segmentCount, 2);
+    assert.equal(analysis.firstSegment.sequence, 100);
+    assert.equal(analysis.lastSegment.sequence, 101);
+    assert.equal(analysis.totalDuration, 12);
+    assert.equal(analysis.endList, false);
 });

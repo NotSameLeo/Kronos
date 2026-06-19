@@ -18,7 +18,7 @@ function parseList(raw) {
 const FRONTEND_PRELOAD_FILE = String(process.env.FRONTEND_PRELOAD_FILE || "").trim();
 
 module.exports = {
-    RELEASE_VERSION: "5.0.0",
+    RELEASE_VERSION: "5.1.0",
     ADDON_TYPE: "tv",
     PLAYBACK_MODE: "plain-hls-relay",
     PORT: process.env.PORT || 7000,
@@ -47,6 +47,9 @@ module.exports = {
     SEGMENT_UPSTREAM_RETRIES: numberEnv("SEGMENT_UPSTREAM_RETRIES", 2, 0),
     SEGMENT_UPSTREAM_RETRY_DELAY_MS: numberEnv("SEGMENT_UPSTREAM_RETRY_DELAY_MS", 500, 0),
     SEGMENT_TOKEN_HEALING: String(process.env.SEGMENT_TOKEN_HEALING || "1") !== "0",
+    HLS_DIAGNOSTICS: String(process.env.HLS_DIAGNOSTICS || "1") !== "0",
+    HLS_DIAGNOSTIC_HEADERS: String(process.env.HLS_DIAGNOSTIC_HEADERS || "0") === "1",
+    HLS_DIAGNOSTIC_URLS: String(process.env.HLS_DIAGNOSTIC_URLS || "0") === "1",
 
     PLAYLIST_REQUEST_TIMEOUT: numberEnv("PLAYLIST_REQUEST_TIMEOUT", 20000, 1),
     PLAYLIST_RETRY_WINDOW_MS: numberEnv("PLAYLIST_RETRY_WINDOW_MS", 30000, 1),
