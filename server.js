@@ -1706,14 +1706,14 @@ async function fetchUpstreamManifest(upstream) {
     });
 }
 
-async function getRewrittenManifest(configKey, upstream, host) {
-    const key = hlsManifestCacheKey(configKey, upstream);
+async function getRewrittenManifest(configKey, upstream, host, routeKey = configKey) {
+    const key = hashKey(`${configKey}|${host}|${routeKey}|manifest|${upstream}`);
     if (memoryCache.hlsManifestInflight[key]) return memoryCache.hlsManifestInflight[key];
 
     const promise = (async () => {
         try {
             const fetched = await fetchUpstreamManifest(upstream);
-            const text = rewriteManifest(fetched.data, fetched.finalUrl, host, configKey, upstream);
+            const text = rewriteManifest(fetched.data, fetched.finalUrl, host, configKey, upstream, routeKey);
             memoryCache.hlsManifestData[key] = { text, updatedAt: Date.now(), upstream };
             return { text, stale: false };
         } catch (err) {
@@ -1751,7 +1751,7 @@ function isRecoverableSegmentError(err) {
     return ["ECONNABORTED", "ECONNRESET", "EPIPE", "ETIMEDOUT"].includes(err?.code);
 }
 
-async function fetchSegmentWithHealing(configKey, upstream, headers, req) {
+async function fetchSegmentWithHealing(configKey, routeKey, upstream, headers, req) {
     try {
         return await fetchSegmentStream(upstream, headers);
     } catch (err) {
@@ -1760,7 +1760,7 @@ async function fetchSegmentWithHealing(configKey, upstream, headers, req) {
         if (!SEGMENT_TOKEN_HEALING || !isHttpUrl(parentPlaylistUrl) || !isRecoverableSegmentError(err)) throw err;
 
         try {
-            await getRewrittenManifest(configKey, parentPlaylistUrl, getPublicHost(req));
+            await getRewrittenManifest(configKey, parentPlaylistUrl, getPublicHost(req), routeKey);
             const healedUrl = getRememberedSegmentUrl(configKey, parentPlaylistUrl, identity);
             if (healedUrl && healedUrl !== upstream) {
                 console.warn(`[PROXY SEG HEALED] status=${err?.response?.status || err?.code || "error"}`);
@@ -1781,11 +1781,11 @@ function segmentProxyUrl(host, configKey, abs, parentPlaylistUrl = "", sequence 
         params.set("s", segmentIdentity(abs));
     }
     if (Number.isFinite(sequence)) params.set("q", String(sequence));
-    return `${host}/${configKey}/proxy/seg?${params.toString()}`;
+    return `${routeBase(host, configKey)}/proxy/seg?${params.toString()}`;
 }
 
 function manifestProxyUrl(host, configKey, abs) {
-    return `${host}/${configKey}/proxy/live.m3u8?u=${encodeProxyUrl(abs)}`;
+    return `${routeBase(host, configKey)}/proxy/live.m3u8?u=${encodeProxyUrl(abs)}`;
 }
 
 function rewriteUriAttributes(line, baseUrl, makeUrl) {
@@ -2000,7 +2000,7 @@ function rewritePreambleForSegments(preamble, segments, baseUrl, makeSegmentUrl)
     return out;
 }
 
-function rewriteMediaManifest(text, baseUrl, host, configKey, parentPlaylistUrl = baseUrl) {
+function rewriteMediaManifest(text, baseUrl, host, configKey, parentPlaylistUrl = baseUrl, routeKey = configKey) {
     const parsed = parseMediaPlaylist(text);
     for (const segment of parsed.segments) {
         if (segment.uri) rememberSegmentUrl(configKey, parentPlaylistUrl, toAbsoluteUrl(segment.uri, baseUrl));
@@ -2014,7 +2014,7 @@ function rewriteMediaManifest(text, baseUrl, host, configKey, parentPlaylistUrl 
     );
     rememberManifestWindow(configKey, parentPlaylistUrl, stableSegments, parsed.targetDuration, parsed.isEnded);
 
-    const makeSegmentUrl = abs => segmentProxyUrl(host, configKey, abs, parentPlaylistUrl);
+    const makeSegmentUrl = abs => segmentProxyUrl(host, routeKey, abs, parentPlaylistUrl);
     const out = rewritePreambleForSegments(parsed.preamble, stableSegments, baseUrl, makeSegmentUrl);
 
     if (!parsed.isEnded && HLS_INJECT_START_OFFSET && PROXY_START_OFFSET_SECONDS > 0) {
@@ -2028,7 +2028,7 @@ function rewriteMediaManifest(text, baseUrl, host, configKey, parentPlaylistUrl 
             if (t.startsWith("#")) {
                 out.push(rewriteUriAttributes(line, baseUrl, makeSegmentUrl));
             } else {
-                out.push(segmentProxyUrl(host, configKey, toAbsoluteUrl(t, baseUrl), parentPlaylistUrl, segment.sequence));
+                out.push(segmentProxyUrl(host, routeKey, toAbsoluteUrl(t, baseUrl), parentPlaylistUrl, segment.sequence));
             }
         }
     }
@@ -2044,10 +2044,10 @@ function rewriteMediaManifest(text, baseUrl, host, configKey, parentPlaylistUrl 
 // Rewrite an upstream HLS manifest so every URL points back through our relay.
 // Master variants are kept as manifests; media segments and key URIs go through
 // /proxy/seg with enough parent context to recover if the provider rotates tokens.
-function rewriteManifest(text, baseUrl, host, configKey, parentPlaylistUrl = baseUrl) {
+function rewriteManifest(text, baseUrl, host, configKey, parentPlaylistUrl = baseUrl, routeKey = configKey) {
     const isMaster = /#EXT-X-STREAM-INF/i.test(text);
     if (!isMaster && /#EXTINF:/i.test(text)) {
-        return rewriteMediaManifest(text, baseUrl, host, configKey, parentPlaylistUrl);
+        return rewriteMediaManifest(text, baseUrl, host, configKey, parentPlaylistUrl, routeKey);
     }
 
     const out = [];
@@ -2056,24 +2056,24 @@ function rewriteManifest(text, baseUrl, host, configKey, parentPlaylistUrl = bas
         if (!t) { out.push(line); continue; }
         if (t.startsWith("#")) {
             out.push(/URI=/i.test(t)
-                ? rewriteUriAttributes(line, baseUrl, abs => segmentProxyUrl(host, configKey, abs, parentPlaylistUrl))
+                ? rewriteUriAttributes(line, baseUrl, abs => segmentProxyUrl(host, routeKey, abs, parentPlaylistUrl))
                 : line);
             continue;
         }
         const abs = toAbsoluteUrl(t, baseUrl);
-        if (isMaster || isHlsUrl(abs)) { out.push(manifestProxyUrl(host, configKey, abs)); continue; }
-        out.push(segmentProxyUrl(host, configKey, abs, parentPlaylistUrl));
+        if (isMaster || isHlsUrl(abs)) { out.push(manifestProxyUrl(host, routeKey, abs)); continue; }
+        out.push(segmentProxyUrl(host, routeKey, abs, parentPlaylistUrl));
     }
     return out.join("\n");
 }
 
 // Relay (and rewrite) an HLS manifest.
 async function proxyManifestResponse(req, res) {
-    const { configKey } = getRequestConfig(req);
+    const { configKey, routeKey } = getRequestConfig(req);
     try {
         const upstream = decodeProxyUrl(req.query.u || "");
         if (!isHttpUrl(upstream)) return res.status(400).type("text/plain").send("#EXTM3U\n");
-        const manifest = await getRewrittenManifest(configKey, upstream, getPublicHost(req));
+        const manifest = await getRewrittenManifest(configKey, upstream, getPublicHost(req), routeKey);
         setPlaylistHeaders(res);
         res.setHeader("X-Kronos-Relay", "1");
         res.setHeader("X-Kronos-Cache", manifest.stale ? "stale" : "fresh");
@@ -2091,7 +2091,7 @@ app.get("/:base64Config/proxy/live.m3u8", proxyManifestResponse);
 // Relay a segment (or any raw stream) byte-for-byte, forwarding Range for seeking.
 async function proxySegmentResponse(req, res) {
     try {
-        const { configKey } = getRequestConfig(req);
+        const { configKey, routeKey } = getRequestConfig(req);
         const upstream = decodeProxyUrl(req.query.u || "");
         if (!isHttpUrl(upstream)) return res.status(400).end();
         const parentPlaylistUrl = decodeProxyUrl(req.query.p || "");
@@ -2100,7 +2100,7 @@ async function proxySegmentResponse(req, res) {
         rememberEdgeSegmentRequest(configKey, parentPlaylistUrl, sequence);
         const headers = { ...RELAY_HEADERS };
         if (req.headers.range) headers.Range = req.headers.range;
-        const r = await fetchSegmentWithHealing(configKey, upstream, headers, req);
+        const r = await fetchSegmentWithHealing(configKey, routeKey, upstream, headers, req);
         res.status(r.status);
         for (const h of ["content-type", "content-length", "content-range", "accept-ranges", "last-modified", "etag"]) {
             if (r.headers[h]) res.setHeader(h, r.headers[h]);
