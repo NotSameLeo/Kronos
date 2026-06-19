@@ -1,0 +1,21 @@
+module.exports = {
+    channels: new Map(),
+    channelIndex: new Map(),
+    channelInflight: new Map(),
+    lastCatalogUpdate: new Map(),
+    configByKey: new Map(),
+    epgData: new Map(),
+    epgLastUpdate: new Map(),
+    epgInflight: new Map(),
+    epgRetryTimers: new Map(),
+    epgRefreshTimers: new Map(),
+    epgStatus: new Map(),
+    epgSubscribers: new Map(),
+    epgMatchStats: new Map(),
+    logoData: new Map(),
+    logoFailures: new Map(),
+    manifestInflight: new Map(),
+    segmentMaps: new Map(),
+    shortConfigs: null,
+    updatingCatalog: new Set()
+};
