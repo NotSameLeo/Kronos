@@ -137,6 +137,66 @@ async function fetchStableManifest(context) {
     }
 }
 
+async function fetchPlayableManifest(context) {
+    const stable = await fetchStableManifest(context);
+    return waitForLiveEdgeBatch(context, stable);
+}
+
+async function waitForLiveEdgeBatch(context, manifest) {
+    let current = manifest;
+    let holdStartedAt = 0;
+    let attempts = 0;
+    let lastDecision = null;
+
+    while (true) {
+        const decision = detectLiveEdgeBatchHold(context, current.analysis);
+        if (!decision) {
+            rememberLiveEdgeBatchWindow(context, current.analysis);
+            if (attempts > 0) {
+                logLiveEdgeBatchRelease(context, {
+                    attempts,
+                    holdMs: holdStartedAt ? Date.now() - holdStartedAt : 0,
+                    reason: "ready",
+                    lastDecision
+                });
+            }
+            return {
+                ...current,
+                edgeHoldAttempts: attempts,
+                edgeHoldMs: holdStartedAt ? Date.now() - holdStartedAt : 0
+            };
+        }
+
+        lastDecision = decision;
+        if (!holdStartedAt) holdStartedAt = Date.now();
+        const waitMs = nextLiveEdgeBatchDelay(holdStartedAt);
+        if (waitMs <= 0) {
+            rememberLiveEdgeBatchWindow(context, current.analysis);
+            logLiveEdgeBatchRelease(context, {
+                attempts,
+                holdMs: Date.now() - holdStartedAt,
+                reason: "timeout",
+                lastDecision
+            });
+            return {
+                ...current,
+                edgeHoldAttempts: attempts,
+                edgeHoldMs: Date.now() - holdStartedAt
+            };
+        }
+
+        logLiveEdgeBatchHold(context, {
+            ...decision,
+            attempts,
+            waitMs,
+            elapsedMs: Date.now() - holdStartedAt
+        });
+        await sleep(waitMs);
+        attempts++;
+        current = await fetchStableManifest(context);
+    }
+}
+
 async function getRewrittenManifest(configKey, upstream, host, routeKey = configKey, req = null) {
     const key = hashKey(`${configKey}|${host}|${routeKey}|manifest|${upstream}`);
     if (state.manifestInflight.has(key)) return state.manifestInflight.get(key);
@@ -144,7 +204,7 @@ async function getRewrittenManifest(configKey, upstream, host, routeKey = config
     const promise = (async () => {
         const startedAt = Date.now();
         const blockOfflinePlaceholders = req?.query?.pg !== "0";
-        const { fetched, analysis, holdAttempts, holdMs } = await fetchStableManifest({
+        const { fetched, analysis, holdAttempts, holdMs, edgeHoldAttempts, edgeHoldMs } = await fetchPlayableManifest({
             req,
             configKey,
             routeKey,
@@ -171,7 +231,9 @@ async function getRewrittenManifest(configKey, upstream, host, routeKey = config
             bytes: fetched.data.length,
             analysis,
             holdAttempts,
-            holdMs
+            holdMs,
+            edgeHoldAttempts,
+            edgeHoldMs
         });
         return {
             text,
@@ -502,6 +564,85 @@ function detectLiveManifestInstability(previous, analysis, now = Date.now()) {
     return null;
 }
 
+function liveEdgeBatchKey(context) {
+    return hashKey(`${context.routeKey}|${clientAddress(context.req)}|${userAgent(context.req)}|${context.upstream}|edge-batch`, 20);
+}
+
+function playbackSessionForManifest(context) {
+    const key = hashKey(`${context.routeKey}|${clientAddress(context.req)}|${userAgent(context.req)}|${context.upstream}`, 16);
+    return state.playbackSessions.get(key) || null;
+}
+
+function exposedLiveEdgeFromAnalysis(analysis) {
+    if (!analysis || analysis.kind !== "media" || analysis.endList) return null;
+    if (!Number.isFinite(analysis.lastSegment?.sequence) || !Number.isFinite(analysis.firstSegment?.sequence)) return null;
+    const removeCount = estimateLiveEdgeRemovedSegments(analysis);
+    const availableSegments = Math.max(0, (analysis.segmentCount || 0) - removeCount);
+    if (availableSegments <= 0) return null;
+    return {
+        firstSeq: analysis.firstSegment.sequence,
+        lastSeq: analysis.lastSegment.sequence - removeCount,
+        removed: removeCount,
+        availableSegments,
+        targetDuration: Number(analysis.targetDuration || 0) || averageSegmentDuration(analysis) || 10
+    };
+}
+
+function estimateLiveEdgeRemovedSegments(analysis) {
+    if (settings.HLS_LIVE_EDGE_DELAY_SECONDS <= 0 || analysis.endList) return 0;
+    const segmentCount = analysis.segmentCount || 0;
+    const removable = Math.max(0, segmentCount - settings.HLS_LIVE_EDGE_MIN_SEGMENTS);
+    if (!removable) return 0;
+    const segmentSeconds = Number(analysis.targetDuration || 0) || averageSegmentDuration(analysis) || 10;
+    return Math.min(removable, Math.ceil(settings.HLS_LIVE_EDGE_DELAY_SECONDS / segmentSeconds));
+}
+
+function averageSegmentDuration(analysis) {
+    const count = Number(analysis?.segmentCount || 0);
+    const duration = Number(analysis?.totalDuration || 0);
+    return count > 0 && duration > 0 ? duration / count : 0;
+}
+
+function detectLiveEdgeBatchHold(context, analysis, now = Date.now()) {
+    if (settings.HLS_LIVE_EDGE_BATCH_SEGMENTS <= 1 || settings.HLS_LIVE_EDGE_BATCH_HOLD_MS <= 0) return null;
+    const edge = exposedLiveEdgeFromAnalysis(analysis);
+    if (!edge) return null;
+    const playback = playbackSessionForManifest(context);
+    if (!Number.isFinite(playback?.lastSequence) || !Number.isFinite(playback?.lastAt)) return null;
+    const maxSessionAgeMs = Math.max(30000, edge.targetDuration * 3000);
+    if (now - playback.lastAt > maxSessionAgeMs) return null;
+    if (playback.lastSequence < edge.firstSeq || playback.lastSequence > edge.lastSeq) return null;
+
+    const availableAhead = edge.lastSeq - playback.lastSequence;
+    if (availableAhead >= settings.HLS_LIVE_EDGE_BATCH_SEGMENTS) return null;
+
+    return {
+        reason: "edge-batch",
+        availableAhead,
+        neededAhead: settings.HLS_LIVE_EDGE_BATCH_SEGMENTS,
+        playerSeq: playback.lastSequence,
+        exposedFirstSeq: edge.firstSeq,
+        exposedLastSeq: edge.lastSeq,
+        availableSegments: edge.availableSegments
+    };
+}
+
+function rememberLiveEdgeBatchWindow(context, analysis) {
+    const edge = exposedLiveEdgeFromAnalysis(analysis);
+    if (!edge) return;
+    state.liveEdgeWindows.set(liveEdgeBatchKey(context), {
+        ...edge,
+        seenAt: Date.now()
+    });
+    trimLiveEdgeBatchWindows();
+}
+
+function trimLiveEdgeBatchWindows() {
+    if (state.liveEdgeWindows.size <= 500) return;
+    const entries = [...state.liveEdgeWindows.entries()].sort((a, b) => (a[1].seenAt || 0) - (b[1].seenAt || 0));
+    for (const [key] of entries.slice(0, state.liveEdgeWindows.size - 500)) state.liveEdgeWindows.delete(key);
+}
+
 function manifestStabilityError(message, reason) {
     const err = new Error(message);
     err.statusCode = 503;
@@ -537,6 +678,13 @@ function nextManifestHoldDelay(holdStartedAt) {
     return Math.min(settings.HLS_MANIFEST_STABILITY_RETRY_DELAY_MS, remaining);
 }
 
+function nextLiveEdgeBatchDelay(holdStartedAt) {
+    if (settings.HLS_LIVE_EDGE_BATCH_HOLD_MS <= 0) return 0;
+    const remaining = settings.HLS_LIVE_EDGE_BATCH_HOLD_MS - (Date.now() - holdStartedAt);
+    if (remaining <= 0) return 0;
+    return Math.min(settings.HLS_MANIFEST_STABILITY_RETRY_DELAY_MS, remaining);
+}
+
 function logManifestEvent(event) {
     if (!settings.HLS_DIAGNOSTICS) return;
     const analysis = event.analysis || {};
@@ -568,6 +716,8 @@ function logManifestEvent(event) {
         blockReason: event.blockReason || "-",
         holdAttempts: valueOrDash(event.holdAttempts),
         holdMs: valueOrDash(event.holdMs),
+        edgeHoldAttempts: valueOrDash(event.edgeHoldAttempts),
+        edgeHoldMs: valueOrDash(event.edgeHoldMs),
         playerPositionKnown: 0,
         playlist: hashKey(event.upstream, 12),
         final: hashKey(event.finalUrl, 12),
@@ -606,6 +756,45 @@ function logManifestHoldRecovered(context, info) {
         holdMs: info.holdMs,
         mediaSeq: valueOrDash(info.mediaSeq),
         lastSeq: valueOrDash(info.lastSeq),
+        playlist: hashKey(context.upstream, 12),
+        ip: clientAddress(context.req),
+        ua: compactUserAgent(context.req)
+    })}`);
+}
+
+function logLiveEdgeBatchHold(context, info) {
+    if (!settings.HLS_DIAGNOSTICS) return;
+    console.warn(`[HLS EDGE HOLD] ${formatFields({
+        route: shortValue(context.routeKey),
+        cfg: hashKey(context.configKey, 10),
+        reason: info.reason,
+        playerSeq: valueOrDash(info.playerSeq),
+        exposedFirstSeq: valueOrDash(info.exposedFirstSeq),
+        exposedLastSeq: valueOrDash(info.exposedLastSeq),
+        availableAhead: valueOrDash(info.availableAhead),
+        neededAhead: valueOrDash(info.neededAhead),
+        attempts: info.attempts,
+        waitMs: info.waitMs,
+        elapsedMs: info.elapsedMs,
+        playlist: hashKey(context.upstream, 12),
+        ip: clientAddress(context.req),
+        ua: compactUserAgent(context.req)
+    })}`);
+}
+
+function logLiveEdgeBatchRelease(context, info) {
+    if (!settings.HLS_DIAGNOSTICS) return;
+    const decision = info.lastDecision || {};
+    console.warn(`[HLS EDGE RELEASE] ${formatFields({
+        route: shortValue(context.routeKey),
+        cfg: hashKey(context.configKey, 10),
+        reason: info.reason,
+        attempts: info.attempts,
+        holdMs: info.holdMs,
+        playerSeq: valueOrDash(decision.playerSeq),
+        exposedLastSeq: valueOrDash(decision.exposedLastSeq),
+        availableAhead: valueOrDash(decision.availableAhead),
+        neededAhead: valueOrDash(decision.neededAhead),
         playlist: hashKey(context.upstream, 12),
         ip: clientAddress(context.req),
         ua: compactUserAgent(context.req)
@@ -1038,6 +1227,8 @@ module.exports = {
     copyResponseHeaders,
     decodeProxyUrl: decodeBase64Url,
     detectLiveManifestInstability,
+    detectLiveEdgeBatchHold,
+    exposedLiveEdgeFromAnalysis,
     fetchSegmentWithHealing,
     getRewrittenManifest,
     closeUpstreamResponse,

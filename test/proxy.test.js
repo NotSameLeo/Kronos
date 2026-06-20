@@ -2,7 +2,9 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
     analyzeManifest,
+    detectLiveEdgeBatchHold,
     detectLiveManifestInstability,
+    exposedLiveEdgeFromAnalysis,
     isOfflinePlaceholderManifest,
     manifestWindowFromAnalysis,
     rewriteManifest,
@@ -189,4 +191,42 @@ test("live manifest stability detects same-sequence segment forks", () => {
     const previous = manifestWindowFromAnalysis(first, 1000);
     const instability = detectLiveManifestInstability(previous, forked, 2000);
     assert.equal(instability.reason, "sequence-fork");
+});
+
+test("live edge batching holds only when the player is near the exposed edge", () => {
+    const analysis = analyzeManifest([
+        "#EXTM3U",
+        "#EXT-X-TARGETDURATION:10",
+        "#EXT-X-MEDIA-SEQUENCE:100",
+        "#EXTINF:10,",
+        "seg100.ts",
+        "#EXTINF:10,",
+        "seg101.ts",
+        "#EXTINF:10,",
+        "seg102.ts",
+        "#EXTINF:10,",
+        "seg103.ts",
+        "#EXTINF:10,",
+        "seg104.ts",
+        "#EXTINF:10,",
+        "seg105.ts"
+    ].join("\n"), "http://upstream.example/live/index.m3u8");
+    const edge = exposedLiveEdgeFromAnalysis(analysis);
+    assert.equal(edge.lastSeq, 102);
+
+    const context = {
+        routeKey: "route",
+        upstream: "http://upstream.example/live/index.m3u8",
+        req: {
+            ip: "127.0.0.1",
+            get: name => name === "user-agent" ? "KSPlayer" : ""
+        }
+    };
+    const state = require("../src/state");
+    const sessionKey = require("../src/utils").hashKey("route|127.0.0.1|KSPlayer|http://upstream.example/live/index.m3u8", 16);
+    state.playbackSessions.set(sessionKey, { lastSequence: 101, lastAt: Date.now() });
+    assert.equal(detectLiveEdgeBatchHold(context, analysis).availableAhead, 1);
+
+    state.playbackSessions.set(sessionKey, { lastSequence: 100, lastAt: Date.now() });
+    assert.equal(detectLiveEdgeBatchHold(context, analysis), null);
 });

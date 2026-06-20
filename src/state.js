@@ -16,6 +16,7 @@ module.exports = {
     logoFailures: new Map(),
     manifestInflight: new Map(),
     manifestWindows: new Map(),
+    liveEdgeWindows: new Map(),
     segmentMaps: new Map(),
     segmentMetadata: new Map(),
     playbackSessions: new Map(),
