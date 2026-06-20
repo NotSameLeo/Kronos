@@ -1,6 +1,13 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { analyzeManifest, isOfflinePlaceholderManifest, rewriteManifest, segmentIdentity } = require("../src/proxy");
+const {
+    analyzeManifest,
+    detectLiveManifestInstability,
+    isOfflinePlaceholderManifest,
+    manifestWindowFromAnalysis,
+    rewriteManifest,
+    segmentIdentity
+} = require("../src/proxy");
 
 test("rewriteManifest relays media playlist URLs without live-edge rules", () => {
     const upstream = "http://upstream.example/live/index.m3u8?token=abc";
@@ -137,4 +144,49 @@ test("isOfflinePlaceholderManifest detects short ended slate playlists", () => {
 
     assert.equal(isOfflinePlaceholderManifest(placeholder), true);
     assert.equal(isOfflinePlaceholderManifest(liveStartup), false);
+});
+
+test("live manifest stability ignores token rotation for the same segment window", () => {
+    const first = analyzeManifest([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:10",
+        "#EXTINF:10,",
+        "seg10.ts?token=old",
+        "#EXTINF:10,",
+        "seg11.ts?token=old"
+    ].join("\n"), "http://upstream.example/live/index.m3u8");
+    const second = analyzeManifest([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:10",
+        "#EXTINF:10,",
+        "seg10.ts?token=new",
+        "#EXTINF:10,",
+        "seg11.ts?token=new"
+    ].join("\n"), "http://upstream.example/live/index.m3u8");
+
+    const previous = manifestWindowFromAnalysis(first, 1000);
+    assert.equal(detectLiveManifestInstability(previous, second, 2000), null);
+});
+
+test("live manifest stability detects same-sequence segment forks", () => {
+    const first = analyzeManifest([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:20",
+        "#EXTINF:10,",
+        "real20.ts",
+        "#EXTINF:10,",
+        "real21.ts"
+    ].join("\n"), "http://upstream.example/live/index.m3u8");
+    const forked = analyzeManifest([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:20",
+        "#EXTINF:10,",
+        "fallback20.ts",
+        "#EXTINF:10,",
+        "fallback21.ts"
+    ].join("\n"), "http://upstream.example/live/index.m3u8");
+
+    const previous = manifestWindowFromAnalysis(first, 1000);
+    const instability = detectLiveManifestInstability(previous, forked, 2000);
+    assert.equal(instability.reason, "sequence-fork");
 });

@@ -437,15 +437,15 @@ function addNormalizedEpgKey(keys, value) {
     if (key.startsWith("discovery") && key.length > "discovery".length) keys.add(key.slice("discovery".length));
 }
 
-function findEpgMatch(epgData, channel) {
+function findEpgMatch(epgData, channel, at = new Date()) {
     if (!epgData?.byKey) return null;
     for (const key of getEpgMatchKeys([channel.tvgId, channel.name])) {
         const entries = epgData.byKey.get(key);
         if (!entries?.length) continue;
-        const entry = entries.find(item => formatEpgDescription(item.programmes));
+        const entry = entries.find(item => item.programmes?.length);
         if (entry) return {
             ...entry,
-            description: formatEpgDescription(entry.programmes),
+            description: formatEpgDescription(entry.programmes, at),
             programmes: entry.programmes
         };
     }
@@ -456,7 +456,7 @@ function withCurrentEPG(channel, epgData = null, at = new Date()) {
     if (!channel) return null;
     const epg = channel.epgProgrammes?.length
         ? { id: channel.epgId || null, programmes: channel.epgProgrammes }
-        : findEpgMatch(epgData, channel);
+        : findEpgMatch(epgData, channel, at);
     if (!epg?.programmes?.length) return { ...channel, description: "" };
     return {
         ...channel,
@@ -470,10 +470,10 @@ function withCurrentEPGForChannels(channels, epgData = null, at = new Date()) {
     return (Array.isArray(channels) ? channels : []).map(channel => withCurrentEPG(channel, epgData, at));
 }
 
-function attachEPGToChannels(channels, epgData) {
+function attachEPGToChannels(channels, epgData, at = new Date()) {
     let matched = 0;
     const updated = channels.map(channel => {
-        const epg = findEpgMatch(epgData, channel);
+        const epg = findEpgMatch(epgData, channel, at);
         if (epg) matched++;
         return {
             ...channel,

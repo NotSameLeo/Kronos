@@ -65,35 +65,93 @@ async function fetchUpstreamManifest(upstream) {
     });
 }
 
+async function fetchStableManifest(context) {
+    let holdStartedAt = 0;
+    let holdAttempts = 0;
+    let lastErr = null;
+
+    while (true) {
+        try {
+            const fetched = await fetchUpstreamManifest(context.upstream);
+            const analysis = analyzeManifest(fetched.data, fetched.finalUrl);
+            const placeholder = context.blockOfflinePlaceholders && isOfflinePlaceholderManifest(analysis);
+            const instability = placeholder
+                ? null
+                : detectLiveManifestInstability(getRememberedManifestWindow(context.configKey, context.upstream), analysis);
+
+            if (!placeholder && !instability) {
+                rememberLiveManifestWindow(context.configKey, context.upstream, analysis);
+                if (holdAttempts > 0) {
+                    logManifestHoldRecovered(context, {
+                        attempts: holdAttempts,
+                        holdMs: holdStartedAt ? Date.now() - holdStartedAt : 0,
+                        mediaSeq: analysis.mediaSequence,
+                        lastSeq: analysis.lastSegment?.sequence
+                    });
+                }
+                return {
+                    fetched,
+                    analysis,
+                    holdAttempts,
+                    holdMs: holdStartedAt ? Date.now() - holdStartedAt : 0
+                };
+            }
+
+            logManifestEvent({
+                req: context.req,
+                configKey: context.configKey,
+                routeKey: context.routeKey,
+                upstream: context.upstream,
+                finalUrl: fetched.finalUrl,
+                status: fetched.status,
+                upstreamMs: fetched.upstreamMs,
+                rewriteMs: 0,
+                totalMs: Date.now() - context.startedAt,
+                bytes: fetched.data.length,
+                analysis,
+                blocked: true,
+                blockReason: placeholder ? "offline-placeholder" : instability.reason,
+                holdAttempts
+            });
+            lastErr = manifestStabilityError(
+                placeholder ? "Upstream returned short offline placeholder" : `Unstable live manifest: ${instability.reason}`,
+                placeholder ? "offline-placeholder" : instability.reason
+            );
+        } catch (err) {
+            if (!isRecoverableManifestError(err)) throw err;
+            lastErr = err;
+        }
+
+        if (!holdStartedAt) holdStartedAt = Date.now();
+        const waitMs = nextManifestHoldDelay(holdStartedAt);
+        if (waitMs <= 0) throw lastErr;
+        logManifestHold(context, {
+            reason: manifestErrorReason(lastErr),
+            attempts: holdAttempts,
+            waitMs,
+            elapsedMs: Date.now() - holdStartedAt,
+            status: manifestErrorStatus(lastErr)
+        });
+        await sleep(waitMs);
+        holdAttempts++;
+    }
+}
+
 async function getRewrittenManifest(configKey, upstream, host, routeKey = configKey, req = null) {
     const key = hashKey(`${configKey}|${host}|${routeKey}|manifest|${upstream}`);
     if (state.manifestInflight.has(key)) return state.manifestInflight.get(key);
 
     const promise = (async () => {
         const startedAt = Date.now();
-        const fetched = await fetchUpstreamManifest(upstream);
-        const analysis = analyzeManifest(fetched.data, fetched.finalUrl);
         const blockOfflinePlaceholders = req?.query?.pg !== "0";
-        if (blockOfflinePlaceholders && isOfflinePlaceholderManifest(analysis)) {
-            logManifestEvent({
-                req,
-                configKey,
-                routeKey,
-                upstream,
-                finalUrl: fetched.finalUrl,
-                status: fetched.status,
-                upstreamMs: fetched.upstreamMs,
-                rewriteMs: 0,
-                totalMs: Date.now() - startedAt,
-                bytes: fetched.data.length,
-                analysis,
-                blocked: true
-            });
-            const err = new Error("Upstream returned short offline placeholder");
-            err.statusCode = 503;
-            err.retryAfter = 2;
-            throw err;
-        }
+        const { fetched, analysis, holdAttempts, holdMs } = await fetchStableManifest({
+            req,
+            configKey,
+            routeKey,
+            upstream,
+            blockOfflinePlaceholders,
+            startedAt
+        });
 
         const rewriteStartedAt = Date.now();
         const manifestNonce = settings.HLS_CACHE_BUST_SEGMENTS
@@ -111,7 +169,9 @@ async function getRewrittenManifest(configKey, upstream, host, routeKey = config
             rewriteMs: Date.now() - rewriteStartedAt,
             totalMs: Date.now() - startedAt,
             bytes: fetched.data.length,
-            analysis
+            analysis,
+            holdAttempts,
+            holdMs
         });
         return {
             text,
@@ -385,6 +445,98 @@ function isOfflinePlaceholderManifest(analysis) {
     return Number(analysis.totalDuration || 0) <= settings.HLS_OFFLINE_PLACEHOLDER_MAX_SECONDS;
 }
 
+function manifestStabilityKey(configKey, upstream) {
+    return hashKey(`${configKey}|manifest-window|${upstream}`, 20);
+}
+
+function manifestWindowFromAnalysis(analysis, seenAt = Date.now()) {
+    if (!analysis || analysis.kind !== "media" || analysis.endList) return null;
+    const first = analysis.firstSegment || null;
+    const last = analysis.lastSegment || null;
+    if (!Number.isFinite(analysis.mediaSequence) || !Number.isFinite(last?.sequence)) return null;
+    return {
+        mediaSequence: analysis.mediaSequence,
+        discontinuitySequence: analysis.discontinuitySequence,
+        firstSeq: first?.sequence,
+        lastSeq: last.sequence,
+        firstIdentity: first?.identity || first?.urlHash || "-",
+        lastIdentity: last.identity || last.urlHash || "-",
+        segmentCount: analysis.segmentCount || 0,
+        seenAt
+    };
+}
+
+function getRememberedManifestWindow(configKey, upstream) {
+    return state.manifestWindows.get(manifestStabilityKey(configKey, upstream)) || null;
+}
+
+function rememberLiveManifestWindow(configKey, upstream, analysis) {
+    const window = manifestWindowFromAnalysis(analysis);
+    if (!window) return;
+    state.manifestWindows.set(manifestStabilityKey(configKey, upstream), window);
+    trimManifestWindows();
+}
+
+function trimManifestWindows() {
+    if (state.manifestWindows.size <= 500) return;
+    const entries = [...state.manifestWindows.entries()].sort((a, b) => (a[1].seenAt || 0) - (b[1].seenAt || 0));
+    for (const [key] of entries.slice(0, state.manifestWindows.size - 500)) state.manifestWindows.delete(key);
+}
+
+function detectLiveManifestInstability(previous, analysis, now = Date.now()) {
+    const current = manifestWindowFromAnalysis(analysis, now);
+    if (!previous || !current) return null;
+    if (now - (previous.seenAt || 0) > settings.HLS_MANIFEST_STABILITY_HISTORY_MS) return null;
+
+    const sameDiscontinuity = current.discontinuitySequence === previous.discontinuitySequence;
+    if (sameDiscontinuity && Number.isFinite(previous.lastSeq) && current.lastSeq < previous.lastSeq) {
+        return { reason: "sequence-regression", previous, current };
+    }
+
+    const sameSequenceWindow = current.mediaSequence === previous.mediaSequence && current.lastSeq === previous.lastSeq;
+    const changedStableIdentity = current.firstIdentity !== previous.firstIdentity || current.lastIdentity !== previous.lastIdentity;
+    if (sameSequenceWindow && sameDiscontinuity && changedStableIdentity) {
+        return { reason: "sequence-fork", previous, current };
+    }
+
+    return null;
+}
+
+function manifestStabilityError(message, reason) {
+    const err = new Error(message);
+    err.statusCode = 503;
+    err.retryAfter = 2;
+    err.kronosReason = reason;
+    err.kronosRecoverable = true;
+    return err;
+}
+
+function isRecoverableManifestError(err) {
+    if (err?.kronosRecoverable) return true;
+    const status = manifestErrorStatus(err);
+    if ([407, 408, 409, 425, 429].includes(status)) return true;
+    if (status >= 500 && status <= 599) return true;
+    return ["ECONNABORTED", "ECONNRESET", "EPIPE", "ETIMEDOUT", "EAI_AGAIN"].includes(err?.code);
+}
+
+function manifestErrorStatus(err) {
+    return Number(err?.response?.status || err?.statusCode || 0);
+}
+
+function manifestErrorReason(err) {
+    if (err?.kronosReason) return err.kronosReason;
+    const status = manifestErrorStatus(err);
+    if (status) return `http-${status}`;
+    return err?.code || compactMessage(err?.message || "manifest-error");
+}
+
+function nextManifestHoldDelay(holdStartedAt) {
+    if (settings.HLS_MANIFEST_STABILITY_HOLD_MS <= 0) return 0;
+    const remaining = settings.HLS_MANIFEST_STABILITY_HOLD_MS - (Date.now() - holdStartedAt);
+    if (remaining <= 0) return 0;
+    return Math.min(settings.HLS_MANIFEST_STABILITY_RETRY_DELAY_MS, remaining);
+}
+
 function logManifestEvent(event) {
     if (!settings.HLS_DIAGNOSTICS) return;
     const analysis = event.analysis || {};
@@ -413,6 +565,9 @@ function logManifestEvent(event) {
         last: last?.urlHash || "-",
         live: analysis.endList ? 0 : 1,
         blocked: event.blocked ? 1 : 0,
+        blockReason: event.blockReason || "-",
+        holdAttempts: valueOrDash(event.holdAttempts),
+        holdMs: valueOrDash(event.holdMs),
         playerPositionKnown: 0,
         playlist: hashKey(event.upstream, 12),
         final: hashKey(event.finalUrl, 12),
@@ -424,6 +579,37 @@ function logManifestEvent(event) {
         fields.finalUrl = redactUrl(event.finalUrl);
     }
     console.log(`[HLS MANIFEST] ${formatFields(fields)}`);
+}
+
+function logManifestHold(context, info) {
+    if (!settings.HLS_DIAGNOSTICS) return;
+    console.warn(`[HLS MANIFEST HOLD] ${formatFields({
+        route: shortValue(context.routeKey),
+        cfg: hashKey(context.configKey, 10),
+        reason: info.reason,
+        status: info.status || "-",
+        attempts: info.attempts,
+        waitMs: info.waitMs,
+        elapsedMs: info.elapsedMs,
+        playlist: hashKey(context.upstream, 12),
+        ip: clientAddress(context.req),
+        ua: compactUserAgent(context.req)
+    })}`);
+}
+
+function logManifestHoldRecovered(context, info) {
+    if (!settings.HLS_DIAGNOSTICS) return;
+    console.warn(`[HLS MANIFEST RECOVERED] ${formatFields({
+        route: shortValue(context.routeKey),
+        cfg: hashKey(context.configKey, 10),
+        attempts: info.attempts,
+        holdMs: info.holdMs,
+        mediaSeq: valueOrDash(info.mediaSeq),
+        lastSeq: valueOrDash(info.lastSeq),
+        playlist: hashKey(context.upstream, 12),
+        ip: clientAddress(context.req),
+        ua: compactUserAgent(context.req)
+    })}`);
 }
 
 function logSegmentRequest(context) {
@@ -851,11 +1037,13 @@ module.exports = {
     analyzeManifest,
     copyResponseHeaders,
     decodeProxyUrl: decodeBase64Url,
+    detectLiveManifestInstability,
     fetchSegmentWithHealing,
     getRewrittenManifest,
     closeUpstreamResponse,
     releaseActiveUpstream,
     isOfflinePlaceholderManifest,
+    manifestWindowFromAnalysis,
     manifestProxyUrl,
     monitorSegmentTransfer,
     rewriteManifest,
