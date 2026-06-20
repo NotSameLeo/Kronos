@@ -1445,7 +1445,11 @@
         }
 
         function getListSignature(lists = getLists()) {
-            return JSON.stringify(lists.map(list => ({ n: list.n, u: list.u, t: list.t || 'auto', fmt: list.fmt || 'ts' })));
+            return JSON.stringify(lists.map(list => ({ n: list.n, u: list.u, t: list.t || 'auto' })));
+        }
+
+        function shouldResetAnalysisForListInput(input) {
+            return !input.matches('[data-list-format]');
         }
 
         function createPlaylistRow(data = {}) {
@@ -1512,11 +1516,12 @@
 
             row.querySelectorAll('input, select').forEach(input => {
                 input.addEventListener('input', function() {
-                    resetAnalysisState();
+                    if (shouldResetAnalysisForListInput(input)) resetAnalysisState();
                     if (input.matches('[data-list-type]')) syncRowSourceMode(row);
                     updatePreview();
                 });
                 input.addEventListener('change', function() {
+                    if (shouldResetAnalysisForListInput(input)) resetAnalysisState();
                     if (input.matches('[data-list-type]')) syncRowSourceMode(row);
                     updatePreview();
                 });
