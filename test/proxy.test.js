@@ -15,7 +15,7 @@ test("rewriteManifest relays media playlist URLs without live-edge rules", () =>
         ""
     ].join("\n");
 
-    const out = rewriteManifest(text, upstream, "http://kronos.test", "config-key", upstream, "short1234");
+    const out = rewriteManifest(text, upstream, "http://kronos.test", "config-key", upstream, "short1234", "testnonce");
     assert.doesNotMatch(out, /#EXT-X-START/i);
     assert.doesNotMatch(out, /[?&]q=/);
     assert.match(out, /#EXT-X-KEY:METHOD=AES-128,URI="http:\/\/kronos\.test\/short1234\/proxy\/seg\?/);
@@ -27,6 +27,24 @@ test("rewriteManifest relays media playlist URLs without live-edge rules", () =>
     assert.ok(proxied.searchParams.get("u"));
     assert.ok(proxied.searchParams.get("p"));
     assert.ok(proxied.searchParams.get("s"));
+    assert.ok(proxied.searchParams.get("m"));
+});
+
+test("rewriteManifest gives live segment URLs a fresh manifest nonce", () => {
+    const upstream = "http://upstream.example/live/index.m3u8";
+    const text = [
+        "#EXTM3U",
+        "#EXTINF:6,",
+        "seg-1.ts"
+    ].join("\n");
+
+    const first = rewriteManifest(text, upstream, "http://kronos.test", "config-key", upstream, "short1234", "nonce-a");
+    const second = rewriteManifest(text, upstream, "http://kronos.test", "config-key", upstream, "short1234", "nonce-b");
+    const firstUrl = new URL(first.split("\n").find(line => line.includes("/proxy/seg?")));
+    const secondUrl = new URL(second.split("\n").find(line => line.includes("/proxy/seg?")));
+
+    assert.equal(firstUrl.searchParams.get("u"), secondUrl.searchParams.get("u"));
+    assert.notEqual(firstUrl.searchParams.get("m"), secondUrl.searchParams.get("m"));
 });
 
 test("rewriteManifest relays master playlist variants as child manifests", () => {

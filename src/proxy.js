@@ -17,7 +17,9 @@ const {
 
 const RELAY_HEADERS = {
     "User-Agent": settings.UPSTREAM_UA,
-    "Accept": "*/*"
+    "Accept": "*/*",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache"
 };
 
 function setPlaylistHeaders(res) {
@@ -71,7 +73,10 @@ async function getRewrittenManifest(configKey, upstream, host, routeKey = config
         const startedAt = Date.now();
         const fetched = await fetchUpstreamManifest(upstream);
         const rewriteStartedAt = Date.now();
-        const text = rewriteManifest(fetched.data, fetched.finalUrl, host, configKey, upstream, routeKey);
+        const manifestNonce = settings.HLS_CACHE_BUST_SEGMENTS
+            ? hashKey(`${Date.now()}|${Math.random()}|${fetched.finalUrl}`, 12)
+            : "";
+        const text = rewriteManifest(fetched.data, fetched.finalUrl, host, configKey, upstream, routeKey, manifestNonce);
         const analysis = analyzeManifest(fetched.data, fetched.finalUrl);
         logManifestEvent({
             req,
@@ -154,12 +159,13 @@ function manifestProxyUrl(host, routeKey, url) {
     return `${routeBase(host, routeKey)}/proxy/live.m3u8?u=${encodeBase64Url(url)}`;
 }
 
-function segmentProxyUrl(host, routeKey, url, parentPlaylistUrl = "") {
+function segmentProxyUrl(host, routeKey, url, parentPlaylistUrl = "", manifestNonce = "") {
     const params = new URLSearchParams({ u: encodeBase64Url(url) });
-    if (settings.SEGMENT_TOKEN_HEALING && parentPlaylistUrl && isHttpUrl(parentPlaylistUrl)) {
+    if ((settings.SEGMENT_TOKEN_HEALING || settings.HLS_DIAGNOSTICS) && parentPlaylistUrl && isHttpUrl(parentPlaylistUrl)) {
         params.set("p", encodeBase64Url(parentPlaylistUrl));
         params.set("s", segmentIdentity(url));
     }
+    if (settings.HLS_CACHE_BUST_SEGMENTS && manifestNonce) params.set("m", manifestNonce);
     return `${routeBase(host, routeKey)}/proxy/seg?${params.toString()}`;
 }
 
@@ -169,13 +175,13 @@ function rewriteUriAttributes(line, baseUrl, makeUrl) {
     });
 }
 
-function rewriteManifest(text, baseUrl, host, configKey, parentPlaylistUrl = baseUrl, routeKey = configKey) {
+function rewriteManifest(text, baseUrl, host, configKey, parentPlaylistUrl = baseUrl, routeKey = configKey, manifestNonce = "") {
     const isMaster = /#EXT-X-STREAM-INF/i.test(text);
     const mediaSequence = readNumericTag(text, "#EXT-X-MEDIA-SEQUENCE");
     let mediaIndex = 0;
     const rewriteTagUrl = url => isHlsUrl(url)
         ? manifestProxyUrl(host, routeKey, url)
-        : segmentProxyUrl(host, routeKey, url, parentPlaylistUrl);
+        : segmentProxyUrl(host, routeKey, url, parentPlaylistUrl, manifestNonce);
 
     const output = [];
     let pendingDuration = null;
@@ -209,7 +215,7 @@ function rewriteManifest(text, baseUrl, host, configKey, parentPlaylistUrl = bas
         });
         mediaIndex++;
         pendingDuration = null;
-        output.push(segmentProxyUrl(host, routeKey, absolute, parentPlaylistUrl));
+        output.push(segmentProxyUrl(host, routeKey, absolute, parentPlaylistUrl, manifestNonce));
     }
 
     return output.join("\n");
@@ -657,6 +663,10 @@ function copyResponseHeaders(upstreamResponse, res) {
     ].forEach(header => {
         if (upstreamResponse.headers[header]) res.setHeader(header, upstreamResponse.headers[header]);
     });
+    if (settings.SEGMENT_STRICT_NO_CACHE) {
+        res.removeHeader("ETag");
+        res.removeHeader("Last-Modified");
+    }
 }
 
 module.exports = {
