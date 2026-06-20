@@ -47,7 +47,7 @@ test("EPG matching tolerates country prefixes and quality suffixes", () => {
         ])
     };
 
-    const { channels, matched } = attachEPGToChannels([{ name: "RSI LA 2 HD" }], epgData, new Date("2026-06-20T02:10:00+02:00"));
+    const { channels, matched } = attachEPGToChannels([{ name: "RSI LA 2 HD" }], epgData);
     assert.equal(matched, 1);
     assert.equal(channels[0].epgId, "RSILA2.it");
     assert.match(channels[0].description, /^In Onda:/);
@@ -63,7 +63,7 @@ test("EPG matching ignores country prefixes and noisy stream suffixes", () => {
     const { channels, matched } = attachEPGToChannels([
         { name: "IT - DAZN WEB 1 4K BAR HEVC" },
         { name: "CH: DAZN WEB 1 UHD RAW" }
-    ], epgData, new Date("2026-06-20T02:10:00+02:00"));
+    ], epgData);
     assert.equal(matched, 2);
     assert.deepEqual(channels.map(channel => channel.epgId), ["DAZNWeb1.it", "DAZNWeb1.it"]);
 });

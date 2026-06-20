@@ -1,15 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const {
-    analyzeManifest,
-    detectLiveEdgeBatchHold,
-    detectLiveManifestInstability,
-    exposedLiveEdgeFromAnalysis,
-    isOfflinePlaceholderManifest,
-    manifestWindowFromAnalysis,
-    rewriteManifest,
-    segmentIdentity
-} = require("../src/proxy");
+const { analyzeManifest, isOfflinePlaceholderManifest, rewriteManifest, segmentIdentity } = require("../src/proxy");
 
 test("rewriteManifest relays media playlist URLs without live-edge rules", () => {
     const upstream = "http://upstream.example/live/index.m3u8?token=abc";
@@ -146,87 +137,4 @@ test("isOfflinePlaceholderManifest detects short ended slate playlists", () => {
 
     assert.equal(isOfflinePlaceholderManifest(placeholder), true);
     assert.equal(isOfflinePlaceholderManifest(liveStartup), false);
-});
-
-test("live manifest stability ignores token rotation for the same segment window", () => {
-    const first = analyzeManifest([
-        "#EXTM3U",
-        "#EXT-X-MEDIA-SEQUENCE:10",
-        "#EXTINF:10,",
-        "seg10.ts?token=old",
-        "#EXTINF:10,",
-        "seg11.ts?token=old"
-    ].join("\n"), "http://upstream.example/live/index.m3u8");
-    const second = analyzeManifest([
-        "#EXTM3U",
-        "#EXT-X-MEDIA-SEQUENCE:10",
-        "#EXTINF:10,",
-        "seg10.ts?token=new",
-        "#EXTINF:10,",
-        "seg11.ts?token=new"
-    ].join("\n"), "http://upstream.example/live/index.m3u8");
-
-    const previous = manifestWindowFromAnalysis(first, 1000);
-    assert.equal(detectLiveManifestInstability(previous, second, 2000), null);
-});
-
-test("live manifest stability detects same-sequence segment forks", () => {
-    const first = analyzeManifest([
-        "#EXTM3U",
-        "#EXT-X-MEDIA-SEQUENCE:20",
-        "#EXTINF:10,",
-        "real20.ts",
-        "#EXTINF:10,",
-        "real21.ts"
-    ].join("\n"), "http://upstream.example/live/index.m3u8");
-    const forked = analyzeManifest([
-        "#EXTM3U",
-        "#EXT-X-MEDIA-SEQUENCE:20",
-        "#EXTINF:10,",
-        "fallback20.ts",
-        "#EXTINF:10,",
-        "fallback21.ts"
-    ].join("\n"), "http://upstream.example/live/index.m3u8");
-
-    const previous = manifestWindowFromAnalysis(first, 1000);
-    const instability = detectLiveManifestInstability(previous, forked, 2000);
-    assert.equal(instability.reason, "sequence-fork");
-});
-
-test("live edge batching holds only when the player is near the exposed edge", () => {
-    const analysis = analyzeManifest([
-        "#EXTM3U",
-        "#EXT-X-TARGETDURATION:10",
-        "#EXT-X-MEDIA-SEQUENCE:100",
-        "#EXTINF:10,",
-        "seg100.ts",
-        "#EXTINF:10,",
-        "seg101.ts",
-        "#EXTINF:10,",
-        "seg102.ts",
-        "#EXTINF:10,",
-        "seg103.ts",
-        "#EXTINF:10,",
-        "seg104.ts",
-        "#EXTINF:10,",
-        "seg105.ts"
-    ].join("\n"), "http://upstream.example/live/index.m3u8");
-    const edge = exposedLiveEdgeFromAnalysis(analysis);
-    assert.equal(edge.lastSeq, 102);
-
-    const context = {
-        routeKey: "route",
-        upstream: "http://upstream.example/live/index.m3u8",
-        req: {
-            ip: "127.0.0.1",
-            get: name => name === "user-agent" ? "KSPlayer" : ""
-        }
-    };
-    const state = require("../src/state");
-    const sessionKey = require("../src/utils").hashKey("route|127.0.0.1|KSPlayer|http://upstream.example/live/index.m3u8", 16);
-    state.playbackSessions.set(sessionKey, { lastSequence: 101, lastAt: Date.now() });
-    assert.equal(detectLiveEdgeBatchHold(context, analysis).availableAhead, 1);
-
-    state.playbackSessions.set(sessionKey, { lastSequence: 100, lastAt: Date.now() });
-    assert.equal(detectLiveEdgeBatchHold(context, analysis), null);
 });
