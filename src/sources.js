@@ -17,21 +17,42 @@ function normalizeSourceType(value) {
     return ["auto", "m3u", "xtream"].includes(type) ? type : "auto";
 }
 
+function normalizeXtreamStreamFormat(value) {
+    const format = String(value || "ts").trim().toLowerCase();
+    return ["ts", "hls"].includes(format) ? format : "ts";
+}
+
+function readXtreamOutputFormat(sourceUrl) {
+    try {
+        const parsed = new URL(sourceUrl);
+        const output = parsed.searchParams.get("output");
+        if (output) return normalizeXtreamStreamFormat(output);
+        if (/\.m3u8$/i.test(parsed.pathname)) return "hls";
+        if (/\.ts$/i.test(parsed.pathname)) return "ts";
+        return "ts";
+    } catch {
+        return "ts";
+    }
+}
+
 function getConfiguredLists(config) {
     if (Array.isArray(config?.l) && config.l.length) {
         return config.l
             .map((list, index) => ({
                 name: String(list?.n || `Lista ${index + 1}`).trim() || `Lista ${index + 1}`,
                 url: String(list?.u || "").trim(),
-                type: normalizeSourceType(list?.t)
+                type: normalizeSourceType(list?.t),
+                streamFormat: normalizeXtreamStreamFormat(list?.fmt || list?.f || readXtreamOutputFormat(list?.u || ""))
             }))
             .filter(list => list.url && !isBlockedPlaylist(list.url));
     }
 
+    const url = String(config?.u || "").trim();
     return [{
         name: String(config?.ln || "Canali TV").trim() || "Canali TV",
-        url: String(config?.u || "").trim(),
-        type: normalizeSourceType(config?.t)
+        url,
+        type: normalizeSourceType(config?.t),
+        streamFormat: normalizeXtreamStreamFormat(config?.fmt || config?.f || readXtreamOutputFormat(url))
     }].filter(list => list.url && !isBlockedPlaylist(list.url));
 }
 
@@ -208,8 +229,9 @@ function xtreamApiUrl(xtream, action = "") {
     return url.toString();
 }
 
-function xtreamLiveUrl(xtream, streamId) {
-    return `${xtream.origin}/live/${encodeURIComponent(xtream.username)}/${encodeURIComponent(xtream.password)}/${encodeURIComponent(streamId)}.m3u8`;
+function xtreamLiveUrl(xtream, streamId, streamFormat = "ts") {
+    const extension = normalizeXtreamStreamFormat(streamFormat) === "hls" ? "m3u8" : "ts";
+    return `${xtream.origin}/live/${encodeURIComponent(xtream.username)}/${encodeURIComponent(xtream.password)}/${encodeURIComponent(streamId)}.${extension}`;
 }
 
 async function fetchXtreamApi(xtream, action = "") {
@@ -251,7 +273,7 @@ async function fetchXtreamChannels(source) {
         .map(item => {
             const streamId = String(item.stream_id);
             const categoryId = String(item.category_id || item.category_ids?.[0] || "");
-            const url = isHttpUrl(item.direct_source) ? item.direct_source : xtreamLiveUrl(xtream, streamId);
+            const url = isHttpUrl(item.direct_source) ? item.direct_source : xtreamLiveUrl(xtream, streamId, source.streamFormat);
             return {
                 id: "channel_" + crypto.createHash("sha1")
                     .update(`${source.url || ""}|xtream:${streamId}`)
@@ -264,7 +286,8 @@ async function fetchXtreamChannels(source) {
                 url,
                 sourceName: source.name || "Xtream",
                 sourceUrl: source.url || "",
-                sourceType: "xtream"
+                sourceType: "xtream",
+                streamFormat: normalizeXtreamStreamFormat(source.streamFormat)
             };
         });
 
@@ -426,9 +449,11 @@ module.exports = {
     getSelectedGroups,
     isDividerChannelName,
     matchesChannelSearch,
+    normalizeXtreamStreamFormat,
     normalizeSourceType,
     parseM3UChannels,
     parseXtreamConfig,
+    xtreamLiveUrl,
     sortChannelsByName,
     sortGroupsForManifest,
     stripInitialCountryPrefix,

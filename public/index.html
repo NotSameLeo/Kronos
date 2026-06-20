@@ -603,7 +603,7 @@
 
         .playlist-row {
             display: grid;
-            grid-template-columns: minmax(140px, 0.22fr) minmax(120px, 0.16fr) minmax(260px, 1fr) minmax(130px, 0.22fr) minmax(130px, 0.22fr) auto;
+            grid-template-columns: minmax(130px, 0.2fr) minmax(110px, 0.14fr) minmax(230px, 1fr) minmax(110px, 0.14fr) minmax(120px, 0.18fr) minmax(120px, 0.18fr) auto;
             gap: 10px;
             align-items: stretch;
             padding: 10px;
@@ -612,12 +612,15 @@
             background: rgba(255, 255, 255, 0.045);
         }
 
-        .playlist-row .xtream-field {
+        .playlist-row .xtream-field,
+        .playlist-row .xtream-format-field {
             display: none;
         }
 
         .playlist-row.is-xtream .xtream-field,
-        .playlist-row.is-auto .xtream-field {
+        .playlist-row.is-auto .xtream-field,
+        .playlist-row.is-xtream .xtream-format-field,
+        .playlist-row.is-auto .xtream-format-field {
             display: block;
         }
 
@@ -1384,6 +1387,10 @@
             return ['auto', 'm3u', 'xtream'].includes(value) ? value : 'auto';
         }
 
+        function normalizeStreamFormat(value) {
+            return ['ts', 'hls'].includes(value) ? value : 'ts';
+        }
+
         function parseXtreamFields(url) {
             try {
                 const parsed = new URL(url);
@@ -1394,19 +1401,24 @@
                     username = username || decodeURIComponent(parts[1]);
                     password = password || decodeURIComponent(parts[2]);
                 }
-                return { server: parsed.origin, username, password };
+                return {
+                    server: parsed.origin,
+                    username,
+                    password,
+                    format: normalizeStreamFormat(parsed.searchParams.get('output') || (parsed.pathname.endsWith('.m3u8') ? 'hls' : 'ts'))
+                };
             } catch (err) {
-                return { server: url || '', username: '', password: '' };
+                return { server: url || '', username: '', password: '', format: 'ts' };
             }
         }
 
-        function buildXtreamUrl(server, username, password) {
+        function buildXtreamUrl(server, username, password, format = 'ts') {
             try {
                 const base = new URL('/get.php', server);
                 base.searchParams.set('username', username);
                 base.searchParams.set('password', password);
                 base.searchParams.set('type', 'm3u_plus');
-                base.searchParams.set('output', 'hls');
+                base.searchParams.set('output', normalizeStreamFormat(format));
                 return base.toString();
             } catch (err) {
                 return server;
@@ -1426,13 +1438,14 @@
                 const rawUrl = row.querySelector('[data-list-url]').value.trim();
                 const username = row.querySelector('[data-list-username]').value.trim();
                 const password = row.querySelector('[data-list-password]').value.trim();
-                const url = username && password ? buildXtreamUrl(rawUrl, username, password) : rawUrl;
-                return { n: name, u: url, t: type };
+                const format = normalizeStreamFormat(row.querySelector('[data-list-format]').value);
+                const url = username && password ? buildXtreamUrl(rawUrl, username, password, format) : rawUrl;
+                return { n: name, u: url, t: type, fmt: format };
             }).filter(list => list.u);
         }
 
         function getListSignature(lists = getLists()) {
-            return JSON.stringify(lists.map(list => ({ n: list.n, u: list.u, t: list.t || 'auto' })));
+            return JSON.stringify(lists.map(list => ({ n: list.n, u: list.u, t: list.t || 'auto', fmt: list.fmt || 'ts' })));
         }
 
         function createPlaylistRow(data = {}) {
@@ -1455,6 +1468,13 @@
                     <label>URL sorgente <small>server o playlist</small></label>
                     <input type="url" data-list-url required placeholder="https://example.com/get.php" autocomplete="url">
                 </div>
+                <div class="field xtream-format-field">
+                    <label>Formato <small>Xtream</small></label>
+                    <select data-list-format>
+                        <option value="ts">TS</option>
+                        <option value="hls">HLS</option>
+                    </select>
+                </div>
                 <div class="field xtream-field">
                     <label>Username <small>Xtream</small></label>
                     <input type="text" data-list-username placeholder="opzionale" autocomplete="username">
@@ -1470,6 +1490,7 @@
             row.querySelector('[data-list-name]').value = data.n || `Lista ${getPlaylistRows().length + 1}`;
             row.querySelector('[data-list-type]').value = normalizeSourceType(data.t || (xtream.username && xtream.password ? 'xtream' : 'auto'));
             row.querySelector('[data-list-url]').value = xtream.username && xtream.password ? xtream.server : (data.u || '');
+            row.querySelector('[data-list-format]').value = normalizeStreamFormat(data.fmt || data.f || xtream.format);
             row.querySelector('[data-list-username]').value = xtream.username;
             row.querySelector('[data-list-password]').value = xtream.password;
             syncRowSourceMode(row);
@@ -1478,6 +1499,7 @@
                     row.querySelector('[data-list-url]').value = '';
                     row.querySelector('[data-list-name]').value = 'Lista 1';
                     row.querySelector('[data-list-type]').value = 'auto';
+                    row.querySelector('[data-list-format]').value = 'ts';
                     row.querySelector('[data-list-username]').value = '';
                     row.querySelector('[data-list-password]').value = '';
                     syncRowSourceMode(row);
@@ -1672,12 +1694,18 @@
                     .map((list, index) => ({
                         n: list.n || `Lista ${index + 1}`,
                         u: list.u || '',
-                        t: normalizeSourceType(list.t)
+                        t: normalizeSourceType(list.t),
+                        fmt: normalizeStreamFormat(list.fmt || list.f || parseXtreamFields(list.u || '').format)
                     }))
                     .filter(list => list.u);
             }
 
-            return config.u ? [{ n: config.ln || 'Lista 1', u: config.u, t: normalizeSourceType(config.t) }] : [];
+            return config.u ? [{
+                n: config.ln || 'Lista 1',
+                u: config.u,
+                t: normalizeSourceType(config.t),
+                fmt: normalizeStreamFormat(config.fmt || config.f || parseXtreamFields(config.u || '').format)
+            }] : [];
         }
 
         function setCurrentManifestFromToken(token) {

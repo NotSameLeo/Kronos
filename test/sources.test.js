@@ -3,9 +3,11 @@ const assert = require("node:assert/strict");
 const {
     getConfiguredLists,
     normalizeSourceType,
+    normalizeXtreamStreamFormat,
     parseM3UChannels,
     parseXtreamConfig,
-    sortChannelsByName
+    sortChannelsByName,
+    xtreamLiveUrl
 } = require("../src/sources");
 
 test("parseM3UChannels extracts channels and skips divider rows", () => {
@@ -30,15 +32,18 @@ test("source type and config list normalization stay conservative", () => {
     assert.equal(normalizeSourceType("xtream"), "xtream");
     assert.equal(normalizeSourceType("M3U"), "m3u");
     assert.equal(normalizeSourceType("weird"), "auto");
+    assert.equal(normalizeXtreamStreamFormat("hls"), "hls");
+    assert.equal(normalizeXtreamStreamFormat("TS"), "ts");
+    assert.equal(normalizeXtreamStreamFormat("weird"), "ts");
 
     const lists = getConfiguredLists({
         l: [
-            { n: "A", u: "http://a.example/list.m3u", t: "m3u" },
+            { n: "A", u: "http://a.example/list.m3u", t: "m3u", fmt: "hls" },
             { n: "", u: "", t: "xtream" },
-            { u: "http://b.example/list.m3u" }
+            { u: "http://b.example/get.php?username=u&password=p&type=m3u_plus&output=hls" }
         ]
     });
-    assert.deepEqual(lists.map(list => [list.name, list.type]), [["A", "m3u"], ["Lista 3", "auto"]]);
+    assert.deepEqual(lists.map(list => [list.name, list.type, list.streamFormat]), [["A", "m3u", "hls"], ["Lista 3", "auto", "hls"]]);
 });
 
 test("parseXtreamConfig accepts get.php and live path credentials", () => {
@@ -52,6 +57,13 @@ test("parseXtreamConfig accepts get.php and live path credentials", () => {
         username: "user",
         password: "pass"
     });
+});
+
+test("xtreamLiveUrl follows the configured stream format", () => {
+    const xtream = { origin: "http://host.example", username: "user", password: "pass" };
+    assert.equal(xtreamLiveUrl(xtream, "10", "ts"), "http://host.example/live/user/pass/10.ts");
+    assert.equal(xtreamLiveUrl(xtream, "10", "hls"), "http://host.example/live/user/pass/10.m3u8");
+    assert.equal(xtreamLiveUrl(xtream, "10", "bad"), "http://host.example/live/user/pass/10.ts");
 });
 
 test("sortChannelsByName uses natural channel ordering and quality variants", () => {
