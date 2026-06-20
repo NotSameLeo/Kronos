@@ -73,7 +73,8 @@ async function getRewrittenManifest(configKey, upstream, host, routeKey = config
         const startedAt = Date.now();
         const fetched = await fetchUpstreamManifest(upstream);
         const analysis = analyzeManifest(fetched.data, fetched.finalUrl);
-        if (isOfflinePlaceholderManifest(analysis)) {
+        const blockOfflinePlaceholders = req?.query?.pg !== "0";
+        if (blockOfflinePlaceholders && isOfflinePlaceholderManifest(analysis)) {
             logManifestEvent({
                 req,
                 configKey,
@@ -98,7 +99,7 @@ async function getRewrittenManifest(configKey, upstream, host, routeKey = config
         const manifestNonce = settings.HLS_CACHE_BUST_SEGMENTS
             ? hashKey(`${Date.now()}|${Math.random()}|${fetched.finalUrl}`, 12)
             : "";
-        const text = rewriteManifest(fetched.data, fetched.finalUrl, host, configKey, upstream, routeKey, manifestNonce);
+        const text = rewriteManifest(fetched.data, fetched.finalUrl, host, configKey, upstream, routeKey, manifestNonce, blockOfflinePlaceholders);
         logManifestEvent({
             req,
             configKey,
@@ -176,8 +177,12 @@ function getSegmentMetadata(configKey, parentPlaylistUrl, identity) {
     return state.segmentMetadata.get(segmentMetadataMapKey(configKey, parentPlaylistUrl))?.get(identity) || null;
 }
 
-function manifestProxyUrl(host, routeKey, url) {
-    return `${routeBase(host, routeKey)}/proxy/live.m3u8?u=${encodeBase64Url(url)}`;
+function manifestProxyUrl(host, routeKey, url, blockOfflinePlaceholders = true) {
+    const params = new URLSearchParams({
+        u: encodeBase64Url(url),
+        pg: blockOfflinePlaceholders ? "1" : "0"
+    });
+    return `${routeBase(host, routeKey)}/proxy/live.m3u8?${params.toString()}`;
 }
 
 function segmentProxyUrl(host, routeKey, url, parentPlaylistUrl = "", manifestNonce = "") {
@@ -196,12 +201,12 @@ function rewriteUriAttributes(line, baseUrl, makeUrl) {
     });
 }
 
-function rewriteManifest(text, baseUrl, host, configKey, parentPlaylistUrl = baseUrl, routeKey = configKey, manifestNonce = "") {
+function rewriteManifest(text, baseUrl, host, configKey, parentPlaylistUrl = baseUrl, routeKey = configKey, manifestNonce = "", blockOfflinePlaceholders = true) {
     const isMaster = /#EXT-X-STREAM-INF/i.test(text);
     const mediaSequence = readNumericTag(text, "#EXT-X-MEDIA-SEQUENCE");
     let mediaIndex = 0;
     const rewriteTagUrl = url => isHlsUrl(url)
-        ? manifestProxyUrl(host, routeKey, url)
+        ? manifestProxyUrl(host, routeKey, url, blockOfflinePlaceholders)
         : segmentProxyUrl(host, routeKey, url, parentPlaylistUrl, manifestNonce);
 
     const output = [];
@@ -221,7 +226,7 @@ function rewriteManifest(text, baseUrl, host, configKey, parentPlaylistUrl = bas
 
         const absolute = toAbsoluteUrl(trimmed, baseUrl);
         if (isMaster || isHlsUrl(absolute)) {
-            output.push(manifestProxyUrl(host, routeKey, absolute));
+            output.push(manifestProxyUrl(host, routeKey, absolute, blockOfflinePlaceholders));
             continue;
         }
 

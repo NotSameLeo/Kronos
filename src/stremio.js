@@ -50,10 +50,14 @@ function buildStream(channel, host, routeKey) {
     const behaviorHints = { bingeGroup: `kronos-${channel.id}` };
 
     if (isHlsUrl(channel.url)) {
+        const params = new URLSearchParams({
+            u: encodeBase64Url(channel.url),
+            pg: shouldBlockOfflinePlaceholders(channel) ? "1" : "0"
+        });
         return {
             title: channel.name,
             name: "TV",
-            url: `${base}/proxy/live.m3u8?u=${encodeBase64Url(channel.url)}`,
+            url: `${base}/proxy/live.m3u8?${params.toString()}`,
             behaviorHints
         };
     }
@@ -72,6 +76,11 @@ function buildStream(channel, host, routeKey) {
         name: "TV",
         externalUrl: channel.url
     };
+}
+
+function shouldBlockOfflinePlaceholders(channel) {
+    const text = `${channel?.name || ""} ${channel?.group || ""}`.toLowerCase();
+    return !/\b(?:vetrina|info\s+eventi)\b/.test(text);
 }
 
 function toMeta(channel, host, routeKey = "", options = {}) {
@@ -202,5 +211,6 @@ module.exports = {
     buildStream,
     logoSvg,
     sendPosterSvg,
+    shouldBlockOfflinePlaceholders,
     toMeta
 };

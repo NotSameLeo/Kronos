@@ -60,6 +60,7 @@ test("rewriteManifest relays master playlist variants as child manifests", () =>
     const variant = out.split("\n").find(line => line.includes("video%2F4k") || line.includes("/proxy/live.m3u8?"));
     assert.ok(variant);
     assert.match(out, /http:\/\/kronos\.test\/abc12345\/proxy\/live\.m3u8\?/);
+    assert.match(out, /[?&]pg=1/);
 });
 
 test("segmentIdentity ignores volatile token parameters", () => {
