@@ -389,6 +389,30 @@ function logSegmentResult(context, response, options = {}) {
     console.log(`[HLS SEG OK] ${formatFields(fields)}`);
 }
 
+function logSegmentTransfer(context, info) {
+    if (!settings.HLS_DIAGNOSTICS) return;
+    const expected = Number(info.expectedBytes || 0);
+    const sent = Number(info.bytesSent || 0);
+    const completeByBytes = expected > 0 ? sent >= expected : info.upstreamEnded && info.responseFinished;
+    const fields = {
+        sid: context.sessionKey,
+        route: shortValue(context.routeKey),
+        seg: context.metadata?.urlHash || hashKey(context.upstream, 12),
+        seq: valueOrDash(context.metadata?.sequence),
+        movement: context.movement,
+        bytesSent: sent,
+        expectedBytes: expected || "-",
+        complete: completeByBytes ? 1 : 0,
+        responseFinished: info.responseFinished ? 1 : 0,
+        clientClosedBeforeEnd: info.clientClosedBeforeEnd ? 1 : 0,
+        upstreamEnded: info.upstreamEnded ? 1 : 0,
+        upstreamError: info.upstreamError ? 1 : 0,
+        durationMs: info.durationMs,
+        kbps: info.durationMs > 0 ? Math.round((sent * 8) / info.durationMs) : "-"
+    };
+    console.log(`[HLS SEG SENT] ${formatFields(fields)}`);
+}
+
 function logSegmentError(context, err, options = {}) {
     if (!settings.HLS_DIAGNOSTICS) return;
     const fields = {
@@ -403,6 +427,47 @@ function logSegmentError(context, err, options = {}) {
         msg: compactMessage(err?.message || "segment error")
     };
     console.warn(`[HLS SEG ERR] ${formatFields(fields)}`);
+}
+
+function monitorSegmentTransfer(upstreamResponse, req, res) {
+    const context = upstreamResponse?.kronosContext;
+    if (!settings.HLS_DIAGNOSTICS || !context || !upstreamResponse?.data) return;
+
+    const startedAt = Date.now();
+    let bytesSent = 0;
+    let upstreamEnded = false;
+    let upstreamError = false;
+    let logged = false;
+    const expectedBytes = Number(upstreamResponse.headers["content-length"] || 0);
+
+    upstreamResponse.data.on("data", chunk => {
+        bytesSent += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk);
+    });
+    upstreamResponse.data.on("end", () => {
+        upstreamEnded = true;
+    });
+    upstreamResponse.data.on("error", () => {
+        upstreamError = true;
+    });
+
+    const finish = reason => {
+        if (logged) return;
+        logged = true;
+        const responseFinished = res.writableFinished || res.writableEnded;
+        logSegmentTransfer(context, {
+            reason,
+            bytesSent,
+            expectedBytes,
+            responseFinished,
+            clientClosedBeforeEnd: reason === "close" && !responseFinished,
+            upstreamEnded,
+            upstreamError,
+            durationMs: Date.now() - startedAt
+        });
+    };
+
+    res.once("finish", () => finish("finish"));
+    res.once("close", () => finish("close"));
 }
 
 function formatFields(fields) {
@@ -495,6 +560,7 @@ async function fetchSegmentWithHealing(configKey, routeKey, upstream, headers, r
     logSegmentRequest(context);
     try {
         const response = await fetchSegmentStream(upstream, headers);
+        response.kronosContext = context;
         logSegmentResult(context, response, { healed: false });
         return response;
     } catch (err) {
@@ -511,7 +577,9 @@ async function fetchSegmentWithHealing(configKey, routeKey, upstream, headers, r
             if (healedUrl && healedUrl !== upstream) {
                 console.warn(`[PROXY SEG HEALED] status=${err?.response?.status || err?.code || "error"}`);
                 const healedResponse = await fetchSegmentStream(healedUrl, headers);
-                logSegmentResult({ ...context, healedUrlHash: hashKey(healedUrl, 12) }, healedResponse, { healed: true });
+                const healedContext = { ...context, healedUrlHash: hashKey(healedUrl, 12) };
+                healedResponse.kronosContext = healedContext;
+                logSegmentResult(healedContext, healedResponse, { healed: true });
                 return healedResponse;
             }
         } catch (healErr) {
@@ -599,6 +667,7 @@ module.exports = {
     fetchSegmentWithHealing,
     getRewrittenManifest,
     manifestProxyUrl,
+    monitorSegmentTransfer,
     rewriteManifest,
     segmentIdentity,
     segmentProxyUrl,

@@ -37,6 +37,7 @@ const {
     decodeProxyUrl,
     fetchSegmentWithHealing,
     getRewrittenManifest,
+    monitorSegmentTransfer,
     RELAY_HEADERS,
     setPlaylistHeaders
 } = require("./src/proxy");
@@ -113,6 +114,7 @@ app.listen(settings.PORT, "0.0.0.0", () => {
     console.log(`Node ${process.version}`);
     console.log(`playback=${settings.PLAYBACK_MODE} playerPositionKnown=0 remux=0 vpn=0`);
     console.log(`hlsDiagnostics=${settings.HLS_DIAGNOSTICS ? 1 : 0} diagnosticUrls=${settings.HLS_DIAGNOSTIC_URLS ? 1 : 0} diagnosticHeaders=${settings.HLS_DIAGNOSTIC_HEADERS ? 1 : 0}`);
+    console.log(`segmentStrictNoCache=${settings.SEGMENT_STRICT_NO_CACHE ? 1 : 0}`);
     console.log(`hlsTimeout=${settings.HLS_REQUEST_TIMEOUT / 1000}s segmentTimeout=${settings.SEG_REQUEST_TIMEOUT / 1000}s`);
     console.log(`manifestRetries=${settings.HLS_MANIFEST_RETRIES} segmentRetries=${settings.SEGMENT_UPSTREAM_RETRIES}`);
     console.log(`tokenHealing=${settings.SEGMENT_TOKEN_HEALING ? 1 : 0} rangeForward=1`);
@@ -394,8 +396,18 @@ async function proxySegmentResponse(req, res) {
         const upstreamResponse = await fetchSegmentWithHealing(configKey, routeKey, upstream, headers, req);
         res.status(upstreamResponse.status);
         copyResponseHeaders(upstreamResponse, res);
-        res.setHeader("Cache-Control", "no-store");
+        if (settings.SEGMENT_STRICT_NO_CACHE) {
+            res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, no-transform");
+            res.setHeader("Pragma", "no-cache");
+            res.setHeader("Expires", "0");
+            res.setHeader("Surrogate-Control", "no-store");
+            res.setHeader("X-Accel-Buffering", "no");
+            res.removeHeader("ETag");
+        } else {
+            res.setHeader("Cache-Control", "no-store");
+        }
         res.setHeader("X-Kronos-Relay", "1");
+        monitorSegmentTransfer(upstreamResponse, req, res);
         upstreamResponse.data.on("error", () => {
             if (!res.headersSent) res.status(502).end();
             else res.destroy();
@@ -519,7 +531,8 @@ function buildStats(configKey) {
             segmentRetries: settings.SEGMENT_UPSTREAM_RETRIES,
             hlsDiagnostics: settings.HLS_DIAGNOSTICS,
             hlsDiagnosticUrls: settings.HLS_DIAGNOSTIC_URLS,
-            hlsDiagnosticHeaders: settings.HLS_DIAGNOSTIC_HEADERS
+            hlsDiagnosticHeaders: settings.HLS_DIAGNOSTIC_HEADERS,
+            segmentStrictNoCache: settings.SEGMENT_STRICT_NO_CACHE
         }
     };
 }
