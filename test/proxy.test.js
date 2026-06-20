@@ -47,6 +47,32 @@ test("rewriteManifest gives live segment URLs a fresh manifest nonce", () => {
     assert.notEqual(firstUrl.searchParams.get("m"), secondUrl.searchParams.get("m"));
 });
 
+test("rewriteManifest hides newest live segments to keep a stability buffer", () => {
+    const upstream = "http://upstream.example/live/index.m3u8";
+    const text = [
+        "#EXTM3U",
+        "#EXT-X-TARGETDURATION:10",
+        "#EXT-X-MEDIA-SEQUENCE:50",
+        "#EXTINF:10,",
+        "seg50.ts",
+        "#EXTINF:10,",
+        "seg51.ts",
+        "#EXTINF:10,",
+        "seg52.ts",
+        "#EXTINF:10,",
+        "seg53.ts",
+        "#EXTINF:10,",
+        "seg54.ts",
+        "#EXTINF:10,",
+        "seg55.ts"
+    ].join("\n");
+
+    const out = rewriteManifest(text, upstream, "http://kronos.test", "config-key", upstream, "short1234", "nonce-a");
+    const segmentLines = out.split("\n").filter(line => line.includes("/proxy/seg?"));
+    assert.equal(segmentLines.length, 3);
+    assert.match(Buffer.from(new URL(segmentLines.at(-1)).searchParams.get("u"), "base64url").toString(), /seg52\.ts$/);
+});
+
 test("rewriteManifest relays master playlist variants as child manifests", () => {
     const text = [
         "#EXTM3U",

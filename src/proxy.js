@@ -244,7 +244,52 @@ function rewriteManifest(text, baseUrl, host, configKey, parentPlaylistUrl = bas
         output.push(segmentProxyUrl(host, routeKey, absolute, parentPlaylistUrl, manifestNonce));
     }
 
-    return output.join("\n");
+    return applyLiveEdgeDelay(output.join("\n"), {
+        enabled: !isMaster,
+        endList: /#EXT-X-ENDLIST/i.test(text),
+        segmentCount: mediaIndex
+    });
+}
+
+function applyLiveEdgeDelay(text, options = {}) {
+    if (!options.enabled || options.endList || settings.HLS_LIVE_EDGE_DELAY_SECONDS <= 0) return text;
+    const minSegments = settings.HLS_LIVE_EDGE_MIN_SEGMENTS;
+    if ((options.segmentCount || 0) <= minSegments) return text;
+
+    const lines = String(text || "").split(/\r?\n/);
+    const segments = [];
+    let currentExtinf = -1;
+    for (let index = 0; index < lines.length; index++) {
+        const trimmed = lines[index].trim();
+        if (/^#EXTINF:/i.test(trimmed)) {
+            currentExtinf = index;
+            continue;
+        }
+        if (!trimmed || trimmed.startsWith("#")) continue;
+        if (!trimmed.includes("/proxy/seg?") || currentExtinf < 0) continue;
+        segments.push({
+            start: currentExtinf,
+            end: index,
+            duration: readExtinfDuration(lines[currentExtinf]) || 0
+        });
+        currentExtinf = -1;
+    }
+
+    if (segments.length <= minSegments) return text;
+    let delayedSeconds = 0;
+    let removeCount = 0;
+    for (let index = segments.length - 1; index >= minSegments; index--) {
+        delayedSeconds += segments[index].duration || 0;
+        removeCount++;
+        if (delayedSeconds >= settings.HLS_LIVE_EDGE_DELAY_SECONDS) break;
+    }
+    if (!removeCount) return text;
+
+    const remove = new Set();
+    for (const segment of segments.slice(-removeCount)) {
+        for (let index = segment.start; index <= segment.end; index++) remove.add(index);
+    }
+    return lines.filter((_line, index) => !remove.has(index)).join("\n");
 }
 
 function readNumericTag(text, tag) {
