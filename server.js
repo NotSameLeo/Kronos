@@ -35,6 +35,7 @@ const {
 } = require("./src/sources");
 const {
     copyResponseHeaders,
+    closeUpstreamResponse,
     decodeProxyUrl,
     fetchSegmentWithHealing,
     getRewrittenManifest,
@@ -118,7 +119,7 @@ app.listen(settings.PORT, "0.0.0.0", () => {
     console.log(`segmentStrictNoCache=${settings.SEGMENT_STRICT_NO_CACHE ? 1 : 0}`);
     console.log(`hlsTimeout=${settings.HLS_REQUEST_TIMEOUT / 1000}s segmentTimeout=${settings.SEG_REQUEST_TIMEOUT / 1000}s`);
     console.log(`manifestRetries=${settings.HLS_MANIFEST_RETRIES} segmentRetries=${settings.SEGMENT_UPSTREAM_RETRIES}`);
-    console.log(`tokenHealing=${settings.SEGMENT_TOKEN_HEALING ? 1 : 0} segmentCacheBust=${settings.HLS_CACHE_BUST_SEGMENTS ? 1 : 0} offlinePlaceholderBlock=${settings.HLS_BLOCK_OFFLINE_PLACEHOLDERS ? 1 : 0} liveEdgeDelay=${settings.HLS_LIVE_EDGE_DELAY_SECONDS}s rangeForward=1`);
+    console.log(`tokenHealing=${settings.SEGMENT_TOKEN_HEALING ? 1 : 0} segmentCacheBust=${settings.HLS_CACHE_BUST_SEGMENTS ? 1 : 0} offlinePlaceholderBlock=${settings.HLS_BLOCK_OFFLINE_PLACEHOLDERS ? 1 : 0} liveEdgeDelay=${settings.HLS_LIVE_EDGE_DELAY_SECONDS}s segmentKeepAlive=${settings.HLS_SEGMENT_UPSTREAM_KEEPALIVE ? 1 : 0} rangeForward=1`);
     console.log(`catalogPageSize=${settings.CATALOG_PAGE_SIZE} catalogRefresh=${settings.CATALOG_REFRESH_INTERVAL_MS / 1000}s`);
     console.log(`epgPreload=${settings.EPG_PRELOAD_URLS.length} epgRefresh=${settings.EPG_REFRESH_INTERVAL_MS / 1000}s`);
     console.log("============================================================");
@@ -423,7 +424,7 @@ async function proxySegmentResponse(req, res) {
             else res.destroy();
         });
         res.on("close", () => {
-            try { upstreamResponse.data.destroy(); } catch {}
+            closeUpstreamResponse(upstreamResponse);
         });
         upstreamResponse.data.pipe(res);
     } catch (err) {
@@ -541,6 +542,7 @@ function buildStats(configKey) {
             offlinePlaceholderBlock: settings.HLS_BLOCK_OFFLINE_PLACEHOLDERS,
             liveEdgeDelaySeconds: settings.HLS_LIVE_EDGE_DELAY_SECONDS,
             liveEdgeMinSegments: settings.HLS_LIVE_EDGE_MIN_SEGMENTS,
+            segmentUpstreamKeepAlive: settings.HLS_SEGMENT_UPSTREAM_KEEPALIVE,
             manifestRetries: settings.HLS_MANIFEST_RETRIES,
             segmentRetries: settings.SEGMENT_UPSTREAM_RETRIES,
             hlsDiagnostics: settings.HLS_DIAGNOSTICS,

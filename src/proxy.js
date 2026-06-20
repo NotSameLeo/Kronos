@@ -616,12 +616,16 @@ function safePath(value) {
 async function fetchSegmentStream(upstream, headers) {
     return retryOperation("segment", settings.SEGMENT_UPSTREAM_RETRIES, settings.SEGMENT_UPSTREAM_RETRY_DELAY_MS, async attempt => {
         const startedAt = Date.now();
+        const segmentHeaders = {
+            ...headers,
+            Connection: settings.HLS_SEGMENT_UPSTREAM_KEEPALIVE ? "keep-alive" : "close"
+        };
         const response = await axios.get(upstream, {
             responseType: "stream",
             timeout: settings.SEG_REQUEST_TIMEOUT,
             maxRedirects: 5,
-            headers,
-            ...upstreamAgentOptions(),
+            headers: segmentHeaders,
+            ...(settings.HLS_SEGMENT_UPSTREAM_KEEPALIVE ? upstreamAgentOptions() : { httpAgent: false, httpsAgent: false }),
             decompress: false,
             maxContentLength: Infinity,
             maxBodyLength: Infinity,
@@ -632,6 +636,13 @@ async function fetchSegmentStream(upstream, headers) {
         response.kronosAttempt = attempt + 1;
         return response;
     });
+}
+
+function closeUpstreamResponse(upstreamResponse) {
+    try { upstreamResponse?.data?.destroy?.(); } catch {}
+    try { upstreamResponse?.request?.destroy?.(); } catch {}
+    try { upstreamResponse?.request?.socket?.destroy?.(); } catch {}
+    try { upstreamResponse?.request?.res?.destroy?.(); } catch {}
 }
 
 function isRecoverableSegmentError(err) {
@@ -756,6 +767,7 @@ module.exports = {
     decodeProxyUrl: decodeBase64Url,
     fetchSegmentWithHealing,
     getRewrittenManifest,
+    closeUpstreamResponse,
     isOfflinePlaceholderManifest,
     manifestProxyUrl,
     monitorSegmentTransfer,
