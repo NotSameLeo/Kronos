@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { analyzeManifest, isOfflinePlaceholderManifest, rewriteManifest, segmentIdentity } = require("../src/proxy");
+const { analyzeManifest, copyResponseHeaders, isOfflinePlaceholderManifest, rewriteManifest, segmentIdentity } = require("../src/proxy");
 
 test("rewriteManifest relays media playlist URLs without live-edge rules", () => {
     const upstream = "http://upstream.example/live/index.m3u8?token=abc";
@@ -93,6 +93,30 @@ test("segmentIdentity ignores volatile token parameters", () => {
     const first = segmentIdentity("http://cdn.example/path/seg.ts?token=old&track=a&expires=1");
     const second = segmentIdentity("http://cdn.example/path/seg.ts?token=new&track=a&expires=2");
     assert.equal(first, second);
+});
+
+test("copyResponseHeaders hides finite range metadata for direct TS streams", () => {
+    const headers = new Map();
+    const res = {
+        setHeader: (key, value) => headers.set(key.toLowerCase(), value),
+        removeHeader: key => headers.delete(key.toLowerCase())
+    };
+    copyResponseHeaders({
+        headers: {
+            "content-type": "video/mp2t",
+            "content-length": "14472616",
+            "content-range": "bytes 0-14472615/14472616",
+            "accept-ranges": "bytes",
+            "etag": "\"file\""
+        },
+        kronosContext: { streamFormat: "ts-direct" }
+    }, res);
+
+    assert.equal(headers.get("content-type"), "video/mp2t");
+    assert.equal(headers.has("content-length"), false);
+    assert.equal(headers.has("content-range"), false);
+    assert.equal(headers.has("accept-ranges"), false);
+    assert.equal(headers.has("etag"), false);
 });
 
 test("analyzeManifest exposes live sequence diagnostics", () => {

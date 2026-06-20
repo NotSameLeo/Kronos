@@ -861,17 +861,28 @@ function trimPlaybackSessions() {
 }
 
 function copyResponseHeaders(upstreamResponse, res) {
-    [
-        "content-type",
-        "content-length",
-        "content-range",
-        "accept-ranges",
-        "last-modified",
-        "etag",
-        "content-encoding"
-    ].forEach(header => {
+    const directTs = upstreamResponse?.kronosContext?.streamFormat === "ts-direct";
+    const headers = directTs
+        ? ["content-type", "content-encoding"]
+        : [
+            "content-type",
+            "content-length",
+            "content-range",
+            "accept-ranges",
+            "last-modified",
+            "etag",
+            "content-encoding"
+        ];
+    headers.forEach(header => {
         if (upstreamResponse.headers[header]) res.setHeader(header, upstreamResponse.headers[header]);
     });
+    if (directTs) {
+        res.removeHeader("Content-Length");
+        res.removeHeader("Content-Range");
+        res.removeHeader("Accept-Ranges");
+        res.removeHeader("Last-Modified");
+        res.removeHeader("ETag");
+    }
     if (settings.SEGMENT_STRICT_NO_CACHE) {
         res.removeHeader("ETag");
         res.removeHeader("Last-Modified");

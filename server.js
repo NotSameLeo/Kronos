@@ -402,11 +402,12 @@ async function proxySegmentResponse(req, res) {
         const upstream = decodeProxyUrl(req.query.u || "");
         if (!isHttpUrl(upstream)) return res.status(400).end();
 
+        const directTsRequest = isDirectTsProxyRequest(upstream, req);
         const headers = { ...RELAY_HEADERS };
-        if (req.headers.range) headers.Range = req.headers.range;
+        if (req.headers.range && !directTsRequest) headers.Range = req.headers.range;
 
         const upstreamResponse = await fetchSegmentWithHealing(configKey, routeKey, upstream, headers, req);
-        res.status(upstreamResponse.status);
+        res.status(directTsRequest && upstreamResponse.status === 206 ? 200 : upstreamResponse.status);
         copyResponseHeaders(upstreamResponse, res);
         if (settings.SEGMENT_STRICT_NO_CACHE) {
             res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, no-transform");
@@ -432,6 +433,15 @@ async function proxySegmentResponse(req, res) {
     } catch (err) {
         console.error("[PROXY SEG]", err?.response?.status || err.code || err.message);
         if (!res.headersSent) res.status(502).end();
+    }
+}
+
+function isDirectTsProxyRequest(upstream, req) {
+    if (req.query.p || req.query.s) return false;
+    try {
+        return new URL(upstream).pathname.toLowerCase().endsWith(".ts");
+    } catch {
+        return false;
     }
 }
 
