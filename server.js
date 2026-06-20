@@ -18,6 +18,7 @@ const {
     findCachedChannelById,
     getChannelById,
     getChannelsFromCache,
+    withLiveEPG,
     startCatalogPeriodicRefresh,
     startCatalogStartupPreload
 } = require("./src/catalog");
@@ -287,7 +288,7 @@ async function catalogResponse(req, res) {
         const targetSource = getCatalogSourceName(req.params.id);
         const targetGroup = params.genre || null;
         const search = params.search ? String(params.search).trim() : null;
-        const channels = await getChannelsFromCache(configKey, config);
+        const channels = withLiveEPG(configKey, config, await getChannelsFromCache(configKey, config));
         const filtered = sortChannelsByName(channels.filter(channel => {
             const sourceOk = targetSource ? channel.sourceName === targetSource : true;
             const groupOk = targetGroup ? normalizeGroupName(channel.group) === normalizeGroupName(targetGroup) : true;
@@ -325,7 +326,7 @@ function registerMetaRoutes() {
 async function metaResponse(req, res) {
     try {
         const { configKey, config, routeKey } = getRequestConfig(req);
-        const channel = await getChannelById(configKey, config, req.params.id);
+        const channel = withLiveEPG(configKey, config, [await getChannelById(configKey, config, req.params.id)]).filter(Boolean)[0];
         if (!channel) return res.status(404).json({ meta: null });
         res.json({ meta: toMeta(channel, getPublicHost(req), routeKey) });
     } catch (err) {
@@ -464,7 +465,7 @@ function statsResponse(req, res) {
 async function debugResponse(req, res) {
     try {
         const { configKey, config } = getRequestConfig(req);
-        const channels = await getChannelsFromCache(configKey, config);
+        const channels = withLiveEPG(configKey, config, await getChannelsFromCache(configKey, config));
         const effectiveConfig = state.configByKey.get(configKey) || config;
         const effectiveEpgUrl = effectiveConfig.e || getEffectiveEpgUrl(config, getConfiguredLists(config));
         res.json({

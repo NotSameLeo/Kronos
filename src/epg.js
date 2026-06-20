@@ -324,8 +324,8 @@ function formatTime(date) {
     }).format(date);
 }
 
-function selectProgrammeWindow(programmes) {
-    const now = new Date();
+function selectProgrammeWindow(programmes, at = new Date()) {
+    const now = at instanceof Date ? at : new Date(at);
     const sorted = programmes.slice().sort((a, b) => a.start - b.start);
     const currentIndex = sorted.findIndex(programme => now >= programme.start && now <= programme.stop);
     const current = currentIndex >= 0 ? sorted[currentIndex] : null;
@@ -333,8 +333,8 @@ function selectProgrammeWindow(programmes) {
     return { current, next };
 }
 
-function formatEpgDescription(programmes) {
-    const { current, next } = selectProgrammeWindow(programmes);
+function formatEpgDescription(programmes, at = new Date()) {
+    const { current, next } = selectProgrammeWindow(programmes, at);
     const lines = [];
     if (current) lines.push(formatProgramme("In Onda", current));
     if (next) lines.push(formatProgramme("A Seguire", next));
@@ -441,9 +441,31 @@ function findEpgMatch(epgData, channel) {
         const entries = epgData.byKey.get(key);
         if (!entries?.length) continue;
         const entry = entries.find(item => formatEpgDescription(item.programmes));
-        if (entry) return { ...entry, description: formatEpgDescription(entry.programmes) };
+        if (entry) return {
+            ...entry,
+            description: formatEpgDescription(entry.programmes),
+            programmes: entry.programmes
+        };
     }
     return null;
+}
+
+function withCurrentEPG(channel, epgData = null, at = new Date()) {
+    if (!channel) return null;
+    const epg = channel.epgProgrammes?.length
+        ? { id: channel.epgId || null, programmes: channel.epgProgrammes }
+        : findEpgMatch(epgData, channel);
+    if (!epg?.programmes?.length) return { ...channel, description: "" };
+    return {
+        ...channel,
+        description: formatEpgDescription(epg.programmes, at),
+        epgId: epg.id || channel.epgId || null,
+        epgProgrammes: epg.programmes
+    };
+}
+
+function withCurrentEPGForChannels(channels, epgData = null, at = new Date()) {
+    return (Array.isArray(channels) ? channels : []).map(channel => withCurrentEPG(channel, epgData, at));
 }
 
 function attachEPGToChannels(channels, epgData) {
@@ -451,7 +473,12 @@ function attachEPGToChannels(channels, epgData) {
     const updated = channels.map(channel => {
         const epg = findEpgMatch(epgData, channel);
         if (epg) matched++;
-        return { ...channel, description: epg?.description || "", epgId: epg?.id || null };
+        return {
+            ...channel,
+            description: epg?.description || "",
+            epgId: epg?.id || null,
+            epgProgrammes: epg?.programmes || null
+        };
     });
     return { channels: updated, matched };
 }
@@ -468,8 +495,11 @@ async function waitForFirstEPG(epgUrl, epgPromise) {
 module.exports = {
     attachEPGToChannels,
     ensureEPGRefresh,
+    formatEpgDescription,
     getCachedEPG,
     startEPGStartupPreload,
     subscribeConfigToEPG,
-    waitForFirstEPG
+    waitForFirstEPG,
+    withCurrentEPG,
+    withCurrentEPGForChannels
 };

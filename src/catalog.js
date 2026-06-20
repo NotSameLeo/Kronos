@@ -5,7 +5,8 @@ const {
     ensureEPGRefresh,
     getCachedEPG,
     subscribeConfigToEPG,
-    waitForFirstEPG
+    waitForFirstEPG,
+    withCurrentEPGForChannels
 } = require("./epg");
 const {
     decorateChannelName,
@@ -128,6 +129,17 @@ function findCachedChannelById(id) {
     return null;
 }
 
+function getCurrentEPGData(configKey, config) {
+    const effectiveConfig = state.configByKey.get(configKey) || config;
+    const lists = getConfiguredLists(config);
+    const epgUrl = effectiveConfig.e || getEffectiveEpgUrl(config, lists);
+    return getCachedEPG(epgUrl);
+}
+
+function withLiveEPG(configKey, config, channels) {
+    return withCurrentEPGForChannels(channels, getCurrentEPGData(configKey, config));
+}
+
 function startCatalogStartupPreload() {
     const preload = getStartupPreloadConfigs();
     if (!preload.configs.length) return;
@@ -169,6 +181,7 @@ module.exports = {
     findCachedChannelById,
     getChannelById,
     getChannelsFromCache,
+    withLiveEPG,
     startCatalogPeriodicRefresh,
     startCatalogStartupPreload
 };
