@@ -497,6 +497,37 @@ function logSegmentTransfer(context, info) {
         kbps: info.durationMs > 0 ? Math.round((sent * 8) / info.durationMs) : "-"
     };
     console.log(`[HLS SEG SENT] ${formatFields(fields)}`);
+    if (info.clientClosedBeforeEnd && !completeByBytes) {
+        logPlayerDisconnect(context, {
+            reason: info.reason || "client-close",
+            bytesSent: sent,
+            expectedBytes: expected || "-",
+            durationMs: info.durationMs,
+            upstreamEnded: info.upstreamEnded ? 1 : 0,
+            upstreamError: info.upstreamError ? 1 : 0
+        });
+    }
+}
+
+function logPlayerDisconnect(context, info = {}) {
+    if (!settings.HLS_DIAGNOSTICS) return;
+    const fields = {
+        sid: context.sessionKey,
+        route: shortValue(context.routeKey),
+        reason: info.reason || "client-close",
+        parent: context.parentPlaylistUrl ? hashKey(context.parentPlaylistUrl, 12) : "-",
+        seg: context.metadata?.urlHash || hashKey(context.upstream, 12),
+        seq: valueOrDash(context.metadata?.sequence),
+        movement: context.movement,
+        bytesSent: valueOrDash(info.bytesSent),
+        expectedBytes: valueOrDash(info.expectedBytes),
+        durationMs: valueOrDash(info.durationMs),
+        upstreamEnded: valueOrDash(info.upstreamEnded),
+        upstreamError: valueOrDash(info.upstreamError),
+        ip: clientAddress(context.req),
+        ua: compactUserAgent(context.req)
+    };
+    console.warn(`[PLAYER DISCONNECT] ${formatFields(fields)}`);
 }
 
 function logSegmentError(context, err, options = {}) {
@@ -652,7 +683,21 @@ function closePreviousClientUpstream(context) {
     closeUpstreamResponse(previous.upstreamResponse);
     state.activeSegmentUpstreams.delete(context.clientStreamKey);
     if (settings.HLS_DIAGNOSTICS) {
-        console.warn(`[HLS ZAP CLOSE] sid=${context.sessionKey} prevParent=${hashKey(previous.parentPlaylistUrl, 12)} nextParent=${hashKey(context.parentPlaylistUrl, 12)} ageMs=${Date.now() - (previous.startedAt || Date.now())}`);
+        const ageMs = Date.now() - (previous.startedAt || Date.now());
+        const prevParent = hashKey(previous.parentPlaylistUrl, 12);
+        const nextParent = hashKey(context.parentPlaylistUrl, 12);
+        console.warn(`[HLS ZAP CLOSE] sid=${context.sessionKey} prevParent=${prevParent} nextParent=${nextParent} ageMs=${ageMs}`);
+        console.warn(`[PLAYER ZAP] ${formatFields({
+            sid: context.sessionKey,
+            route: shortValue(context.routeKey),
+            prevParent,
+            nextParent,
+            nextSeg: context.metadata?.urlHash || hashKey(context.upstream, 12),
+            nextSeq: valueOrDash(context.metadata?.sequence),
+            ageMs,
+            ip: clientAddress(context.req),
+            ua: compactUserAgent(context.req)
+        })}`);
     }
 }
 
