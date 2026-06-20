@@ -410,7 +410,7 @@ function getEpgMatchKeys(values) {
     const add = value => {
         let text = String(value || "").trim();
         if (!text) return;
-        text = text.replace(/\.it$/i, "").replace(/^\s*IT\s*:\s*/i, "");
+        text = text.replace(/\.it$/i, "").replace(/^\s*IT\s*(?:[:\-]|\s+-\s+)\s*/i, "");
         addNormalizedEpgKey(keys, text);
         addNormalizedEpgKey(keys, text.replace(/\b(?:FHD|FULL\s*HD|HD|HEVC|UHD|4K|SD|H\.?26[45])\b/gi, " "));
         addNormalizedEpgKey(keys, text.replace(/\b(?:FHD|FULL\s*HD|HD|HEVC|UHD|4K|SD)\s+\d{3,4}\b/gi, " "));

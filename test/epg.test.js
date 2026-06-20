@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { formatEpgDescription, withCurrentEPG } = require("../src/epg");
+const { attachEPGToChannels, formatEpgDescription, withCurrentEPG } = require("../src/epg");
 
 const programmes = [
     {
@@ -38,4 +38,17 @@ test("withCurrentEPG refreshes cached channel descriptions without refetching th
 
     const refreshed = withCurrentEPG(cachedChannel, null, new Date("2026-06-20T02:26:00+02:00"));
     assert.match(refreshed.description, /^In Onda: COPPA DEL MONDO FIFA 2026/);
+});
+
+test("EPG matching tolerates country prefixes and quality suffixes", () => {
+    const epgData = {
+        byKey: new Map([
+            ["rsila2", [{ id: "RSILA2.it", programmes }]]
+        ])
+    };
+
+    const { channels, matched } = attachEPGToChannels([{ name: "RSI LA 2 HD" }], epgData);
+    assert.equal(matched, 1);
+    assert.equal(channels[0].epgId, "RSILA2.it");
+    assert.match(channels[0].description, /^In Onda:/);
 });
