@@ -72,12 +72,33 @@ async function getRewrittenManifest(configKey, upstream, host, routeKey = config
     const promise = (async () => {
         const startedAt = Date.now();
         const fetched = await fetchUpstreamManifest(upstream);
+        const analysis = analyzeManifest(fetched.data, fetched.finalUrl);
+        if (isOfflinePlaceholderManifest(analysis)) {
+            logManifestEvent({
+                req,
+                configKey,
+                routeKey,
+                upstream,
+                finalUrl: fetched.finalUrl,
+                status: fetched.status,
+                upstreamMs: fetched.upstreamMs,
+                rewriteMs: 0,
+                totalMs: Date.now() - startedAt,
+                bytes: fetched.data.length,
+                analysis,
+                blocked: true
+            });
+            const err = new Error("Upstream returned short offline placeholder");
+            err.statusCode = 503;
+            err.retryAfter = 2;
+            throw err;
+        }
+
         const rewriteStartedAt = Date.now();
         const manifestNonce = settings.HLS_CACHE_BUST_SEGMENTS
             ? hashKey(`${Date.now()}|${Math.random()}|${fetched.finalUrl}`, 12)
             : "";
         const text = rewriteManifest(fetched.data, fetched.finalUrl, host, configKey, upstream, routeKey, manifestNonce);
-        const analysis = analyzeManifest(fetched.data, fetched.finalUrl);
         logManifestEvent({
             req,
             configKey,
@@ -306,6 +327,14 @@ function analyzeManifest(text, baseUrl) {
     };
 }
 
+function isOfflinePlaceholderManifest(analysis) {
+    if (!settings.HLS_BLOCK_OFFLINE_PLACEHOLDERS) return false;
+    if (!analysis || analysis.kind !== "media") return false;
+    if (!analysis.endList) return false;
+    if ((analysis.segmentCount || 0) < 1 || (analysis.segmentCount || 0) > 2) return false;
+    return Number(analysis.totalDuration || 0) <= settings.HLS_OFFLINE_PLACEHOLDER_MAX_SECONDS;
+}
+
 function logManifestEvent(event) {
     if (!settings.HLS_DIAGNOSTICS) return;
     const analysis = event.analysis || {};
@@ -333,6 +362,7 @@ function logManifestEvent(event) {
         first: first?.urlHash || "-",
         last: last?.urlHash || "-",
         live: analysis.endList ? 0 : 1,
+        blocked: event.blocked ? 1 : 0,
         playerPositionKnown: 0,
         playlist: hashKey(event.upstream, 12),
         final: hashKey(event.finalUrl, 12),
@@ -676,6 +706,7 @@ module.exports = {
     decodeProxyUrl: decodeBase64Url,
     fetchSegmentWithHealing,
     getRewrittenManifest,
+    isOfflinePlaceholderManifest,
     manifestProxyUrl,
     monitorSegmentTransfer,
     rewriteManifest,

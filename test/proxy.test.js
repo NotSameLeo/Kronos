@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { analyzeManifest, rewriteManifest, segmentIdentity } = require("../src/proxy");
+const { analyzeManifest, isOfflinePlaceholderManifest, rewriteManifest, segmentIdentity } = require("../src/proxy");
 
 test("rewriteManifest relays media playlist URLs without live-edge rules", () => {
     const upstream = "http://upstream.example/live/index.m3u8?token=abc";
@@ -88,4 +88,26 @@ test("analyzeManifest exposes live sequence diagnostics", () => {
     assert.equal(analysis.lastSegment.sequence, 101);
     assert.equal(analysis.totalDuration, 12);
     assert.equal(analysis.endList, false);
+});
+
+test("isOfflinePlaceholderManifest detects short ended slate playlists", () => {
+    const placeholder = analyzeManifest([
+        "#EXTM3U",
+        "#EXT-X-TARGETDURATION:15",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXTINF:15,",
+        "waiting.ts",
+        "#EXT-X-ENDLIST"
+    ].join("\n"), "http://upstream.example/live/index.m3u8");
+
+    const liveStartup = analyzeManifest([
+        "#EXTM3U",
+        "#EXT-X-TARGETDURATION:17",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXTINF:16.733,",
+        "live0.ts"
+    ].join("\n"), "http://upstream.example/live/index.m3u8");
+
+    assert.equal(isOfflinePlaceholderManifest(placeholder), true);
+    assert.equal(isOfflinePlaceholderManifest(liveStartup), false);
 });

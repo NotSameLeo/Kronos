@@ -118,7 +118,7 @@ app.listen(settings.PORT, "0.0.0.0", () => {
     console.log(`segmentStrictNoCache=${settings.SEGMENT_STRICT_NO_CACHE ? 1 : 0}`);
     console.log(`hlsTimeout=${settings.HLS_REQUEST_TIMEOUT / 1000}s segmentTimeout=${settings.SEG_REQUEST_TIMEOUT / 1000}s`);
     console.log(`manifestRetries=${settings.HLS_MANIFEST_RETRIES} segmentRetries=${settings.SEGMENT_UPSTREAM_RETRIES}`);
-    console.log(`tokenHealing=${settings.SEGMENT_TOKEN_HEALING ? 1 : 0} segmentCacheBust=${settings.HLS_CACHE_BUST_SEGMENTS ? 1 : 0} rangeForward=1`);
+    console.log(`tokenHealing=${settings.SEGMENT_TOKEN_HEALING ? 1 : 0} segmentCacheBust=${settings.HLS_CACHE_BUST_SEGMENTS ? 1 : 0} offlinePlaceholderBlock=${settings.HLS_BLOCK_OFFLINE_PLACEHOLDERS ? 1 : 0} rangeForward=1`);
     console.log(`catalogPageSize=${settings.CATALOG_PAGE_SIZE} catalogRefresh=${settings.CATALOG_REFRESH_INTERVAL_MS / 1000}s`);
     console.log(`epgPreload=${settings.EPG_PRELOAD_URLS.length} epgRefresh=${settings.EPG_REFRESH_INTERVAL_MS / 1000}s`);
     console.log("============================================================");
@@ -381,7 +381,16 @@ async function proxyManifestResponse(req, res) {
         res.send(manifest.text);
     } catch (err) {
         console.error("[PROXY M3U8]", err.message);
-        if (!res.headersSent) res.status(502).type("text/plain").send("#EXTM3U\n");
+        if (!res.headersSent) {
+            if (err.statusCode === 503) {
+                setPlaylistHeaders(res);
+                res.setHeader("Retry-After", String(err.retryAfter || 2));
+                res.setHeader("X-Kronos-Relay", "1");
+                res.setHeader("X-Kronos-Blocked-Placeholder", "1");
+                return res.status(503).send("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n");
+            }
+            res.status(502).type("text/plain").send("#EXTM3U\n");
+        }
     }
 }
 
@@ -529,6 +538,7 @@ function buildStats(configKey) {
             resolutionLimit: false,
             segmentTokenHealing: settings.SEGMENT_TOKEN_HEALING,
             segmentCacheBust: settings.HLS_CACHE_BUST_SEGMENTS,
+            offlinePlaceholderBlock: settings.HLS_BLOCK_OFFLINE_PLACEHOLDERS,
             manifestRetries: settings.HLS_MANIFEST_RETRIES,
             segmentRetries: settings.SEGMENT_UPSTREAM_RETRIES,
             hlsDiagnostics: settings.HLS_DIAGNOSTICS,
