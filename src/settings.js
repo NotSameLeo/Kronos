@@ -18,7 +18,7 @@ function parseList(raw) {
 const FRONTEND_PRELOAD_FILE = String(process.env.FRONTEND_PRELOAD_FILE || "").trim();
 
 module.exports = {
-    RELEASE_VERSION: "5.6.9",
+    RELEASE_VERSION: "5.6.10",
     ADDON_TYPE: "tv",
     PLAYBACK_MODE: "plain-hls-relay",
     PORT: process.env.PORT || 7000,

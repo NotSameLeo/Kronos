@@ -432,6 +432,8 @@ function logSegmentRequest(context) {
         sid: context.sessionKey,
         route: shortValue(context.routeKey),
         cfg: hashKey(context.configKey, 10),
+        fmt: context.streamFormat,
+        urlExt: context.urlExtension,
         seg: context.metadata?.urlHash || hashKey(context.upstream, 12),
         seq: valueOrDash(context.metadata?.sequence),
         idx: valueOrDash(context.metadata?.mediaIndex),
@@ -458,6 +460,8 @@ function logSegmentResult(context, response, options = {}) {
     const fields = {
         sid: context.sessionKey,
         route: shortValue(context.routeKey),
+        fmt: context.streamFormat,
+        urlExt: context.urlExtension,
         seg: context.metadata?.urlHash || hashKey(context.upstream, 12),
         seq: valueOrDash(context.metadata?.sequence),
         movement: context.movement,
@@ -483,6 +487,8 @@ function logSegmentTransfer(context, info) {
     const fields = {
         sid: context.sessionKey,
         route: shortValue(context.routeKey),
+        fmt: context.streamFormat,
+        urlExt: context.urlExtension,
         seg: context.metadata?.urlHash || hashKey(context.upstream, 12),
         seq: valueOrDash(context.metadata?.sequence),
         movement: context.movement,
@@ -515,6 +521,8 @@ function logPlayerDisconnect(context, info = {}) {
         sid: context.sessionKey,
         route: shortValue(context.routeKey),
         reason: info.reason || "client-close",
+        fmt: context.streamFormat,
+        urlExt: context.urlExtension,
         parent: context.parentPlaylistUrl ? hashKey(context.parentPlaylistUrl, 12) : "-",
         seg: context.metadata?.urlHash || hashKey(context.upstream, 12),
         seq: valueOrDash(context.metadata?.sequence),
@@ -535,6 +543,8 @@ function logSegmentError(context, err, options = {}) {
     const fields = {
         sid: context.sessionKey,
         route: shortValue(context.routeKey),
+        fmt: context.streamFormat,
+        urlExt: context.urlExtension,
         seg: context.metadata?.urlHash || hashKey(context.upstream, 12),
         seq: valueOrDash(context.metadata?.sequence),
         movement: context.movement,
@@ -776,6 +786,8 @@ function buildSegmentContext(configKey, routeKey, upstream, headers, req) {
     const parentPlaylistUrl = decodeBase64Url(req.query.p || "");
     const identity = String(req.query.s || segmentIdentity(upstream));
     const metadata = getSegmentMetadata(configKey, parentPlaylistUrl, identity);
+    const urlExtension = inferUrlExtension(upstream);
+    const streamFormat = inferSegmentStreamFormat(upstream, parentPlaylistUrl, metadata);
     const clientStreamKey = hashKey(`${routeKey}|${clientAddress(req)}|${userAgent(req)}`, 16);
     const sessionKey = hashKey(`${routeKey}|${clientAddress(req)}|${userAgent(req)}|${parentPlaylistUrl}`, 16);
     const previous = state.playbackSessions.get(sessionKey) || null;
@@ -808,6 +820,8 @@ function buildSegmentContext(configKey, routeKey, upstream, headers, req) {
         routeKey,
         upstream,
         parentPlaylistUrl,
+        streamFormat,
+        urlExtension,
         clientStreamKey,
         identity,
         metadata,
@@ -820,6 +834,24 @@ function buildSegmentContext(configKey, routeKey, upstream, headers, req) {
         sincePreviousMs: previous?.lastAt ? now - previous.lastAt : null,
         req
     };
+}
+
+function inferSegmentStreamFormat(upstream, parentPlaylistUrl, metadata) {
+    if (metadata || parentPlaylistUrl) return "hls-segment";
+    const ext = inferUrlExtension(upstream);
+    if (ext === "ts") return "ts-direct";
+    if (ext === "m3u8") return "hls-manifest";
+    return ext ? `${ext}-direct` : "direct";
+}
+
+function inferUrlExtension(value) {
+    try {
+        const pathname = new URL(value).pathname;
+        const match = pathname.match(/\.([a-z0-9]{2,6})$/i);
+        return match ? match[1].toLowerCase() : "-";
+    } catch {
+        return "-";
+    }
 }
 
 function trimPlaybackSessions() {
