@@ -18,6 +18,7 @@ module.exports = {
     segmentMaps: new Map(),
     segmentMetadata: new Map(),
     playbackSessions: new Map(),
+    activeSegmentUpstreams: new Map(),
     shortConfigs: null,
     updatingCatalog: new Set()
 };

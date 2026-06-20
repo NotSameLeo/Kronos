@@ -645,6 +645,43 @@ function closeUpstreamResponse(upstreamResponse) {
     try { upstreamResponse?.request?.res?.destroy?.(); } catch {}
 }
 
+function closePreviousClientUpstream(context) {
+    if (!context?.clientStreamKey || !context.parentPlaylistUrl) return;
+    const previous = state.activeSegmentUpstreams.get(context.clientStreamKey);
+    if (!previous || previous.parentPlaylistUrl === context.parentPlaylistUrl) return;
+    closeUpstreamResponse(previous.upstreamResponse);
+    state.activeSegmentUpstreams.delete(context.clientStreamKey);
+    if (settings.HLS_DIAGNOSTICS) {
+        console.warn(`[HLS ZAP CLOSE] sid=${context.sessionKey} prevParent=${hashKey(previous.parentPlaylistUrl, 12)} nextParent=${hashKey(context.parentPlaylistUrl, 12)} ageMs=${Date.now() - (previous.startedAt || Date.now())}`);
+    }
+}
+
+function registerActiveUpstream(context, upstreamResponse) {
+    if (!context?.clientStreamKey || !context.parentPlaylistUrl || !upstreamResponse) return;
+    state.activeSegmentUpstreams.set(context.clientStreamKey, {
+        parentPlaylistUrl: context.parentPlaylistUrl,
+        upstreamResponse,
+        startedAt: Date.now()
+    });
+    trimActiveUpstreams();
+}
+
+function releaseActiveUpstream(upstreamResponse) {
+    if (!upstreamResponse) return;
+    for (const [key, active] of state.activeSegmentUpstreams.entries()) {
+        if (active.upstreamResponse === upstreamResponse) state.activeSegmentUpstreams.delete(key);
+    }
+}
+
+function trimActiveUpstreams() {
+    if (state.activeSegmentUpstreams.size <= 100) return;
+    const entries = [...state.activeSegmentUpstreams.entries()].sort((a, b) => (a[1].startedAt || 0) - (b[1].startedAt || 0));
+    for (const [key, active] of entries.slice(0, state.activeSegmentUpstreams.size - 100)) {
+        closeUpstreamResponse(active.upstreamResponse);
+        state.activeSegmentUpstreams.delete(key);
+    }
+}
+
 function isRecoverableSegmentError(err) {
     const status = Number(err?.response?.status || 0);
     if ([401, 403, 404, 407, 408, 410, 412, 425, 429].includes(status)) return true;
@@ -655,9 +692,11 @@ function isRecoverableSegmentError(err) {
 async function fetchSegmentWithHealing(configKey, routeKey, upstream, headers, req) {
     const context = buildSegmentContext(configKey, routeKey, upstream, headers, req);
     logSegmentRequest(context);
+    closePreviousClientUpstream(context);
     try {
         const response = await fetchSegmentStream(upstream, headers);
         response.kronosContext = context;
+        registerActiveUpstream(context, response);
         logSegmentResult(context, response, { healed: false });
         return response;
     } catch (err) {
@@ -692,6 +731,7 @@ function buildSegmentContext(configKey, routeKey, upstream, headers, req) {
     const parentPlaylistUrl = decodeBase64Url(req.query.p || "");
     const identity = String(req.query.s || segmentIdentity(upstream));
     const metadata = getSegmentMetadata(configKey, parentPlaylistUrl, identity);
+    const clientStreamKey = hashKey(`${routeKey}|${clientAddress(req)}|${userAgent(req)}`, 16);
     const sessionKey = hashKey(`${routeKey}|${clientAddress(req)}|${userAgent(req)}|${parentPlaylistUrl}`, 16);
     const previous = state.playbackSessions.get(sessionKey) || null;
     const now = Date.now();
@@ -723,6 +763,7 @@ function buildSegmentContext(configKey, routeKey, upstream, headers, req) {
         routeKey,
         upstream,
         parentPlaylistUrl,
+        clientStreamKey,
         identity,
         metadata,
         sessionKey,
@@ -768,6 +809,7 @@ module.exports = {
     fetchSegmentWithHealing,
     getRewrittenManifest,
     closeUpstreamResponse,
+    releaseActiveUpstream,
     isOfflinePlaceholderManifest,
     manifestProxyUrl,
     monitorSegmentTransfer,

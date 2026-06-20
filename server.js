@@ -41,6 +41,7 @@ const {
     getRewrittenManifest,
     monitorSegmentTransfer,
     RELAY_HEADERS,
+    releaseActiveUpstream,
     setPlaylistHeaders
 } = require("./src/proxy");
 const {
@@ -424,6 +425,7 @@ async function proxySegmentResponse(req, res) {
             else res.destroy();
         });
         res.on("close", () => {
+            releaseActiveUpstream(upstreamResponse);
             closeUpstreamResponse(upstreamResponse);
         });
         upstreamResponse.data.pipe(res);
@@ -529,7 +531,8 @@ function buildStats(configKey) {
             currentConfigChannels: configKey ? state.channels.get(configKey)?.length || 0 : 0,
             epgMaps: state.epgData.size,
             logos: state.logoData.size,
-            hlsSegmentMaps: state.segmentMaps.size
+            hlsSegmentMaps: state.segmentMaps.size,
+            activeSegmentUpstreams: state.activeSegmentUpstreams.size
         },
         playback: {
             mode: settings.PLAYBACK_MODE,
