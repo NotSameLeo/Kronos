@@ -410,10 +410,12 @@ function getEpgMatchKeys(values) {
     const add = value => {
         let text = String(value || "").trim();
         if (!text) return;
-        text = text.replace(/\.it$/i, "").replace(/^\s*IT\s*(?:[:\-]|\s+-\s+)\s*/i, "");
+        text = text.replace(/\.[a-z]{2}$/i, "");
+        text = text.replace(/^\s*[A-Z]{2,3}\s*(?:[:\-|]|\s+-\s+)\s*/i, "");
         addNormalizedEpgKey(keys, text);
-        addNormalizedEpgKey(keys, text.replace(/\b(?:FHD|FULL\s*HD|HD|HEVC|UHD|4K|SD|H\.?26[45])\b/gi, " "));
-        addNormalizedEpgKey(keys, text.replace(/\b(?:FHD|FULL\s*HD|HD|HEVC|UHD|4K|SD)\s+\d{3,4}\b/gi, " "));
+        const withoutQuality = text.replace(/\b(?:8K|4K|UHD|FULL\s*HD|FHD|HD|HEVC|SD|H\.?26[45]|60\s*FPS|50\s*FPS|RAW|BAR|VIP|PLUS|BACKUP|EVENTI?|EXCLUSIVE)\b/gi, " ");
+        addNormalizedEpgKey(keys, withoutQuality);
+        addNormalizedEpgKey(keys, withoutQuality.replace(/\s+\d{3,4}\s*$/, " "));
         addNormalizedEpgKey(keys, text.replace(/\s+\d{3,4}\s*$/, " "));
     };
     (Array.isArray(values) ? values : [values]).forEach(add);

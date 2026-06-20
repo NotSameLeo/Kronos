@@ -4,7 +4,8 @@ const {
     getConfiguredLists,
     normalizeSourceType,
     parseM3UChannels,
-    parseXtreamConfig
+    parseXtreamConfig,
+    sortChannelsByName
 } = require("../src/sources");
 
 test("parseM3UChannels extracts channels and skips divider rows", () => {
@@ -51,4 +52,24 @@ test("parseXtreamConfig accepts get.php and live path credentials", () => {
         username: "user",
         password: "pass"
     });
+});
+
+test("sortChannelsByName uses natural channel ordering and quality variants", () => {
+    const channels = [
+        { name: "DAZN WEB 10" },
+        { name: "DAZN WEB 1 4K" },
+        { name: "DAZN WEB 2" },
+        { name: "DAZN WEB 1 HD" },
+        { name: "DAZN WEB 1" },
+        { name: "DAZN WEB 10 HD" }
+    ];
+
+    assert.deepEqual(sortChannelsByName(channels).map(channel => channel.name), [
+        "DAZN WEB 1",
+        "DAZN WEB 1 HD",
+        "DAZN WEB 1 4K",
+        "DAZN WEB 2",
+        "DAZN WEB 10",
+        "DAZN WEB 10 HD"
+    ]);
 });

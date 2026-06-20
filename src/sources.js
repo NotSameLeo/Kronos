@@ -373,8 +373,43 @@ function toCatalogId(name) {
     return `kronos_list_${Buffer.from(String(name)).toString("hex")}`;
 }
 
+const channelNameCollator = new Intl.Collator("it", {
+    numeric: true,
+    sensitivity: "base",
+    ignorePunctuation: true
+});
+
+const QUALITY_ORDER = new Map([
+    ["", 0],
+    ["hd", 1],
+    ["fhd", 2],
+    ["fullhd", 2],
+    ["uhd", 3],
+    ["4k", 3],
+    ["8k", 4]
+]);
+
+function channelSortParts(name) {
+    const text = String(name || "").trim();
+    const qualityMatch = text.match(/\b(8K|4K|UHD|FULL\s*HD|FHD|HD)\b\s*$/i);
+    const quality = qualityMatch ? qualityMatch[1].toLowerCase().replace(/\s+/g, "") : "";
+    const base = qualityMatch ? text.slice(0, qualityMatch.index).trim() : text;
+    return {
+        base: base || text,
+        quality: QUALITY_ORDER.has(quality) ? QUALITY_ORDER.get(quality) : QUALITY_ORDER.get("")
+    };
+}
+
+function compareChannelNames(a, b) {
+    const left = channelSortParts(a);
+    const right = channelSortParts(b);
+    return channelNameCollator.compare(left.base, right.base)
+        || left.quality - right.quality
+        || channelNameCollator.compare(String(a || ""), String(b || ""));
+}
+
 function sortChannelsByName(list) {
-    return list.slice().sort((a, b) => a.name.localeCompare(b.name, "it", { sensitivity: "base" }));
+    return list.slice().sort((a, b) => compareChannelNames(a.name, b.name));
 }
 
 module.exports = {
