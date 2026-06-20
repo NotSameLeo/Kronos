@@ -62,6 +62,15 @@ function buildStream(channel, host, routeKey) {
         };
     }
 
+    if (isXtreamTsLive(channel)) {
+        return {
+            title: channel.name,
+            name: "TV",
+            url: `${base}/proxy/live.ts?u=${encodeBase64Url(channel.url)}`,
+            behaviorHints
+        };
+    }
+
     if (isHttpUrl(channel.url)) {
         return {
             title: channel.name,
@@ -76,6 +85,12 @@ function buildStream(channel, host, routeKey) {
         name: "TV",
         externalUrl: channel.url
     };
+}
+
+function isXtreamTsLive(channel) {
+    return channel?.sourceType === "xtream"
+        && channel?.streamFormat === "ts"
+        && /\.ts(?:[?#].*)?$/i.test(String(channel?.url || ""));
 }
 
 function shouldBlockOfflinePlaceholders(channel) {
@@ -209,6 +224,7 @@ function logoSvg() {
 module.exports = {
     buildManifest,
     buildStream,
+    isXtreamTsLive,
     logoSvg,
     sendPosterSvg,
     shouldBlockOfflinePlaceholders,
