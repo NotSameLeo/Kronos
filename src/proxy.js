@@ -65,9 +65,48 @@ async function fetchUpstreamManifest(upstream) {
     });
 }
 
+async function fetchCoalescedUpstreamManifest(cacheKey, upstream) {
+    const coalesceMs = Number(settings.HLS_MANIFEST_COALESCE_MS || 0);
+    if (coalesceMs <= 0) {
+        const fetched = await fetchUpstreamManifest(upstream);
+        return { ...fetched, manifestCache: "off", cacheAgeMs: 0 };
+    }
+
+    const recent = state.manifestRawRecent.get(cacheKey);
+    const ageMs = recent ? Date.now() - recent.savedAt : Infinity;
+    if (recent && ageMs >= 0 && ageMs <= coalesceMs) {
+        return {
+            data: recent.data,
+            finalUrl: recent.finalUrl,
+            status: recent.status,
+            upstreamMs: 0,
+            manifestCache: "hit",
+            cacheAgeMs: ageMs
+        };
+    }
+
+    const inFlight = state.manifestRawInflight.get(cacheKey);
+    if (inFlight) {
+        const fetched = await inFlight;
+        return { ...fetched, manifestCache: "join", cacheAgeMs: 0 };
+    }
+
+    const promise = fetchUpstreamManifest(upstream).then(fetched => {
+        rememberRecentRawManifest(cacheKey, fetched);
+        return { ...fetched, manifestCache: "miss", cacheAgeMs: 0 };
+    });
+    state.manifestRawInflight.set(cacheKey, promise);
+    try {
+        return await promise;
+    } finally {
+        state.manifestRawInflight.delete(cacheKey);
+    }
+}
+
 async function getRewrittenManifest(configKey, upstream, host, routeKey = configKey, req = null) {
     const key = hashKey(`${configKey}|${host}|${routeKey}|manifest|${upstream}`);
     if (state.manifestInflight.has(key)) return state.manifestInflight.get(key);
+    const rawCacheKey = hashKey(`${configKey}|${routeKey}|raw-manifest|${upstream}`);
 
     const promise = (async () => {
         const startedAt = Date.now();
@@ -76,7 +115,7 @@ async function getRewrittenManifest(configKey, upstream, host, routeKey = config
         const startOffsetSeconds = startOffsetFromRequest(req);
 
         try {
-            const fetched = await fetchUpstreamManifest(upstream);
+            const fetched = await fetchCoalescedUpstreamManifest(rawCacheKey, upstream);
             const analysis = analyzeManifest(fetched.data, fetched.finalUrl);
             if (blockOfflinePlaceholders && isOfflinePlaceholderManifest(analysis)) {
                 logManifestEvent({
@@ -91,7 +130,9 @@ async function getRewrittenManifest(configKey, upstream, host, routeKey = config
                     totalMs: Date.now() - startedAt,
                     bytes: fetched.data.length,
                     analysis,
-                    blocked: true
+                    blocked: true,
+                    manifestCache: fetched.manifestCache,
+                    cacheAgeMs: fetched.cacheAgeMs
                 });
                 const err = new Error("Upstream returned short offline placeholder");
                 err.statusCode = 503;
@@ -126,7 +167,9 @@ async function getRewrittenManifest(configKey, upstream, host, routeKey = config
                 rewriteMs: Date.now() - rewriteStartedAt,
                 totalMs: Date.now() - startedAt,
                 bytes: fetched.data.length,
-                analysis
+                analysis,
+                manifestCache: fetched.manifestCache,
+                cacheAgeMs: fetched.cacheAgeMs
             });
             rememberLastGoodManifest(key, { text, analysis, upstream, routeKey });
             return { text, analysis, stale: false };
@@ -157,6 +200,19 @@ async function getRewrittenManifest(configKey, upstream, host, routeKey = config
         return await promise;
     } finally {
         state.manifestInflight.delete(key);
+    }
+}
+
+function rememberRecentRawManifest(key, fetched) {
+    if (!settings.HLS_MANIFEST_COALESCE_MS) return;
+    state.manifestRawRecent.set(key, {
+        data: fetched.data,
+        finalUrl: fetched.finalUrl,
+        status: fetched.status,
+        savedAt: Date.now()
+    });
+    while (state.manifestRawRecent.size > 100) {
+        state.manifestRawRecent.delete(state.manifestRawRecent.keys().next().value);
     }
 }
 
@@ -504,6 +560,8 @@ function logManifestEvent(event) {
         last: last?.urlHash || "-",
         live: analysis.endList ? 0 : 1,
         blocked: event.blocked ? 1 : 0,
+        cache: event.manifestCache || "-",
+        cacheAgeMs: valueOrDash(event.cacheAgeMs),
         playerPositionKnown: 0,
         playlist: hashKey(event.upstream, 12),
         final: hashKey(event.finalUrl, 12),

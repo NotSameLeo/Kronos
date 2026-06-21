@@ -1,6 +1,8 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { analyzeManifest, copyResponseHeaders, isOfflinePlaceholderManifest, rewriteManifest, segmentIdentity } = require("../src/proxy");
+const http = require("node:http");
+const state = require("../src/state");
+const { analyzeManifest, copyResponseHeaders, getRewrittenManifest, isOfflinePlaceholderManifest, rewriteManifest, segmentIdentity } = require("../src/proxy");
 
 test("rewriteManifest relays media playlist URLs without live-edge rules", () => {
     const upstream = "http://upstream.example/live/index.m3u8?token=abc";
@@ -179,4 +181,56 @@ test("isOfflinePlaceholderManifest detects short ended slate playlists", () => {
 
     assert.equal(isOfflinePlaceholderManifest(placeholder), true);
     assert.equal(isOfflinePlaceholderManifest(liveStartup), false);
+});
+
+test("getRewrittenManifest coalesces duplicate upstream manifest fetches", async () => {
+    state.manifestInflight.clear();
+    state.manifestRawInflight.clear();
+    state.manifestRawRecent.clear();
+    state.manifestLastGood.clear();
+
+    let hits = 0;
+    const server = http.createServer((req, res) => {
+        hits++;
+        setTimeout(() => {
+            res.writeHead(200, { "Content-Type": "application/vnd.apple.mpegurl" });
+            res.end([
+                "#EXTM3U",
+                "#EXT-X-TARGETDURATION:10",
+                "#EXT-X-MEDIA-SEQUENCE:200",
+                "#EXTINF:10,",
+                "seg200.ts",
+                "#EXTINF:10,",
+                "seg201.ts"
+            ].join("\n"));
+        }, 50);
+    });
+    await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+
+    try {
+        const upstream = `http://127.0.0.1:${server.address().port}/live.m3u8`;
+        const req = {
+            query: {},
+            headers: {},
+            ip: "127.0.0.1",
+            get: name => name.toLowerCase() === "user-agent" ? "test-player" : ""
+        };
+
+        const [first, second] = await Promise.all([
+            getRewrittenManifest("coalesce-config", upstream, "http://kronos-a.test", "route-a", req),
+            getRewrittenManifest("coalesce-config", upstream, "http://kronos-b.test", "route-a", req)
+        ]);
+        const third = await getRewrittenManifest("coalesce-config", upstream, "http://kronos-c.test", "route-a", req);
+
+        assert.equal(hits, 1);
+        assert.match(first.text, /http:\/\/kronos-a\.test\/route-a\/proxy\/seg/);
+        assert.match(second.text, /http:\/\/kronos-b\.test\/route-a\/proxy\/seg/);
+        assert.match(third.text, /http:\/\/kronos-c\.test\/route-a\/proxy\/seg/);
+    } finally {
+        await new Promise(resolve => server.close(resolve));
+        state.manifestInflight.clear();
+        state.manifestRawInflight.clear();
+        state.manifestRawRecent.clear();
+        state.manifestLastGood.clear();
+    }
 });

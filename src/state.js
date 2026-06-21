@@ -15,6 +15,8 @@ module.exports = {
     logoData: new Map(),
     logoFailures: new Map(),
     manifestInflight: new Map(),
+    manifestRawInflight: new Map(),
+    manifestRawRecent: new Map(),
     manifestLastGood: new Map(),
     segmentMaps: new Map(),
     segmentMetadata: new Map(),
