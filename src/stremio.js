@@ -63,11 +63,17 @@ function buildStream(channel, host, routeKey) {
     }
 
     if (isHttpUrl(channel.url)) {
-        if (isDirectTsUrl(channel.url)) {
+        const hlsFallbackUrl = directXtreamTsToHlsUrl(channel);
+        if (hlsFallbackUrl) {
+            const params = new URLSearchParams({
+                u: encodeBase64Url(hlsFallbackUrl),
+                pg: shouldBlockOfflinePlaceholders(channel) ? "1" : "0",
+                d: "60"
+            });
             return {
                 title: channel.name,
                 name: "TV",
-                url: `${base}/proxy/live.ts?u=${encodeBase64Url(channel.url)}`,
+                url: `${base}/proxy/live.m3u8?${params.toString()}`,
                 behaviorHints
             };
         }
@@ -98,6 +104,11 @@ function isDirectTsUrl(value) {
     } catch {
         return false;
     }
+}
+
+function directXtreamTsToHlsUrl(channel) {
+    if (channel?.sourceType !== "xtream" || channel?.streamFormat !== "ts" || !isDirectTsUrl(channel.url)) return "";
+    return channel.url.replace(/\.ts([?#].*)?$/i, ".m3u8$1");
 }
 
 function toMeta(channel, host, routeKey = "", options = {}) {

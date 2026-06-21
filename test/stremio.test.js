@@ -38,15 +38,19 @@ test("buildStream disables offline placeholder blocking for vetrina channels", (
     assert.equal(new URL(buildStream(live, "http://kronos.test", "abc").url).searchParams.get("pg"), "1");
 });
 
-test("buildStream sends direct TS channels through the live TS relay", () => {
+test("buildStream sends Xtream TS channels through delayed HLS fallback", () => {
     const stream = buildStream({
         id: "channel_ts",
         name: "DAZN WEB 1",
         group: "DAZN",
-        url: "http://stream.example/live/user/pass/123.ts"
+        url: "http://stream.example/live/user/pass/123.ts",
+        sourceType: "xtream",
+        streamFormat: "ts"
     }, "http://kronos.test", "abc");
 
     const url = new URL(stream.url);
-    assert.equal(url.pathname, "/abc/proxy/live.ts");
+    assert.equal(url.pathname, "/abc/proxy/live.m3u8");
+    assert.equal(url.searchParams.get("d"), "60");
     assert.ok(url.searchParams.get("u"));
+    assert.match(Buffer.from(url.searchParams.get("u"), "base64url").toString(), /123\.m3u8$/);
 });

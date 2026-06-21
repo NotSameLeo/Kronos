@@ -99,7 +99,17 @@ async function getRewrittenManifest(configKey, upstream, host, routeKey = config
         const manifestNonce = settings.HLS_CACHE_BUST_SEGMENTS
             ? hashKey(`${Date.now()}|${Math.random()}|${fetched.finalUrl}`, 12)
             : "";
-        const text = rewriteManifest(fetched.data, fetched.finalUrl, host, configKey, upstream, routeKey, manifestNonce, blockOfflinePlaceholders);
+        const text = rewriteManifest(
+            fetched.data,
+            fetched.finalUrl,
+            host,
+            configKey,
+            upstream,
+            routeKey,
+            manifestNonce,
+            blockOfflinePlaceholders,
+            liveEdgeDelayFromRequest(req)
+        );
         logManifestEvent({
             req,
             configKey,
@@ -177,11 +187,14 @@ function getSegmentMetadata(configKey, parentPlaylistUrl, identity) {
     return state.segmentMetadata.get(segmentMetadataMapKey(configKey, parentPlaylistUrl))?.get(identity) || null;
 }
 
-function manifestProxyUrl(host, routeKey, url, blockOfflinePlaceholders = true) {
+function manifestProxyUrl(host, routeKey, url, blockOfflinePlaceholders = true, liveEdgeDelaySeconds = null) {
     const params = new URLSearchParams({
         u: encodeBase64Url(url),
         pg: blockOfflinePlaceholders ? "1" : "0"
     });
+    if (Number.isFinite(liveEdgeDelaySeconds) && liveEdgeDelaySeconds > 0) {
+        params.set("d", String(Math.round(liveEdgeDelaySeconds)));
+    }
     return `${routeBase(host, routeKey)}/proxy/live.m3u8?${params.toString()}`;
 }
 
@@ -201,12 +214,12 @@ function rewriteUriAttributes(line, baseUrl, makeUrl) {
     });
 }
 
-function rewriteManifest(text, baseUrl, host, configKey, parentPlaylistUrl = baseUrl, routeKey = configKey, manifestNonce = "", blockOfflinePlaceholders = true) {
+function rewriteManifest(text, baseUrl, host, configKey, parentPlaylistUrl = baseUrl, routeKey = configKey, manifestNonce = "", blockOfflinePlaceholders = true, liveEdgeDelaySeconds = null) {
     const isMaster = /#EXT-X-STREAM-INF/i.test(text);
     const mediaSequence = readNumericTag(text, "#EXT-X-MEDIA-SEQUENCE");
     let mediaIndex = 0;
     const rewriteTagUrl = url => isHlsUrl(url)
-        ? manifestProxyUrl(host, routeKey, url, blockOfflinePlaceholders)
+        ? manifestProxyUrl(host, routeKey, url, blockOfflinePlaceholders, liveEdgeDelaySeconds)
         : segmentProxyUrl(host, routeKey, url, parentPlaylistUrl, manifestNonce);
 
     const output = [];
@@ -226,7 +239,7 @@ function rewriteManifest(text, baseUrl, host, configKey, parentPlaylistUrl = bas
 
         const absolute = toAbsoluteUrl(trimmed, baseUrl);
         if (isMaster || isHlsUrl(absolute)) {
-            output.push(manifestProxyUrl(host, routeKey, absolute, blockOfflinePlaceholders));
+            output.push(manifestProxyUrl(host, routeKey, absolute, blockOfflinePlaceholders, liveEdgeDelaySeconds));
             continue;
         }
 
@@ -247,12 +260,16 @@ function rewriteManifest(text, baseUrl, host, configKey, parentPlaylistUrl = bas
     return applyLiveEdgeDelay(output.join("\n"), {
         enabled: !isMaster,
         endList: /#EXT-X-ENDLIST/i.test(text),
-        segmentCount: mediaIndex
+        segmentCount: mediaIndex,
+        delaySeconds: liveEdgeDelaySeconds
     });
 }
 
 function applyLiveEdgeDelay(text, options = {}) {
-    if (!options.enabled || options.endList || settings.HLS_LIVE_EDGE_DELAY_SECONDS <= 0) return text;
+    const delaySeconds = Number.isFinite(options.delaySeconds)
+        ? options.delaySeconds
+        : settings.HLS_LIVE_EDGE_DELAY_SECONDS;
+    if (!options.enabled || options.endList || delaySeconds <= 0) return text;
     const minSegments = settings.HLS_LIVE_EDGE_MIN_SEGMENTS;
     if ((options.segmentCount || 0) <= minSegments) return text;
 
@@ -281,7 +298,7 @@ function applyLiveEdgeDelay(text, options = {}) {
     for (let index = segments.length - 1; index >= minSegments; index--) {
         delayedSeconds += segments[index].duration || 0;
         removeCount++;
-        if (delayedSeconds >= settings.HLS_LIVE_EDGE_DELAY_SECONDS) break;
+        if (delayedSeconds >= delaySeconds) break;
     }
     if (!removeCount) return text;
 
@@ -290,6 +307,12 @@ function applyLiveEdgeDelay(text, options = {}) {
         for (let index = segment.start; index <= segment.end; index++) remove.add(index);
     }
     return lines.filter((_line, index) => !remove.has(index)).join("\n");
+}
+
+function liveEdgeDelayFromRequest(req) {
+    const value = Number(req?.query?.d);
+    if (!Number.isFinite(value)) return null;
+    return Math.max(0, Math.min(180, value));
 }
 
 function readNumericTag(text, tag) {

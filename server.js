@@ -42,7 +42,6 @@ const {
     monitorSegmentTransfer,
     RELAY_HEADERS,
     releaseActiveUpstream,
-    relayLiveTs,
     setPlaylistHeaders
 } = require("./src/proxy");
 const {
@@ -406,7 +405,13 @@ async function proxyLiveTsResponse(req, res) {
     try {
         const upstream = decodeProxyUrl(req.query.u || "");
         if (!isHttpUrl(upstream) || !isDirectTsUrl(upstream)) return res.status(400).end();
-        await relayLiveTs(configKey, routeKey, upstream, req, res);
+        const hlsUpstream = upstream.replace(/\.ts([?#].*)?$/i, ".m3u8$1");
+        req.query.d ||= "60";
+        const manifest = await getRewrittenManifest(configKey, hlsUpstream, getPublicHost(req), routeKey, req);
+        setPlaylistHeaders(res);
+        res.setHeader("X-Kronos-Relay", "1");
+        res.setHeader("X-Kronos-Ts-Hls-Fallback", "1");
+        res.send(manifest.text);
     } catch (err) {
         console.error("[PROXY TS LIVE]", err?.response?.status || err.code || err.message);
         if (!res.headersSent) res.status(502).end();
