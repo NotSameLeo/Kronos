@@ -68,7 +68,8 @@ function buildStream(channel, host, routeKey) {
             const params = new URLSearchParams({
                 u: encodeBase64Url(hlsFallbackUrl),
                 pg: shouldBlockOfflinePlaceholders(channel) ? "1" : "0",
-                d: "60"
+                d: "60",
+                st: "20"
             });
             return {
                 title: channel.name,

@@ -108,7 +108,8 @@ async function getRewrittenManifest(configKey, upstream, host, routeKey = config
             routeKey,
             manifestNonce,
             blockOfflinePlaceholders,
-            liveEdgeDelayFromRequest(req)
+            liveEdgeDelayFromRequest(req),
+            startOffsetFromRequest(req)
         );
         logManifestEvent({
             req,
@@ -187,13 +188,16 @@ function getSegmentMetadata(configKey, parentPlaylistUrl, identity) {
     return state.segmentMetadata.get(segmentMetadataMapKey(configKey, parentPlaylistUrl))?.get(identity) || null;
 }
 
-function manifestProxyUrl(host, routeKey, url, blockOfflinePlaceholders = true, liveEdgeDelaySeconds = null) {
+function manifestProxyUrl(host, routeKey, url, blockOfflinePlaceholders = true, liveEdgeDelaySeconds = null, startOffsetSeconds = null) {
     const params = new URLSearchParams({
         u: encodeBase64Url(url),
         pg: blockOfflinePlaceholders ? "1" : "0"
     });
     if (Number.isFinite(liveEdgeDelaySeconds) && liveEdgeDelaySeconds > 0) {
         params.set("d", String(Math.round(liveEdgeDelaySeconds)));
+    }
+    if (Number.isFinite(startOffsetSeconds) && startOffsetSeconds > 0) {
+        params.set("st", String(Math.round(startOffsetSeconds)));
     }
     return `${routeBase(host, routeKey)}/proxy/live.m3u8?${params.toString()}`;
 }
@@ -214,12 +218,13 @@ function rewriteUriAttributes(line, baseUrl, makeUrl) {
     });
 }
 
-function rewriteManifest(text, baseUrl, host, configKey, parentPlaylistUrl = baseUrl, routeKey = configKey, manifestNonce = "", blockOfflinePlaceholders = true, liveEdgeDelaySeconds = null) {
+function rewriteManifest(text, baseUrl, host, configKey, parentPlaylistUrl = baseUrl, routeKey = configKey, manifestNonce = "", blockOfflinePlaceholders = true, liveEdgeDelaySeconds = null, startOffsetSeconds = null) {
     const isMaster = /#EXT-X-STREAM-INF/i.test(text);
+    const endList = /#EXT-X-ENDLIST/i.test(text);
     const mediaSequence = readNumericTag(text, "#EXT-X-MEDIA-SEQUENCE");
     let mediaIndex = 0;
     const rewriteTagUrl = url => isHlsUrl(url)
-        ? manifestProxyUrl(host, routeKey, url, blockOfflinePlaceholders, liveEdgeDelaySeconds)
+        ? manifestProxyUrl(host, routeKey, url, blockOfflinePlaceholders, liveEdgeDelaySeconds, startOffsetSeconds)
         : segmentProxyUrl(host, routeKey, url, parentPlaylistUrl, manifestNonce);
 
     const output = [];
@@ -239,7 +244,7 @@ function rewriteManifest(text, baseUrl, host, configKey, parentPlaylistUrl = bas
 
         const absolute = toAbsoluteUrl(trimmed, baseUrl);
         if (isMaster || isHlsUrl(absolute)) {
-            output.push(manifestProxyUrl(host, routeKey, absolute, blockOfflinePlaceholders, liveEdgeDelaySeconds));
+            output.push(manifestProxyUrl(host, routeKey, absolute, blockOfflinePlaceholders, liveEdgeDelaySeconds, startOffsetSeconds));
             continue;
         }
 
@@ -257,11 +262,15 @@ function rewriteManifest(text, baseUrl, host, configKey, parentPlaylistUrl = bas
         output.push(segmentProxyUrl(host, routeKey, absolute, parentPlaylistUrl, manifestNonce));
     }
 
-    return applyLiveEdgeDelay(output.join("\n"), {
+    const delayed = applyLiveEdgeDelay(output.join("\n"), {
         enabled: !isMaster,
-        endList: /#EXT-X-ENDLIST/i.test(text),
+        endList,
         segmentCount: mediaIndex,
         delaySeconds: liveEdgeDelaySeconds
+    });
+    return applyStartOffset(delayed, {
+        enabled: !isMaster && !endList,
+        offsetSeconds: startOffsetSeconds
     });
 }
 
@@ -309,10 +318,25 @@ function applyLiveEdgeDelay(text, options = {}) {
     return lines.filter((_line, index) => !remove.has(index)).join("\n");
 }
 
+function applyStartOffset(text, options = {}) {
+    const offsetSeconds = Number(options.offsetSeconds || 0);
+    if (!options.enabled || offsetSeconds <= 0 || /#EXT-X-START:/i.test(text)) return text;
+    const lines = String(text || "").split(/\r?\n/);
+    const insertAt = lines[0]?.trim() === "#EXTM3U" ? 1 : 0;
+    lines.splice(insertAt, 0, `#EXT-X-START:TIME-OFFSET=-${Math.round(offsetSeconds)},PRECISE=NO`);
+    return lines.join("\n");
+}
+
 function liveEdgeDelayFromRequest(req) {
     const value = Number(req?.query?.d);
     if (!Number.isFinite(value)) return null;
     return Math.max(0, Math.min(180, value));
+}
+
+function startOffsetFromRequest(req) {
+    const value = Number(req?.query?.st);
+    if (!Number.isFinite(value)) return null;
+    return Math.max(0, Math.min(60, value));
 }
 
 function readNumericTag(text, tag) {

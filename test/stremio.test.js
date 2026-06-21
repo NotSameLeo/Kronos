@@ -51,6 +51,7 @@ test("buildStream sends Xtream TS channels through delayed HLS fallback", () => 
     const url = new URL(stream.url);
     assert.equal(url.pathname, "/abc/proxy/live.m3u8");
     assert.equal(url.searchParams.get("d"), "60");
+    assert.equal(url.searchParams.get("st"), "20");
     assert.ok(url.searchParams.get("u"));
     assert.match(Buffer.from(url.searchParams.get("u"), "base64url").toString(), /123\.m3u8$/);
 });

@@ -73,6 +73,24 @@ test("rewriteManifest hides newest live segments to keep a stability buffer", ()
     assert.match(Buffer.from(new URL(segmentLines.at(-1)).searchParams.get("u"), "base64url").toString(), /seg52\.ts$/);
 });
 
+test("rewriteManifest can add a playback start offset for delayed live playlists", () => {
+    const upstream = "http://upstream.example/live/index.m3u8";
+    const text = [
+        "#EXTM3U",
+        "#EXT-X-TARGETDURATION:10",
+        "#EXT-X-MEDIA-SEQUENCE:50",
+        "#EXTINF:10,",
+        "seg50.ts",
+        "#EXTINF:10,",
+        "seg51.ts",
+        "#EXTINF:10,",
+        "seg52.ts"
+    ].join("\n");
+
+    const out = rewriteManifest(text, upstream, "http://kronos.test", "config-key", upstream, "short1234", "nonce-a", true, 0, 20);
+    assert.match(out, /^#EXTM3U\n#EXT-X-START:TIME-OFFSET=-20,PRECISE=NO/m);
+});
+
 test("rewriteManifest relays master playlist variants as child manifests", () => {
     const text = [
         "#EXTM3U",

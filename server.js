@@ -428,6 +428,7 @@ async function proxyLiveTsResponse(req, res) {
         if (!isHttpUrl(upstream) || !isDirectTsUrl(upstream)) return res.status(400).end();
         const hlsUpstream = upstream.replace(/\.ts([?#].*)?$/i, ".m3u8$1");
         req.query.d ||= "60";
+        req.query.st ||= "20";
         const manifest = await getRewrittenManifest(configKey, hlsUpstream, getPublicHost(req), routeKey, req);
         setPlaylistHeaders(res);
         res.setHeader("X-Kronos-Relay", "1");
