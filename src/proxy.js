@@ -688,6 +688,7 @@ async function relayLiveTs(configKey, routeKey, upstream, req, res) {
     let reconnects = 0;
     let totalBytes = 0;
     let activeResponse = null;
+    let continuity = createTsContinuityState();
 
     const closeActive = () => closeUpstreamResponse(activeResponse);
     req.once("aborted", () => {
@@ -721,10 +722,13 @@ async function relayLiveTs(configKey, routeKey, upstream, req, res) {
                 headersSent = true;
             }
 
-            await pipeLiveTsPart(activeResponse, res, chunk => {
-                const size = Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk);
+            if (reconnects > 0 && continuity.lastPcr90k !== null) continuity.waitingForForwardPcr = true;
+            const partInfo = await pipeLiveTsPart(activeResponse, res, chunk => {
+                const filtered = filterLiveTsChunk(continuity, chunk);
+                const size = filtered.length;
                 partBytes += size;
                 totalBytes += size;
+                return filtered;
             });
 
             logLiveTs("PART", {
@@ -734,6 +738,9 @@ async function relayLiveTs(configKey, routeKey, upstream, req, res) {
                 status: activeResponse.status,
                 partBytes,
                 totalBytes,
+                droppedBytes: partInfo.droppedBytes,
+                lastPcr: continuity.lastPcr90k ?? "-",
+                resumedAtPcr: partInfo.resumedAtPcr ?? "-",
                 partMs: Date.now() - partStartedAt,
                 reconnects
             });
@@ -778,6 +785,7 @@ function pipeLiveTsPart(upstreamResponse, res, onChunk) {
     return new Promise((resolve, reject) => {
         let settled = false;
         const stream = upstreamResponse?.data;
+        const info = { droppedBytes: 0, resumedAtPcr: null };
         const settle = (fn, value) => {
             if (settled) return;
             settled = true;
@@ -789,12 +797,15 @@ function pipeLiveTsPart(upstreamResponse, res, onChunk) {
             fn(value);
         };
         const onData = chunk => {
-            onChunk(chunk);
-            if (!res.write(chunk)) stream.pause();
+            const filtered = onChunk(chunk, info);
+            info.droppedBytes += chunk.length - filtered.length;
+            if (!filtered.length) return;
+            info.resumedAtPcr ??= readLastPcr90k(filtered);
+            if (!res.write(filtered)) stream.pause();
         };
         const onDrain = () => stream?.resume?.();
-        const onEnd = () => settle(resolve);
-        const onClose = () => settle(resolve);
+        const onEnd = () => settle(resolve, info);
+        const onClose = () => settle(resolve, info);
         const onError = err => settle(reject, err);
 
         res.on("drain", onDrain);
@@ -803,6 +814,75 @@ function pipeLiveTsPart(upstreamResponse, res, onChunk) {
         stream.once("end", onEnd);
         stream.once("error", onError);
     });
+}
+
+function createTsContinuityState() {
+    return {
+        pending: Buffer.alloc(0),
+        lastPcr90k: null,
+        waitingForForwardPcr: false
+    };
+}
+
+function filterLiveTsChunk(state, chunk) {
+    const input = Buffer.concat([state.pending, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)]);
+    const packetCount = Math.floor(input.length / 188);
+    state.pending = input.subarray(packetCount * 188);
+    if (!packetCount) return Buffer.alloc(0);
+
+    const output = [];
+    for (let index = 0; index < packetCount; index++) {
+        const packet = input.subarray(index * 188, (index + 1) * 188);
+        if (packet[0] !== 0x47) {
+            state.pending = Buffer.alloc(0);
+            continue;
+        }
+
+        const pcr90k = readPacketPcr90k(packet);
+        if (state.waitingForForwardPcr) {
+            if (pcr90k === null || !isForwardPcr(pcr90k, state.lastPcr90k)) continue;
+            state.waitingForForwardPcr = false;
+        }
+
+        if (pcr90k !== null) state.lastPcr90k = pcr90k;
+        output.push(packet);
+    }
+
+    return output.length ? Buffer.concat(output) : Buffer.alloc(0);
+}
+
+function isForwardPcr(next, previous) {
+    if (previous === null) return true;
+    const max = 2 ** 33;
+    const diff = next >= previous ? next - previous : (max - previous) + next;
+    return diff > 0 && diff < max / 2;
+}
+
+function readLastPcr90k(buffer) {
+    let last = null;
+    const packetCount = Math.floor(buffer.length / 188);
+    for (let index = 0; index < packetCount; index++) {
+        const pcr = readPacketPcr90k(buffer.subarray(index * 188, (index + 1) * 188));
+        if (pcr !== null) last = pcr;
+    }
+    return last;
+}
+
+function readPacketPcr90k(packet) {
+    if (packet.length < 188 || packet[0] !== 0x47) return null;
+    const adaptationControl = (packet[3] >> 4) & 0x03;
+    if (adaptationControl !== 2 && adaptationControl !== 3) return null;
+    const adaptationLength = packet[4];
+    if (adaptationLength < 7 || packet.length < 12) return null;
+    const flags = packet[5];
+    if ((flags & 0x10) === 0) return null;
+
+    const base = (packet[6] * 2 ** 25)
+        + (packet[7] << 17)
+        + (packet[8] << 9)
+        + (packet[9] << 1)
+        + ((packet[10] & 0x80) >> 7);
+    return base;
 }
 
 function setLiveTsHeaders(res, upstreamResponse) {
