@@ -113,6 +113,7 @@ async function getRewrittenManifest(configKey, upstream, host, routeKey = config
         const blockOfflinePlaceholders = req?.query?.pg !== "0";
         const liveEdgeDelaySeconds = liveEdgeDelayFromRequest(req);
         const startOffsetSeconds = startOffsetFromRequest(req);
+        const holdBackSeconds = holdBackFromRequest(req);
 
         try {
             const fetched = await fetchCoalescedUpstreamManifest(rawCacheKey, upstream);
@@ -154,7 +155,8 @@ async function getRewrittenManifest(configKey, upstream, host, routeKey = config
                 manifestNonce,
                 blockOfflinePlaceholders,
                 liveEdgeDelaySeconds,
-                startOffsetSeconds
+                startOffsetSeconds,
+                holdBackSeconds
             );
             logManifestEvent({
                 req,
@@ -169,7 +171,8 @@ async function getRewrittenManifest(configKey, upstream, host, routeKey = config
                 bytes: fetched.data.length,
                 analysis,
                 manifestCache: fetched.manifestCache,
-                cacheAgeMs: fetched.cacheAgeMs
+                cacheAgeMs: fetched.cacheAgeMs,
+                holdBackSeconds
             });
             rememberLastGoodManifest(key, { text, analysis, upstream, routeKey });
             return { text, analysis, stale: false };
@@ -288,7 +291,7 @@ function getSegmentMetadata(configKey, parentPlaylistUrl, identity) {
     return state.segmentMetadata.get(segmentMetadataMapKey(configKey, parentPlaylistUrl))?.get(identity) || null;
 }
 
-function manifestProxyUrl(host, routeKey, url, blockOfflinePlaceholders = true, liveEdgeDelaySeconds = null, startOffsetSeconds = null) {
+function manifestProxyUrl(host, routeKey, url, blockOfflinePlaceholders = true, liveEdgeDelaySeconds = null, startOffsetSeconds = null, holdBackSeconds = null) {
     const params = new URLSearchParams({
         u: encodeBase64Url(url),
         pg: blockOfflinePlaceholders ? "1" : "0"
@@ -298,6 +301,9 @@ function manifestProxyUrl(host, routeKey, url, blockOfflinePlaceholders = true, 
     }
     if (Number.isFinite(startOffsetSeconds) && startOffsetSeconds > 0) {
         params.set("st", String(Math.round(startOffsetSeconds)));
+    }
+    if (Number.isFinite(holdBackSeconds) && holdBackSeconds > 0) {
+        params.set("hb", String(Math.round(holdBackSeconds)));
     }
     return `${routeBase(host, routeKey)}/proxy/live.m3u8?${params.toString()}`;
 }
@@ -318,13 +324,13 @@ function rewriteUriAttributes(line, baseUrl, makeUrl) {
     });
 }
 
-function rewriteManifest(text, baseUrl, host, configKey, parentPlaylistUrl = baseUrl, routeKey = configKey, manifestNonce = "", blockOfflinePlaceholders = true, liveEdgeDelaySeconds = null, startOffsetSeconds = null) {
+function rewriteManifest(text, baseUrl, host, configKey, parentPlaylistUrl = baseUrl, routeKey = configKey, manifestNonce = "", blockOfflinePlaceholders = true, liveEdgeDelaySeconds = null, startOffsetSeconds = null, holdBackSeconds = null) {
     const isMaster = /#EXT-X-STREAM-INF/i.test(text);
     const endList = /#EXT-X-ENDLIST/i.test(text);
     const mediaSequence = readNumericTag(text, "#EXT-X-MEDIA-SEQUENCE");
     let mediaIndex = 0;
     const rewriteTagUrl = url => isHlsUrl(url)
-        ? manifestProxyUrl(host, routeKey, url, blockOfflinePlaceholders, liveEdgeDelaySeconds, startOffsetSeconds)
+        ? manifestProxyUrl(host, routeKey, url, blockOfflinePlaceholders, liveEdgeDelaySeconds, startOffsetSeconds, holdBackSeconds)
         : segmentProxyUrl(host, routeKey, url, parentPlaylistUrl, manifestNonce);
 
     const output = [];
@@ -344,7 +350,7 @@ function rewriteManifest(text, baseUrl, host, configKey, parentPlaylistUrl = bas
 
         const absolute = toAbsoluteUrl(trimmed, baseUrl);
         if (isMaster || isHlsUrl(absolute)) {
-            output.push(manifestProxyUrl(host, routeKey, absolute, blockOfflinePlaceholders, liveEdgeDelaySeconds, startOffsetSeconds));
+            output.push(manifestProxyUrl(host, routeKey, absolute, blockOfflinePlaceholders, liveEdgeDelaySeconds, startOffsetSeconds, holdBackSeconds));
             continue;
         }
 
@@ -368,7 +374,11 @@ function rewriteManifest(text, baseUrl, host, configKey, parentPlaylistUrl = bas
         segmentCount: mediaIndex,
         delaySeconds: liveEdgeDelaySeconds
     });
-    return applyStartOffset(delayed, {
+    const holdBack = applyServerControlHoldBack(delayed, {
+        enabled: !isMaster && !endList,
+        holdBackSeconds
+    });
+    return applyStartOffset(holdBack, {
         enabled: !isMaster && !endList,
         offsetSeconds: startOffsetSeconds
     });
@@ -422,9 +432,34 @@ function applyStartOffset(text, options = {}) {
     const offsetSeconds = Number(options.offsetSeconds || 0);
     if (!options.enabled || offsetSeconds <= 0 || /#EXT-X-START:/i.test(text)) return text;
     const lines = String(text || "").split(/\r?\n/);
-    const insertAt = lines[0]?.trim() === "#EXTM3U" ? 1 : 0;
+    const insertAt = playlistHeaderInsertIndex(lines);
     lines.splice(insertAt, 0, `#EXT-X-START:TIME-OFFSET=-${Math.round(offsetSeconds)},PRECISE=NO`);
     return lines.join("\n");
+}
+
+function applyServerControlHoldBack(text, options = {}) {
+    const holdBackSeconds = Number(options.holdBackSeconds || 0);
+    if (!options.enabled || holdBackSeconds <= 0) return text;
+    const rounded = Math.round(holdBackSeconds * 1000) / 1000;
+    const lines = String(text || "").split(/\r?\n/);
+    const existing = lines.findIndex(line => /^#EXT-X-SERVER-CONTROL:/i.test(line.trim()));
+    if (existing >= 0) {
+        if (/HOLD-BACK=/i.test(lines[existing])) return text;
+        lines[existing] = `${lines[existing]},HOLD-BACK=${rounded}`;
+        return lines.join("\n");
+    }
+    const versionIndex = lines.findIndex(line => /^#EXT-X-VERSION:/i.test(line.trim()));
+    const insertAt = versionIndex >= 0 ? versionIndex + 1 : playlistHeaderInsertIndex(lines);
+    lines.splice(insertAt, 0, `#EXT-X-SERVER-CONTROL:HOLD-BACK=${rounded}`);
+    return lines.join("\n");
+}
+
+function playlistHeaderInsertIndex(lines) {
+    let index = lines[0]?.trim() === "#EXTM3U" ? 1 : 0;
+    while (index < lines.length && /^#EXT-X-(VERSION|SERVER-CONTROL|INDEPENDENT-SEGMENTS):/i.test(lines[index].trim())) {
+        index++;
+    }
+    return index;
 }
 
 function liveEdgeDelayFromRequest(req) {
@@ -435,6 +470,12 @@ function liveEdgeDelayFromRequest(req) {
 
 function startOffsetFromRequest(req) {
     const value = Number(req?.query?.st);
+    if (!Number.isFinite(value)) return null;
+    return Math.max(0, Math.min(60, value));
+}
+
+function holdBackFromRequest(req) {
+    const value = Number(req?.query?.hb);
     if (!Number.isFinite(value)) return null;
     return Math.max(0, Math.min(60, value));
 }
@@ -562,6 +603,7 @@ function logManifestEvent(event) {
         blocked: event.blocked ? 1 : 0,
         cache: event.manifestCache || "-",
         cacheAgeMs: valueOrDash(event.cacheAgeMs),
+        holdBack: valueOrDash(event.holdBackSeconds),
         playerPositionKnown: 0,
         playlist: hashKey(event.upstream, 12),
         final: hashKey(event.finalUrl, 12),

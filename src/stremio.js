@@ -69,7 +69,8 @@ function buildStream(channel, host, routeKey) {
                 u: encodeBase64Url(hlsFallbackUrl),
                 pg: shouldBlockOfflinePlaceholders(channel) ? "1" : "0",
                 d: "60",
-                st: "20"
+                st: "30",
+                hb: String(Math.round(settings.HLS_PLAYER_HOLD_BACK_SECONDS))
             });
             return {
                 title: channel.name,

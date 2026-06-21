@@ -93,6 +93,26 @@ test("rewriteManifest can add a playback start offset for delayed live playlists
     assert.match(out, /^#EXTM3U\n#EXT-X-START:TIME-OFFSET=-20,PRECISE=NO/m);
 });
 
+test("rewriteManifest can add a conservative live hold-back hint", () => {
+    const upstream = "http://upstream.example/live/index.m3u8";
+    const text = [
+        "#EXTM3U",
+        "#EXT-X-VERSION:3",
+        "#EXT-X-TARGETDURATION:10",
+        "#EXT-X-MEDIA-SEQUENCE:50",
+        "#EXTINF:10,",
+        "seg50.ts",
+        "#EXTINF:10,",
+        "seg51.ts",
+        "#EXTINF:10,",
+        "seg52.ts"
+    ].join("\n");
+
+    const out = rewriteManifest(text, upstream, "http://kronos.test", "config-key", upstream, "short1234", "nonce-a", true, 0, 30, 30);
+    assert.match(out, /^#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-SERVER-CONTROL:HOLD-BACK=30\n#EXT-X-START:TIME-OFFSET=-30,PRECISE=NO/m);
+    assert.equal(out.split("\n").filter(line => line.includes("/proxy/seg?")).length, 3);
+});
+
 test("rewriteManifest relays master playlist variants as child manifests", () => {
     const text = [
         "#EXTM3U",
@@ -101,12 +121,13 @@ test("rewriteManifest relays master playlist variants as child manifests", () =>
         "video/4k.m3u8"
     ].join("\n");
 
-    const out = rewriteManifest(text, "http://upstream.example/master.m3u8", "http://kronos.test", "config-key", "http://upstream.example/master.m3u8", "abc12345");
+    const out = rewriteManifest(text, "http://upstream.example/master.m3u8", "http://kronos.test", "config-key", "http://upstream.example/master.m3u8", "abc12345", "", true, 60, 30, 30);
     assert.match(out, /URI="http:\/\/kronos\.test\/abc12345\/proxy\/live\.m3u8\?/);
     const variant = out.split("\n").find(line => line.includes("video%2F4k") || line.includes("/proxy/live.m3u8?"));
     assert.ok(variant);
     assert.match(out, /http:\/\/kronos\.test\/abc12345\/proxy\/live\.m3u8\?/);
     assert.match(out, /[?&]pg=1/);
+    assert.match(out, /[?&]hb=30/);
 });
 
 test("segmentIdentity ignores volatile token parameters", () => {
