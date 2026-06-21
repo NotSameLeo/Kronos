@@ -71,10 +71,50 @@ async function getRewrittenManifest(configKey, upstream, host, routeKey = config
 
     const promise = (async () => {
         const startedAt = Date.now();
-        const fetched = await fetchUpstreamManifest(upstream);
-        const analysis = analyzeManifest(fetched.data, fetched.finalUrl);
         const blockOfflinePlaceholders = req?.query?.pg !== "0";
-        if (blockOfflinePlaceholders && isOfflinePlaceholderManifest(analysis)) {
+        const liveEdgeDelaySeconds = liveEdgeDelayFromRequest(req);
+        const startOffsetSeconds = startOffsetFromRequest(req);
+
+        try {
+            const fetched = await fetchUpstreamManifest(upstream);
+            const analysis = analyzeManifest(fetched.data, fetched.finalUrl);
+            if (blockOfflinePlaceholders && isOfflinePlaceholderManifest(analysis)) {
+                logManifestEvent({
+                    req,
+                    configKey,
+                    routeKey,
+                    upstream,
+                    finalUrl: fetched.finalUrl,
+                    status: fetched.status,
+                    upstreamMs: fetched.upstreamMs,
+                    rewriteMs: 0,
+                    totalMs: Date.now() - startedAt,
+                    bytes: fetched.data.length,
+                    analysis,
+                    blocked: true
+                });
+                const err = new Error("Upstream returned short offline placeholder");
+                err.statusCode = 503;
+                err.retryAfter = 2;
+                throw err;
+            }
+
+            const rewriteStartedAt = Date.now();
+            const manifestNonce = settings.HLS_CACHE_BUST_SEGMENTS
+                ? hashKey(`${Date.now()}|${Math.random()}|${fetched.finalUrl}`, 12)
+                : "";
+            const text = rewriteManifest(
+                fetched.data,
+                fetched.finalUrl,
+                host,
+                configKey,
+                upstream,
+                routeKey,
+                manifestNonce,
+                blockOfflinePlaceholders,
+                liveEdgeDelaySeconds,
+                startOffsetSeconds
+            );
             logManifestEvent({
                 req,
                 configKey,
@@ -83,51 +123,33 @@ async function getRewrittenManifest(configKey, upstream, host, routeKey = config
                 finalUrl: fetched.finalUrl,
                 status: fetched.status,
                 upstreamMs: fetched.upstreamMs,
-                rewriteMs: 0,
+                rewriteMs: Date.now() - rewriteStartedAt,
                 totalMs: Date.now() - startedAt,
                 bytes: fetched.data.length,
-                analysis,
-                blocked: true
+                analysis
             });
-            const err = new Error("Upstream returned short offline placeholder");
-            err.statusCode = 503;
-            err.retryAfter = 2;
-            throw err;
+            rememberLastGoodManifest(key, { text, analysis, upstream, routeKey });
+            return { text, analysis, stale: false };
+        } catch (err) {
+            const stale = getLastGoodManifest(key);
+            if (!stale) throw err;
+            logStaleManifest({
+                req,
+                routeKey,
+                configKey,
+                upstream,
+                err,
+                ageMs: Date.now() - stale.savedAt,
+                totalMs: Date.now() - startedAt,
+                analysis: stale.analysis
+            });
+            return {
+                text: stale.text,
+                analysis: stale.analysis,
+                stale: true,
+                staleAgeMs: Date.now() - stale.savedAt
+            };
         }
-
-        const rewriteStartedAt = Date.now();
-        const manifestNonce = settings.HLS_CACHE_BUST_SEGMENTS
-            ? hashKey(`${Date.now()}|${Math.random()}|${fetched.finalUrl}`, 12)
-            : "";
-        const text = rewriteManifest(
-            fetched.data,
-            fetched.finalUrl,
-            host,
-            configKey,
-            upstream,
-            routeKey,
-            manifestNonce,
-            blockOfflinePlaceholders,
-            liveEdgeDelayFromRequest(req),
-            startOffsetFromRequest(req)
-        );
-        logManifestEvent({
-            req,
-            configKey,
-            routeKey,
-            upstream,
-            finalUrl: fetched.finalUrl,
-            status: fetched.status,
-            upstreamMs: fetched.upstreamMs,
-            rewriteMs: Date.now() - rewriteStartedAt,
-            totalMs: Date.now() - startedAt,
-            bytes: fetched.data.length,
-            analysis
-        });
-        return {
-            text,
-            analysis
-        };
     })();
 
     state.manifestInflight.set(key, promise);
@@ -136,6 +158,28 @@ async function getRewrittenManifest(configKey, upstream, host, routeKey = config
     } finally {
         state.manifestInflight.delete(key);
     }
+}
+
+function rememberLastGoodManifest(key, entry) {
+    if (!settings.HLS_STALE_MANIFEST_MAX_MS) return;
+    state.manifestLastGood.set(key, {
+        ...entry,
+        savedAt: Date.now()
+    });
+    while (state.manifestLastGood.size > 200) {
+        state.manifestLastGood.delete(state.manifestLastGood.keys().next().value);
+    }
+}
+
+function getLastGoodManifest(key) {
+    if (!settings.HLS_STALE_MANIFEST_MAX_MS) return null;
+    const entry = state.manifestLastGood.get(key);
+    if (!entry) return null;
+    if (Date.now() - entry.savedAt > settings.HLS_STALE_MANIFEST_MAX_MS) {
+        state.manifestLastGood.delete(key);
+        return null;
+    }
+    return entry;
 }
 
 function segmentMapKey(configKey, parentPlaylistUrl) {
@@ -473,6 +517,26 @@ function logManifestEvent(event) {
     console.log(`[HLS MANIFEST] ${formatFields(fields)}`);
 }
 
+function logStaleManifest(event) {
+    if (!settings.HLS_DIAGNOSTICS) return;
+    const analysis = event.analysis || {};
+    const fields = {
+        route: shortValue(event.routeKey),
+        cfg: hashKey(event.configKey, 10),
+        reason: manifestErrorReason(event.err),
+        status: event.err?.response?.status || "-",
+        code: event.err?.code || "-",
+        staleAgeMs: event.ageMs,
+        totalMs: event.totalMs,
+        mediaSeq: valueOrDash(analysis.mediaSequence),
+        lastSeq: valueOrDash(analysis.lastSegment?.sequence),
+        playlist: hashKey(event.upstream, 12),
+        ip: clientAddress(event.req),
+        ua: compactUserAgent(event.req)
+    };
+    console.warn(`[HLS MANIFEST STALE] ${formatFields(fields)}`);
+}
+
 function logSegmentRequest(context) {
     if (!settings.HLS_DIAGNOSTICS) return;
     const fields = {
@@ -661,6 +725,13 @@ function valueOrDash(value) {
 
 function compactMessage(value) {
     return String(value || "").replace(/\s+/g, " ").slice(0, 180);
+}
+
+function manifestErrorReason(err) {
+    if (err?.statusCode === 503) return "blocked-placeholder";
+    if (err?.response?.status) return `http-${err.response.status}`;
+    if (err?.code) return err.code;
+    return compactMessage(err?.message || "manifest-error");
 }
 
 function shortValue(value) {

@@ -405,6 +405,10 @@ async function proxyManifestResponse(req, res) {
         const manifest = await getRewrittenManifest(configKey, upstream, getPublicHost(req), routeKey, req);
         setPlaylistHeaders(res);
         res.setHeader("X-Kronos-Relay", "1");
+        if (manifest.stale) {
+            res.setHeader("X-Kronos-Stale-Manifest", "1");
+            res.setHeader("X-Kronos-Stale-Age-Ms", String(manifest.staleAgeMs || 0));
+        }
         res.send(manifest.text);
     } catch (err) {
         console.error("[PROXY M3U8]", err.message);
@@ -433,6 +437,10 @@ async function proxyLiveTsResponse(req, res) {
         setPlaylistHeaders(res);
         res.setHeader("X-Kronos-Relay", "1");
         res.setHeader("X-Kronos-Ts-Hls-Fallback", "1");
+        if (manifest.stale) {
+            res.setHeader("X-Kronos-Stale-Manifest", "1");
+            res.setHeader("X-Kronos-Stale-Age-Ms", String(manifest.staleAgeMs || 0));
+        }
         res.send(manifest.text);
     } catch (err) {
         console.error("[PROXY TS LIVE]", err?.response?.status || err.code || err.message);
