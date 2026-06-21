@@ -37,3 +37,16 @@ test("buildStream disables offline placeholder blocking for vetrina channels", (
     assert.equal(new URL(buildStream(primafilaEvent, "http://kronos.test", "abc").url).searchParams.get("pg"), "1");
     assert.equal(new URL(buildStream(live, "http://kronos.test", "abc").url).searchParams.get("pg"), "1");
 });
+
+test("buildStream sends direct TS channels through the live TS relay", () => {
+    const stream = buildStream({
+        id: "channel_ts",
+        name: "DAZN WEB 1",
+        group: "DAZN",
+        url: "http://stream.example/live/user/pass/123.ts"
+    }, "http://kronos.test", "abc");
+
+    const url = new URL(stream.url);
+    assert.equal(url.pathname, "/abc/proxy/live.ts");
+    assert.ok(url.searchParams.get("u"));
+});

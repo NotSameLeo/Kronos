@@ -679,6 +679,156 @@ async function fetchSegmentStream(upstream, headers) {
     });
 }
 
+async function relayLiveTs(configKey, routeKey, upstream, req, res) {
+    const startedAt = Date.now();
+    const sessionKey = hashKey(`${routeKey}|${clientAddress(req)}|${userAgent(req)}|${upstream}|live-ts`, 16);
+    const upstreamHash = hashKey(upstream, 12);
+    let clientClosed = false;
+    let headersSent = false;
+    let reconnects = 0;
+    let totalBytes = 0;
+    let activeResponse = null;
+
+    const closeActive = () => closeUpstreamResponse(activeResponse);
+    req.once("aborted", () => {
+        clientClosed = true;
+        closeActive();
+    });
+    res.once("close", () => {
+        clientClosed = true;
+        closeActive();
+    });
+
+    logLiveTs("START", {
+        sid: sessionKey,
+        route: shortValue(routeKey),
+        cfg: hashKey(configKey, 10),
+        src: upstreamHash,
+        rangeIgnored: req.headers.range ? 1 : 0,
+        ip: clientAddress(req),
+        ua: compactUserAgent(req)
+    });
+
+    while (!clientClosed && !res.destroyed) {
+        const partStartedAt = Date.now();
+        let partBytes = 0;
+        try {
+            activeResponse = await fetchSegmentStream(upstream, RELAY_HEADERS);
+            if (!headersSent) {
+                res.status(200);
+                setLiveTsHeaders(res, activeResponse);
+                res.flushHeaders?.();
+                headersSent = true;
+            }
+
+            await pipeLiveTsPart(activeResponse, res, chunk => {
+                const size = Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk);
+                partBytes += size;
+                totalBytes += size;
+            });
+
+            logLiveTs("PART", {
+                sid: sessionKey,
+                route: shortValue(routeKey),
+                src: upstreamHash,
+                status: activeResponse.status,
+                partBytes,
+                totalBytes,
+                partMs: Date.now() - partStartedAt,
+                reconnects
+            });
+            closeUpstreamResponse(activeResponse);
+            activeResponse = null;
+            if (!clientClosed && !res.destroyed) {
+                reconnects += 1;
+                await sleep(settings.TS_LIVE_RECONNECT_DELAY_MS);
+            }
+        } catch (err) {
+            closeUpstreamResponse(activeResponse);
+            activeResponse = null;
+            if (clientClosed || res.destroyed) break;
+            logLiveTs("ERR", {
+                sid: sessionKey,
+                route: shortValue(routeKey),
+                src: upstreamHash,
+                status: err?.response?.status || "-",
+                code: err?.code || "-",
+                reconnects,
+                msg: compactMessage(err?.message || "ts live relay error")
+            }, true);
+            if (!headersSent) throw err;
+            reconnects += 1;
+            await sleep(settings.TS_LIVE_ERROR_RETRY_MS);
+        }
+    }
+
+    closeUpstreamResponse(activeResponse);
+    if (!res.destroyed && !res.writableEnded) res.end();
+    logLiveTs("END", {
+        sid: sessionKey,
+        route: shortValue(routeKey),
+        src: upstreamHash,
+        totalBytes,
+        reconnects,
+        durationMs: Date.now() - startedAt
+    });
+}
+
+function pipeLiveTsPart(upstreamResponse, res, onChunk) {
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        const stream = upstreamResponse?.data;
+        const settle = (fn, value) => {
+            if (settled) return;
+            settled = true;
+            res.off("drain", onDrain);
+            res.off("close", onClose);
+            stream?.off?.("data", onData);
+            stream?.off?.("end", onEnd);
+            stream?.off?.("error", onError);
+            fn(value);
+        };
+        const onData = chunk => {
+            onChunk(chunk);
+            if (!res.write(chunk)) stream.pause();
+        };
+        const onDrain = () => stream?.resume?.();
+        const onEnd = () => settle(resolve);
+        const onClose = () => settle(resolve);
+        const onError = err => settle(reject, err);
+
+        res.on("drain", onDrain);
+        res.once("close", onClose);
+        stream.on("data", onData);
+        stream.once("end", onEnd);
+        stream.once("error", onError);
+    });
+}
+
+function setLiveTsHeaders(res, upstreamResponse) {
+    const contentType = upstreamResponse?.headers?.["content-type"] || "video/mp2t";
+    res.setHeader("Content-Type", String(contentType).includes("video") ? contentType : "video/mp2t");
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, no-transform");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+    res.setHeader("Surrogate-Control", "no-store");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.setHeader("X-Kronos-Relay", "1");
+    res.setHeader("X-Kronos-Live-Ts", "1");
+    res.setHeader("Accept-Ranges", "none");
+    res.removeHeader("Content-Length");
+    res.removeHeader("Content-Range");
+    res.removeHeader("ETag");
+    res.removeHeader("Last-Modified");
+}
+
+function logLiveTs(label, fields, warn = false) {
+    if (!settings.HLS_DIAGNOSTICS) return;
+    const line = `[TS LIVE ${label}] ${formatFields(fields)}`;
+    if (warn) console.warn(line);
+    else console.log(line);
+}
+
 function closeUpstreamResponse(upstreamResponse) {
     try { upstreamResponse?.data?.destroy?.(); } catch {}
     try { upstreamResponse?.request?.destroy?.(); } catch {}
@@ -901,6 +1051,7 @@ module.exports = {
     isOfflinePlaceholderManifest,
     manifestProxyUrl,
     monitorSegmentTransfer,
+    relayLiveTs,
     rewriteManifest,
     segmentIdentity,
     segmentProxyUrl,

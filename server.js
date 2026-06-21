@@ -42,6 +42,7 @@ const {
     monitorSegmentTransfer,
     RELAY_HEADERS,
     releaseActiveUpstream,
+    relayLiveTs,
     setPlaylistHeaders
 } = require("./src/proxy");
 const {
@@ -366,6 +367,10 @@ function registerProxyRoutes() {
     app.get("/:shortConfig([a-f0-9]{8,20})/proxy/live.m3u8", attachShortConfig, proxyManifestResponse);
     app.get("/c/:shortConfig/proxy/live.m3u8", attachShortConfig, proxyManifestResponse);
     app.get("/:base64Config/proxy/live.m3u8", proxyManifestResponse);
+    app.get("/proxy/live.ts", attachDefaultConfig, proxyLiveTsResponse);
+    app.get("/:shortConfig([a-f0-9]{8,20})/proxy/live.ts", attachShortConfig, proxyLiveTsResponse);
+    app.get("/c/:shortConfig/proxy/live.ts", attachShortConfig, proxyLiveTsResponse);
+    app.get("/:base64Config/proxy/live.ts", proxyLiveTsResponse);
     app.get("/proxy/seg", attachDefaultConfig, proxySegmentResponse);
     app.get("/:shortConfig([a-f0-9]{8,20})/proxy/seg", attachShortConfig, proxySegmentResponse);
     app.get("/c/:shortConfig/proxy/seg", attachShortConfig, proxySegmentResponse);
@@ -393,6 +398,18 @@ async function proxyManifestResponse(req, res) {
             }
             res.status(502).type("text/plain").send("#EXTM3U\n");
         }
+    }
+}
+
+async function proxyLiveTsResponse(req, res) {
+    const { configKey, routeKey } = getRequestConfig(req);
+    try {
+        const upstream = decodeProxyUrl(req.query.u || "");
+        if (!isHttpUrl(upstream) || !isDirectTsUrl(upstream)) return res.status(400).end();
+        await relayLiveTs(configKey, routeKey, upstream, req, res);
+    } catch (err) {
+        console.error("[PROXY TS LIVE]", err?.response?.status || err.code || err.message);
+        if (!res.headersSent) res.status(502).end();
     }
 }
 
@@ -438,6 +455,10 @@ async function proxySegmentResponse(req, res) {
 
 function isDirectTsProxyRequest(upstream, req) {
     if (req.query.p || req.query.s) return false;
+    return isDirectTsUrl(upstream);
+}
+
+function isDirectTsUrl(upstream) {
     try {
         return new URL(upstream).pathname.toLowerCase().endsWith(".ts");
     } catch {

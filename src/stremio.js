@@ -63,6 +63,15 @@ function buildStream(channel, host, routeKey) {
     }
 
     if (isHttpUrl(channel.url)) {
+        if (isDirectTsUrl(channel.url)) {
+            return {
+                title: channel.name,
+                name: "TV",
+                url: `${base}/proxy/live.ts?u=${encodeBase64Url(channel.url)}`,
+                behaviorHints
+            };
+        }
+
         return {
             title: channel.name,
             name: "TV",
@@ -81,6 +90,14 @@ function buildStream(channel, host, routeKey) {
 function shouldBlockOfflinePlaceholders(channel) {
     const text = `${channel?.name || ""} ${channel?.group || ""}`.toLowerCase();
     return !/\b(?:vetrina|info\s+eventi)\b/.test(text);
+}
+
+function isDirectTsUrl(value) {
+    try {
+        return new URL(value).pathname.toLowerCase().endsWith(".ts");
+    } catch {
+        return false;
+    }
 }
 
 function toMeta(channel, host, routeKey = "", options = {}) {
