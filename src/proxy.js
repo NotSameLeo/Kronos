@@ -105,7 +105,8 @@ async function fetchCoalescedUpstreamManifest(cacheKey, upstream) {
 
 async function getRewrittenManifest(configKey, upstream, host, routeKey = configKey, req = null) {
     const key = hashKey(`${configKey}|${host}|${routeKey}|manifest|${upstream}`);
-    if (state.manifestInflight.has(key)) return state.manifestInflight.get(key);
+    const bypassRawCache = Boolean(req?.kronosBypassManifestCache || req?.query?.refresh === "1");
+    if (!bypassRawCache && state.manifestInflight.has(key)) return state.manifestInflight.get(key);
     const rawCacheKey = hashKey(`${configKey}|${routeKey}|raw-manifest|${upstream}`);
 
     const promise = (async () => {
@@ -116,7 +117,9 @@ async function getRewrittenManifest(configKey, upstream, host, routeKey = config
         const holdBackSeconds = holdBackFromRequest(req);
 
         try {
-            const fetched = await fetchCoalescedUpstreamManifest(rawCacheKey, upstream);
+            const fetched = bypassRawCache
+                ? await fetchFreshUpstreamManifest(rawCacheKey, upstream)
+                : await fetchCoalescedUpstreamManifest(rawCacheKey, upstream);
             const analysis = analyzeManifest(fetched.data, fetched.finalUrl);
             if (blockOfflinePlaceholders && isOfflinePlaceholderManifest(analysis)) {
                 logManifestEvent({
@@ -217,6 +220,12 @@ function rememberRecentRawManifest(key, fetched) {
     while (state.manifestRawRecent.size > 100) {
         state.manifestRawRecent.delete(state.manifestRawRecent.keys().next().value);
     }
+}
+
+async function fetchFreshUpstreamManifest(cacheKey, upstream) {
+    const fetched = await fetchUpstreamManifest(upstream);
+    rememberRecentRawManifest(cacheKey, fetched);
+    return { ...fetched, manifestCache: "refresh", cacheAgeMs: 0 };
 }
 
 function rememberLastGoodManifest(key, entry) {
@@ -1211,6 +1220,7 @@ async function fetchSegmentWithHealing(configKey, routeKey, upstream, headers, r
         }
 
         try {
+            req.kronosBypassManifestCache = true;
             await getRewrittenManifest(configKey, parentPlaylistUrl, getPublicHost(req), routeKey, req);
             const healedUrl = getRememberedSegmentUrl(configKey, parentPlaylistUrl, identity);
             if (healedUrl && healedUrl !== upstream) {
@@ -1223,6 +1233,8 @@ async function fetchSegmentWithHealing(configKey, routeKey, upstream, headers, r
             }
         } catch (healErr) {
             console.warn(`[PROXY SEG HEAL FAILED] ${healErr.message}`);
+        } finally {
+            delete req.kronosBypassManifestCache;
         }
 
         logSegmentError(context, err, { healedAttempted: true });

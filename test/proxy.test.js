@@ -2,7 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const http = require("node:http");
 const state = require("../src/state");
-const { analyzeManifest, copyResponseHeaders, getRewrittenManifest, isOfflinePlaceholderManifest, rewriteManifest, segmentIdentity } = require("../src/proxy");
+const { analyzeManifest, copyResponseHeaders, fetchSegmentWithHealing, getRewrittenManifest, isOfflinePlaceholderManifest, rewriteManifest, segmentIdentity } = require("../src/proxy");
 
 test("rewriteManifest relays media playlist URLs without live-edge rules", () => {
     const upstream = "http://upstream.example/live/index.m3u8?token=abc";
@@ -253,5 +253,36 @@ test("getRewrittenManifest coalesces duplicate upstream manifest fetches", async
         state.manifestRawInflight.clear();
         state.manifestRawRecent.clear();
         state.manifestLastGood.clear();
+    }
+});
+
+test("fetchSegmentWithHealing retries transient provider 530 before exposing an error", async () => {
+    let hits = 0;
+    const server = http.createServer((req, res) => {
+        hits++;
+        if (hits <= 3) {
+            res.writeHead(530, { "Content-Type": "text/plain" });
+            res.end("temporary upstream error");
+            return;
+        }
+        res.writeHead(200, { "Content-Type": "video/mp2t", "Content-Length": "4" });
+        res.end("data");
+    });
+    await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+
+    try {
+        const upstream = `http://127.0.0.1:${server.address().port}/seg.ts`;
+        const req = {
+            query: {},
+            headers: {},
+            ip: "127.0.0.1",
+            get: name => name.toLowerCase() === "user-agent" ? "test-player" : ""
+        };
+        const response = await fetchSegmentWithHealing("segment-530-config", "route-a", upstream, {}, req);
+        assert.equal(response.status, 200);
+        assert.equal(hits, 4);
+        response.data.destroy();
+    } finally {
+        await new Promise(resolve => server.close(resolve));
     }
 });
