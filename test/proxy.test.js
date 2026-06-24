@@ -1,8 +1,9 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const http = require("node:http");
+const { EventEmitter } = require("node:events");
 const state = require("../src/state");
-const { analyzeManifest, copyResponseHeaders, fetchSegmentWithHealing, getRewrittenManifest, isOfflinePlaceholderManifest, releaseStaleManifest, rewriteManifest, rewriteManifestDetailed, segmentIdentity } = require("../src/proxy");
+const { analyzeManifest, copyResponseHeaders, fetchSegmentWithHealing, getRewrittenManifest, isOfflinePlaceholderManifest, monitorSegmentTransfer, releaseStaleManifest, rewriteManifest, rewriteManifestDetailed, segmentIdentity } = require("../src/proxy");
 
 test("rewriteManifest relays media playlist URLs without live-edge rules", () => {
     const upstream = "http://upstream.example/live/index.m3u8?token=abc";
@@ -209,6 +210,52 @@ test("copyResponseHeaders hides finite range metadata for direct TS streams", ()
     assert.equal(headers.has("content-range"), false);
     assert.equal(headers.has("accept-ranges"), false);
     assert.equal(headers.has("etag"), false);
+});
+
+test("monitorSegmentTransfer completes passive TS diagnostics without affecting the response", () => {
+    const data = new EventEmitter();
+    const res = new EventEmitter();
+    res.writableFinished = false;
+    res.writableEnded = false;
+    const context = {
+        sessionKey: "diagnostic-session",
+        routeKey: "route-a",
+        streamFormat: "hls-segment",
+        urlExtension: "ts",
+        upstream: "http://upstream.example/seg.ts",
+        movement: "unknown",
+        sequenceDelta: null,
+        metadata: {
+            sequence: 100,
+            duration: 10,
+            urlHash: "segment100"
+        }
+    };
+    const upstreamResponse = {
+        data,
+        headers: { "content-length": "188" },
+        kronosContext: context
+    };
+    const lines = [];
+    const originalLog = console.log;
+    console.log = line => lines.push(String(line));
+    try {
+        monitorSegmentTransfer(upstreamResponse, {}, res);
+        const packet = Buffer.alloc(188, 0xff);
+        packet[0] = 0x47;
+        packet[1] = 0x1f;
+        packet[2] = 0xff;
+        packet[3] = 0x10;
+        data.emit("data", packet);
+        data.emit("end");
+        res.writableFinished = true;
+        res.emit("finish");
+    } finally {
+        console.log = originalLog;
+    }
+
+    assert.ok(lines.some(line => line.startsWith("[HLS SEG SENT]")));
+    assert.ok(lines.some(line => line.startsWith("[TS SEG DIAG]") && line.includes("complete=1")));
 });
 
 test("analyzeManifest exposes live sequence diagnostics", () => {

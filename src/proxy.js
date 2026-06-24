@@ -895,6 +895,9 @@ function monitorSegmentTransfer(upstreamResponse, req, res) {
         if (logged) return;
         logged = true;
         const responseFinished = res.writableFinished || res.writableEnded;
+        const completeByBytes = expectedBytes > 0
+            ? bytesSent >= expectedBytes
+            : upstreamEnded && responseFinished;
         logSegmentTransfer(context, {
             reason,
             bytesSent,
