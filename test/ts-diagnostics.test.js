@@ -35,6 +35,7 @@ test("TS diagnostics reads PAT, PMT, PCR, PTS, continuity and initial keyframe",
     assert.equal(result.ptsSpanMs, 1000);
     assert.equal(result.pcrSpanMs, 1000);
     assert.equal(result.keyframeAtStart, true);
+    assert.equal(result.ptsRegressions, 0);
     assert.equal(result.continuityErrors, 0);
     assert.equal(result.transportErrors, 0);
 });

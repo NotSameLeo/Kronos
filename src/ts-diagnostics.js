@@ -25,7 +25,7 @@ class TsSegmentDiagnostics {
         this.pcrByPid = new Map();
         this.firstPts90k = null;
         this.lastPts90k = null;
-        this.ptsBackwards = 0;
+        this.ptsRegressions = 0;
         this.firstVideoPes = null;
         this.firstVideoPesComplete = false;
         this.keyframeAtStart = null;
@@ -210,7 +210,7 @@ class TsSegmentDiagnostics {
     rememberPts(value) {
         if (this.firstPts90k === null) this.firstPts90k = value;
         if (this.lastPts90k !== null && signedWrapDelta(value, this.lastPts90k, PTS_WRAP) < 0) {
-            this.ptsBackwards++;
+            this.ptsRegressions++;
         }
         this.lastPts90k = value;
     }
@@ -234,7 +234,7 @@ class TsSegmentDiagnostics {
             firstPts90k: this.firstPts90k,
             lastPts90k: this.lastPts90k,
             ptsSpanMs: ticksToMs(this.firstPts90k, this.lastPts90k, PTS_WRAP, 90),
-            ptsBackwards: this.ptsBackwards,
+            ptsRegressions: this.ptsRegressions,
             keyframeAtStart: this.keyframeAtStart
         };
     }

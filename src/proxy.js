@@ -949,7 +949,7 @@ function logTsSegmentDiagnostics(context, current, options = {}) {
         ptsSpanMs: valueOrDash(diagnostics.ptsSpanMs),
         ptsGapMs: valueOrDash(diagnostics.ptsGapMs),
         pcrBackwards: diagnostics.pcrBackwards,
-        ptsBackwards: diagnostics.ptsBackwards,
+        ptsRegressions: diagnostics.ptsRegressions,
         pcrOverlap: diagnostics.pcrOverlap ? 1 : 0,
         ptsOverlap: diagnostics.ptsOverlap ? 1 : 0,
         overlap: diagnostics.overlap ? 1 : 0,
