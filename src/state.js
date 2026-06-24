@@ -21,6 +21,7 @@ module.exports = {
     segmentMaps: new Map(),
     segmentMetadata: new Map(),
     playbackSessions: new Map(),
+    tsDiagnosticSessions: new Map(),
     activeSegmentUpstreams: new Map(),
     shortConfigs: null,
     updatingCatalog: new Set()

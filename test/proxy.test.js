@@ -2,7 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const http = require("node:http");
 const state = require("../src/state");
-const { analyzeManifest, copyResponseHeaders, fetchSegmentWithHealing, getRewrittenManifest, isOfflinePlaceholderManifest, rewriteManifest, segmentIdentity } = require("../src/proxy");
+const { analyzeManifest, copyResponseHeaders, fetchSegmentWithHealing, getRewrittenManifest, isOfflinePlaceholderManifest, releaseStaleManifest, rewriteManifest, rewriteManifestDetailed, segmentIdentity } = require("../src/proxy");
 
 test("rewriteManifest relays media playlist URLs without live-edge rules", () => {
     const upstream = "http://upstream.example/live/index.m3u8?token=abc";
@@ -73,6 +73,57 @@ test("rewriteManifest hides newest live segments to keep a stability buffer", ()
     const segmentLines = out.split("\n").filter(line => line.includes("/proxy/seg?"));
     assert.equal(segmentLines.length, 3);
     assert.match(Buffer.from(new URL(segmentLines.at(-1)).searchParams.get("u"), "base64url").toString(), /seg52\.ts$/);
+});
+
+test("stale manifest recovery releases only real reserved segments over time", () => {
+    const upstream = "http://upstream.example/live/index.m3u8";
+    const text = [
+        "#EXTM3U",
+        "#EXT-X-TARGETDURATION:10",
+        "#EXT-X-MEDIA-SEQUENCE:50",
+        "#EXTINF:10,",
+        "seg50.ts",
+        "#EXTINF:10,",
+        "seg51.ts",
+        "#EXTINF:10,",
+        "seg52.ts",
+        "#EXTINF:10,",
+        "seg53.ts",
+        "#EXTINF:10,",
+        "seg54.ts",
+        "#EXTINF:10,",
+        "seg55.ts"
+    ].join("\n");
+
+    const detailed = rewriteManifestDetailed(
+        text,
+        upstream,
+        "http://kronos.test",
+        "config-key",
+        upstream,
+        "short1234",
+        "nonce-a",
+        true,
+        30,
+        30,
+        30
+    );
+    const stale = {
+        text: detailed.text,
+        reserve: detailed.reserve
+    };
+
+    const before = releaseStaleManifest(stale, 9999);
+    const one = releaseStaleManifest(stale, 10000);
+    const two = releaseStaleManifest(stale, 20000);
+    assert.equal(before.released, 0);
+    assert.equal(one.released, 1);
+    assert.equal(two.released, 2);
+    assert.equal(before.text.split("\n").filter(line => line.includes("/proxy/seg?")).length, 3);
+    assert.equal(one.text.split("\n").filter(line => line.includes("/proxy/seg?")).length, 4);
+    assert.equal(two.text.split("\n").filter(line => line.includes("/proxy/seg?")).length, 5);
+    assert.match(one.text, /#EXT-X-SERVER-CONTROL:HOLD-BACK=30/);
+    assert.match(one.text, /#EXT-X-START:TIME-OFFSET=-30,PRECISE=NO/);
 });
 
 test("rewriteManifest can add a playback start offset for delayed live playlists", () => {

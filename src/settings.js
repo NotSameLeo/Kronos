@@ -57,6 +57,7 @@ module.exports = {
     HLS_PLAYER_HOLD_BACK_SECONDS: numberEnv("HLS_PLAYER_HOLD_BACK_SECONDS", 30, 0, 60),
     HLS_SEGMENT_UPSTREAM_KEEPALIVE: String(process.env.HLS_SEGMENT_UPSTREAM_KEEPALIVE || "0") === "1",
     HLS_DIAGNOSTICS: String(process.env.HLS_DIAGNOSTICS || "1") !== "0",
+    TS_SEGMENT_DIAGNOSTICS: String(process.env.TS_SEGMENT_DIAGNOSTICS || "1") !== "0",
     HLS_DIAGNOSTIC_HEADERS: String(process.env.HLS_DIAGNOSTIC_HEADERS || "0") === "1",
     HLS_DIAGNOSTIC_URLS: String(process.env.HLS_DIAGNOSTIC_URLS || "0") === "1",
     SEGMENT_STRICT_NO_CACHE: String(process.env.SEGMENT_STRICT_NO_CACHE || "1") !== "0",

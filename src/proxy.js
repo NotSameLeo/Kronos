@@ -1,6 +1,7 @@
 const axios = require("axios");
 const settings = require("./settings");
 const state = require("./state");
+const { TsSegmentDiagnostics, compareTsSegments } = require("./ts-diagnostics");
 const {
     decodeBase64Url,
     encodeBase64Url,
@@ -148,7 +149,7 @@ async function getRewrittenManifest(configKey, upstream, host, routeKey = config
             const manifestNonce = settings.HLS_CACHE_BUST_SEGMENTS
                 ? hashKey(`${Date.now()}|${Math.random()}|${fetched.finalUrl}`, 12)
                 : "";
-            const text = rewriteManifest(
+            const rewritten = rewriteManifestDetailed(
                 fetched.data,
                 fetched.finalUrl,
                 host,
@@ -177,26 +178,37 @@ async function getRewrittenManifest(configKey, upstream, host, routeKey = config
                 cacheAgeMs: fetched.cacheAgeMs,
                 holdBackSeconds
             });
-            rememberLastGoodManifest(key, { text, analysis, upstream, routeKey });
-            return { text, analysis, stale: false };
+            rememberLastGoodManifest(key, {
+                text: rewritten.text,
+                reserve: rewritten.reserve,
+                analysis,
+                upstream,
+                routeKey
+            });
+            return { text: rewritten.text, analysis, stale: false };
         } catch (err) {
             const stale = getLastGoodManifest(key);
             if (!stale) throw err;
+            const staleAgeMs = Date.now() - stale.savedAt;
+            const progressive = releaseStaleManifest(stale, staleAgeMs);
             logStaleManifest({
                 req,
                 routeKey,
                 configKey,
                 upstream,
                 err,
-                ageMs: Date.now() - stale.savedAt,
+                ageMs: staleAgeMs,
                 totalMs: Date.now() - startedAt,
-                analysis: stale.analysis
+                analysis: stale.analysis,
+                released: progressive.released,
+                reserveSegments: progressive.reserveSegments
             });
             return {
-                text: stale.text,
+                text: progressive.text,
                 analysis: stale.analysis,
                 stale: true,
-                staleAgeMs: Date.now() - stale.savedAt
+                staleAgeMs,
+                staleReleasedSegments: progressive.released
             };
         }
     })();
@@ -334,6 +346,22 @@ function rewriteUriAttributes(line, baseUrl, makeUrl) {
 }
 
 function rewriteManifest(text, baseUrl, host, configKey, parentPlaylistUrl = baseUrl, routeKey = configKey, manifestNonce = "", blockOfflinePlaceholders = true, liveEdgeDelaySeconds = null, startOffsetSeconds = null, holdBackSeconds = null) {
+    return rewriteManifestDetailed(
+        text,
+        baseUrl,
+        host,
+        configKey,
+        parentPlaylistUrl,
+        routeKey,
+        manifestNonce,
+        blockOfflinePlaceholders,
+        liveEdgeDelaySeconds,
+        startOffsetSeconds,
+        holdBackSeconds
+    ).text;
+}
+
+function rewriteManifestDetailed(text, baseUrl, host, configKey, parentPlaylistUrl = baseUrl, routeKey = configKey, manifestNonce = "", blockOfflinePlaceholders = true, liveEdgeDelaySeconds = null, startOffsetSeconds = null, holdBackSeconds = null) {
     const isMaster = /#EXT-X-STREAM-INF/i.test(text);
     const endList = /#EXT-X-ENDLIST/i.test(text);
     const mediaSequence = readNumericTag(text, "#EXT-X-MEDIA-SEQUENCE");
@@ -377,29 +405,45 @@ function rewriteManifest(text, baseUrl, host, configKey, parentPlaylistUrl = bas
         output.push(segmentProxyUrl(host, routeKey, absolute, parentPlaylistUrl, manifestNonce));
     }
 
-    const delayed = applyLiveEdgeDelay(output.join("\n"), {
+    const delayPlan = buildLiveEdgeDelayPlan(output.join("\n"), {
         enabled: !isMaster,
         endList,
         segmentCount: mediaIndex,
         delaySeconds: liveEdgeDelaySeconds
     });
-    const holdBack = applyServerControlHoldBack(delayed, {
+    const textWithDelay = renderLiveEdgeDelayPlan(delayPlan, 0);
+    const holdBack = applyServerControlHoldBack(textWithDelay, {
         enabled: !isMaster && !endList,
         holdBackSeconds
     });
-    return applyStartOffset(holdBack, {
+    const rewritten = applyStartOffset(holdBack, {
         enabled: !isMaster && !endList,
         offsetSeconds: startOffsetSeconds
     });
+    const reserve = delayPlan.hiddenSegments.length
+        ? {
+            ...delayPlan,
+            holdBackEnabled: !isMaster && !endList,
+            holdBackSeconds,
+            startOffsetEnabled: !isMaster && !endList,
+            startOffsetSeconds
+        }
+        : null;
+    return { text: rewritten, reserve };
 }
 
 function applyLiveEdgeDelay(text, options = {}) {
+    return renderLiveEdgeDelayPlan(buildLiveEdgeDelayPlan(text, options), 0);
+}
+
+function buildLiveEdgeDelayPlan(text, options = {}) {
     const delaySeconds = Number.isFinite(options.delaySeconds)
         ? options.delaySeconds
         : settings.HLS_LIVE_EDGE_DELAY_SECONDS;
-    if (!options.enabled || options.endList || delaySeconds <= 0) return text;
+    const unchanged = { sourceText: text, hiddenSegments: [] };
+    if (!options.enabled || options.endList || delaySeconds <= 0) return unchanged;
     const minSegments = settings.HLS_LIVE_EDGE_MIN_SEGMENTS;
-    if ((options.segmentCount || 0) <= minSegments) return text;
+    if ((options.segmentCount || 0) <= minSegments) return unchanged;
 
     const lines = String(text || "").split(/\r?\n/);
     const segments = [];
@@ -420,7 +464,7 @@ function applyLiveEdgeDelay(text, options = {}) {
         currentExtinf = -1;
     }
 
-    if (segments.length <= minSegments) return text;
+    if (segments.length <= minSegments) return unchanged;
     let delayedSeconds = 0;
     let removeCount = 0;
     for (let index = segments.length - 1; index >= minSegments; index--) {
@@ -428,13 +472,55 @@ function applyLiveEdgeDelay(text, options = {}) {
         removeCount++;
         if (delayedSeconds >= delaySeconds) break;
     }
-    if (!removeCount) return text;
+    if (!removeCount) return unchanged;
+    return {
+        sourceText: text,
+        hiddenSegments: segments.slice(-removeCount)
+    };
+}
 
+function renderLiveEdgeDelayPlan(plan, releasedSegments = 0) {
+    if (!plan?.hiddenSegments?.length) return plan?.sourceText || "";
+    const released = Math.max(0, Math.min(plan.hiddenSegments.length, Math.floor(releasedSegments)));
     const remove = new Set();
-    for (const segment of segments.slice(-removeCount)) {
+    for (const segment of plan.hiddenSegments.slice(released)) {
         for (let index = segment.start; index <= segment.end; index++) remove.add(index);
     }
-    return lines.filter((_line, index) => !remove.has(index)).join("\n");
+    return String(plan.sourceText || "")
+        .split(/\r?\n/)
+        .filter((_line, index) => !remove.has(index))
+        .join("\n");
+}
+
+function releaseStaleManifest(stale, staleAgeMs) {
+    const reserve = stale?.reserve;
+    if (!reserve?.hiddenSegments?.length) {
+        return { text: stale.text, released: 0, reserveSegments: 0 };
+    }
+
+    const elapsedSeconds = Math.max(0, Number(staleAgeMs || 0) / 1000);
+    let cumulativeSeconds = 0;
+    let released = 0;
+    for (const segment of reserve.hiddenSegments) {
+        cumulativeSeconds += Number(segment.duration || 0);
+        if (cumulativeSeconds > elapsedSeconds) break;
+        released++;
+    }
+
+    let text = renderLiveEdgeDelayPlan(reserve, released);
+    text = applyServerControlHoldBack(text, {
+        enabled: reserve.holdBackEnabled,
+        holdBackSeconds: reserve.holdBackSeconds
+    });
+    text = applyStartOffset(text, {
+        enabled: reserve.startOffsetEnabled,
+        offsetSeconds: reserve.startOffsetSeconds
+    });
+    return {
+        text,
+        released,
+        reserveSegments: reserve.hiddenSegments.length
+    };
 }
 
 function applyStartOffset(text, options = {}) {
@@ -639,6 +725,8 @@ function logStaleManifest(event) {
         totalMs: event.totalMs,
         mediaSeq: valueOrDash(analysis.mediaSequence),
         lastSeq: valueOrDash(analysis.lastSegment?.sequence),
+        reserveReleased: valueOrDash(event.released),
+        reserveSegments: valueOrDash(event.reserveSegments),
         playlist: hashKey(event.upstream, 12),
         ip: clientAddress(event.req),
         ua: compactUserAgent(event.req)
@@ -781,6 +869,11 @@ function monitorSegmentTransfer(upstreamResponse, req, res) {
     if (!settings.HLS_DIAGNOSTICS || !context || !upstreamResponse?.data) return;
 
     const startedAt = Date.now();
+    const tsDiagnostics = settings.TS_SEGMENT_DIAGNOSTICS
+        && context.streamFormat === "hls-segment"
+        && context.urlExtension === "ts"
+        ? new TsSegmentDiagnostics()
+        : null;
     let bytesSent = 0;
     let upstreamEnded = false;
     let upstreamError = false;
@@ -789,6 +882,7 @@ function monitorSegmentTransfer(upstreamResponse, req, res) {
 
     upstreamResponse.data.on("data", chunk => {
         bytesSent += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk);
+        tsDiagnostics?.push(chunk);
     });
     upstreamResponse.data.on("end", () => {
         upstreamEnded = true;
@@ -811,10 +905,71 @@ function monitorSegmentTransfer(upstreamResponse, req, res) {
             upstreamError,
             durationMs: Date.now() - startedAt
         });
+        if (tsDiagnostics) {
+            logTsSegmentDiagnostics(context, tsDiagnostics.finish(), {
+                complete: completeByBytes
+            });
+        }
     };
 
     res.once("finish", () => finish("finish"));
     res.once("close", () => finish("close"));
+}
+
+function logTsSegmentDiagnostics(context, current, options = {}) {
+    const previous = state.tsDiagnosticSessions.get(context.sessionKey) || null;
+    const consecutive = context.sequenceDelta === 1;
+    const diagnostics = compareTsSegments(consecutive ? previous : null, current, context.metadata?.duration);
+    if (options.complete && context.movement !== "repeat" && context.movement !== "backtrack") {
+        state.tsDiagnosticSessions.set(context.sessionKey, {
+            lastPcr27m: current.lastPcr27m,
+            lastPts90k: current.lastPts90k,
+            savedAt: Date.now()
+        });
+        trimTsDiagnosticSessions();
+    }
+
+    console.log(`[TS SEG DIAG] ${formatFields({
+        sid: context.sessionKey,
+        route: shortValue(context.routeKey),
+        seg: context.metadata?.urlHash || hashKey(context.upstream, 12),
+        seq: valueOrDash(context.metadata?.sequence),
+        codec: diagnostics.codec || "-",
+        videoPid: valueOrDash(diagnostics.videoPid),
+        pcrPid: valueOrDash(diagnostics.pcrPid),
+        firstPcr: valueOrDash(diagnostics.firstPcr27m),
+        lastPcr: valueOrDash(diagnostics.lastPcr27m),
+        pcrSpanMs: valueOrDash(diagnostics.pcrSpanMs),
+        pcrGapMs: valueOrDash(diagnostics.pcrGapMs),
+        firstPts: valueOrDash(diagnostics.firstPts90k),
+        lastPts: valueOrDash(diagnostics.lastPts90k),
+        ptsSpanMs: valueOrDash(diagnostics.ptsSpanMs),
+        ptsGapMs: valueOrDash(diagnostics.ptsGapMs),
+        pcrBackwards: diagnostics.pcrBackwards,
+        ptsBackwards: diagnostics.ptsBackwards,
+        pcrOverlap: diagnostics.pcrOverlap ? 1 : 0,
+        ptsOverlap: diagnostics.ptsOverlap ? 1 : 0,
+        overlap: diagnostics.overlap ? 1 : 0,
+        continuityErrors: diagnostics.continuityErrors,
+        transportErrors: diagnostics.transportErrors,
+        syncLossBytes: diagnostics.syncLossBytes,
+        keyframeAtStart: diagnostics.keyframeAtStart === null ? "-" : (diagnostics.keyframeAtStart ? 1 : 0),
+        declaredMs: valueOrDash(diagnostics.declaredMs),
+        observedSpanMs: valueOrDash(diagnostics.observedSpanMs),
+        declaredDeltaMs: valueOrDash(diagnostics.declaredDeltaMs),
+        complete: options.complete ? 1 : 0,
+        consecutive: consecutive ? 1 : 0,
+        packets: diagnostics.packetCount
+    })}`);
+}
+
+function trimTsDiagnosticSessions() {
+    if (state.tsDiagnosticSessions.size <= 200) return;
+    const entries = [...state.tsDiagnosticSessions.entries()]
+        .sort((a, b) => (a[1].savedAt || 0) - (b[1].savedAt || 0));
+    for (const [key] of entries.slice(0, state.tsDiagnosticSessions.size - 200)) {
+        state.tsDiagnosticSessions.delete(key);
+    }
 }
 
 function formatFields(fields) {
@@ -1363,6 +1518,8 @@ module.exports = {
     monitorSegmentTransfer,
     relayLiveTs,
     rewriteManifest,
+    rewriteManifestDetailed,
+    releaseStaleManifest,
     segmentIdentity,
     segmentProxyUrl,
     setPlaylistHeaders
