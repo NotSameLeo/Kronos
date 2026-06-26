@@ -47,9 +47,9 @@ test("buildStream gives native HLS channels conservative live playback hints", (
     }, "http://kronos.test", "abc");
     const url = new URL(stream.url);
 
-    assert.equal(url.pathname, "/abc/proxy/live.m3u8");
-    assert.equal(url.searchParams.get("d"), "30");
-    assert.equal(url.searchParams.get("st"), "15");
+    assert.equal(url.pathname, "/abc/proxy/auto.m3u8");
+    assert.equal(url.searchParams.get("d"), "60");
+    assert.equal(url.searchParams.get("st"), "30");
     assert.equal(url.searchParams.get("hb"), "30");
 });
 
@@ -64,7 +64,7 @@ test("buildStream sends Xtream TS channels through delayed HLS fallback", () => 
     }, "http://kronos.test", "abc");
 
     const url = new URL(stream.url);
-    assert.equal(url.pathname, "/abc/proxy/live.m3u8");
+    assert.equal(url.pathname, "/abc/proxy/auto.m3u8");
     assert.equal(url.searchParams.get("d"), "60");
     assert.equal(url.searchParams.get("st"), "30");
     assert.equal(url.searchParams.get("hb"), "30");

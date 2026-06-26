@@ -54,7 +54,7 @@ function buildStream(channel, host, routeKey) {
         return {
             title: channel.name,
             name: "TV",
-            url: `${base}/proxy/live.m3u8?${params.toString()}`,
+            url: `${base}/${settings.TRANSCODE_AUTO_ENABLED ? "proxy/auto.m3u8" : "proxy/live.m3u8"}?${params.toString()}`,
             behaviorHints
         };
     }
@@ -66,7 +66,7 @@ function buildStream(channel, host, routeKey) {
             return {
                 title: channel.name,
                 name: "TV",
-                url: `${base}/proxy/live.m3u8?${params.toString()}`,
+                url: `${base}/${settings.TRANSCODE_AUTO_ENABLED ? "proxy/auto.m3u8" : "proxy/live.m3u8"}?${params.toString()}`,
                 behaviorHints
             };
         }

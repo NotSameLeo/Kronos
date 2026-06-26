@@ -45,6 +45,11 @@ const {
     setPlaylistHeaders
 } = require("./src/proxy");
 const {
+    adaptiveMasterManifest,
+    serveTranscodeFile,
+    transcodeManifest
+} = require("./src/transcode");
+const {
     buildManifest,
     buildStream,
     logoSvg,
@@ -54,7 +59,8 @@ const {
 const {
     getPublicHost,
     isHttpUrl,
-    normalizeGroupName
+    normalizeGroupName,
+    routeBase
 } = require("./src/utils");
 
 installTimestampedConsole();
@@ -123,6 +129,7 @@ app.listen(settings.PORT, "0.0.0.0", () => {
     console.log(`hlsTimeout=${settings.HLS_REQUEST_TIMEOUT / 1000}s segmentTimeout=${settings.SEG_REQUEST_TIMEOUT / 1000}s`);
     console.log(`manifestRetries=${settings.HLS_MANIFEST_RETRIES} manifestCoalesce=${settings.HLS_MANIFEST_COALESCE_MS}ms segmentRetries=${settings.SEGMENT_UPSTREAM_RETRIES}`);
     console.log(`tokenHealing=${settings.SEGMENT_TOKEN_HEALING ? 1 : 0} segmentCacheBust=${settings.HLS_CACHE_BUST_SEGMENTS ? 1 : 0} offlinePlaceholderBlock=${settings.HLS_BLOCK_OFFLINE_PLACEHOLDERS ? 1 : 0} liveEdgeDelay=${settings.HLS_LIVE_EDGE_DELAY_SECONDS}s playerHoldBack=${settings.HLS_PLAYER_HOLD_BACK_SECONDS}s segmentKeepAlive=${settings.HLS_SEGMENT_UPSTREAM_KEEPALIVE ? 1 : 0} rangeForward=1`);
+    console.log(`transcodeAuto=${settings.TRANSCODE_AUTO_ENABLED ? 1 : 0} height=${settings.TRANSCODE_HEIGHT}p video=${settings.TRANSCODE_VIDEO_BITRATE_K}k audio=${settings.TRANSCODE_AUDIO_BITRATE_K}k maxSessions=${settings.TRANSCODE_MAX_SESSIONS}`);
     console.log(`catalogPageSize=${settings.CATALOG_PAGE_SIZE} catalogRefresh=${settings.CATALOG_REFRESH_INTERVAL_MS / 1000}s`);
     console.log(`epgPreload=${settings.EPG_PRELOAD_URLS.length} epgRefresh=${settings.EPG_REFRESH_INTERVAL_MS / 1000}s`);
     console.log("============================================================");
@@ -175,7 +182,7 @@ function dynamicNoCacheMiddleware(req, res, next) {
 }
 
 function isDynamicStremioPath(pathname) {
-    return /(?:^|\/)(?:manifest\.json|catalog\/|meta\/|stream\/|stats$|debug$|api\/config\/|api\/preload-config|api\/analyze-|proxy\/live\.m3u8|proxy\/live\.ts)/i.test(pathname);
+    return /(?:^|\/)(?:manifest\.json|catalog\/|meta\/|stream\/|stats$|debug$|api\/config\/|api\/preload-config|api\/analyze-|proxy\/auto\.m3u8|proxy\/live\.m3u8|proxy\/live\.ts|proxy\/transcode)/i.test(pathname);
 }
 
 function requestLogMiddleware(req, res, next) {
@@ -383,10 +390,22 @@ async function configPosterResponse(req, res) {
 }
 
 function registerProxyRoutes() {
+    app.get("/proxy/auto.m3u8", attachDefaultConfig, proxyAutoManifestResponse);
+    app.get("/:shortConfig([a-f0-9]{8,20})/proxy/auto.m3u8", attachShortConfig, proxyAutoManifestResponse);
+    app.get("/c/:shortConfig/proxy/auto.m3u8", attachShortConfig, proxyAutoManifestResponse);
+    app.get("/:base64Config/proxy/auto.m3u8", proxyAutoManifestResponse);
     app.get("/proxy/live.m3u8", attachDefaultConfig, proxyManifestResponse);
     app.get("/:shortConfig([a-f0-9]{8,20})/proxy/live.m3u8", attachShortConfig, proxyManifestResponse);
     app.get("/c/:shortConfig/proxy/live.m3u8", attachShortConfig, proxyManifestResponse);
     app.get("/:base64Config/proxy/live.m3u8", proxyManifestResponse);
+    app.get("/proxy/transcode.m3u8", attachDefaultConfig, proxyTranscodeManifestResponse);
+    app.get("/:shortConfig([a-f0-9]{8,20})/proxy/transcode.m3u8", attachShortConfig, proxyTranscodeManifestResponse);
+    app.get("/c/:shortConfig/proxy/transcode.m3u8", attachShortConfig, proxyTranscodeManifestResponse);
+    app.get("/:base64Config/proxy/transcode.m3u8", proxyTranscodeManifestResponse);
+    app.get("/proxy/transcode/:session/:file", proxyTranscodeFileResponse);
+    app.get("/:shortConfig([a-f0-9]{8,20})/proxy/transcode/:session/:file", proxyTranscodeFileResponse);
+    app.get("/c/:shortConfig/proxy/transcode/:session/:file", proxyTranscodeFileResponse);
+    app.get("/:base64Config/proxy/transcode/:session/:file", proxyTranscodeFileResponse);
     app.get("/proxy/live.ts", attachDefaultConfig, proxyLiveTsResponse);
     app.get("/:shortConfig([a-f0-9]{8,20})/proxy/live.ts", attachShortConfig, proxyLiveTsResponse);
     app.get("/c/:shortConfig/proxy/live.ts", attachShortConfig, proxyLiveTsResponse);
@@ -395,6 +414,29 @@ function registerProxyRoutes() {
     app.get("/:shortConfig([a-f0-9]{8,20})/proxy/seg", attachShortConfig, proxySegmentResponse);
     app.get("/c/:shortConfig/proxy/seg", attachShortConfig, proxySegmentResponse);
     app.get("/:base64Config/proxy/seg", proxySegmentResponse);
+}
+
+async function proxyAutoManifestResponse(req, res) {
+    try {
+        const { routeKey } = getRequestConfig(req);
+        const upstream = decodeProxyUrl(req.query.u || "");
+        if (!isHttpUrl(upstream)) return res.status(400).type("text/plain").send("#EXTM3U\n");
+        setPlaylistHeaders(res);
+        res.setHeader("X-Kronos-Relay", "1");
+        res.setHeader("X-Kronos-Auto-Transcode", settings.TRANSCODE_AUTO_ENABLED ? "1" : "0");
+        if (!settings.TRANSCODE_AUTO_ENABLED) {
+            return res.redirect(302, `${routeBase(getPublicHost(req), routeKey)}/proxy/live.m3u8?${new URLSearchParams(req.query).toString()}`);
+        }
+        res.send(adaptiveMasterManifest(getPublicHost(req), routeKey, upstream, {
+            blockOfflinePlaceholders: req.query.pg !== "0",
+            liveEdgeDelaySeconds: queryNumber(req.query.d),
+            startOffsetSeconds: queryNumber(req.query.st),
+            holdBackSeconds: queryNumber(req.query.hb)
+        }));
+    } catch (err) {
+        console.error("[PROXY AUTO M3U8]", err.message);
+        if (!res.headersSent) res.status(502).type("text/plain").send("#EXTM3U\n");
+    }
 }
 
 async function proxyManifestResponse(req, res) {
@@ -425,6 +467,29 @@ async function proxyManifestResponse(req, res) {
     }
 }
 
+async function proxyTranscodeManifestResponse(req, res) {
+    try {
+        const { routeKey } = getRequestConfig(req);
+        const upstream = decodeProxyUrl(req.query.u || "");
+        if (!isHttpUrl(upstream)) return res.status(400).type("text/plain").send("#EXTM3U\n");
+        const manifest = await transcodeManifest(getPublicHost(req), routeKey, upstream, req);
+        setPlaylistHeaders(res);
+        res.setHeader("X-Kronos-Relay", "1");
+        res.setHeader("X-Kronos-Transcode", "1");
+        res.send(manifest);
+    } catch (err) {
+        console.error("[PROXY TRANSCODE M3U8]", err.message);
+        if (!res.headersSent) {
+            res.setHeader("Retry-After", "2");
+            res.status(err.statusCode || 503).type("text/plain").send("#EXTM3U\n");
+        }
+    }
+}
+
+async function proxyTranscodeFileResponse(req, res) {
+    await serveTranscodeFile(req.params.session, req.params.file, res);
+}
+
 async function proxyLiveTsResponse(req, res) {
     const { configKey, routeKey } = getRequestConfig(req);
     try {
@@ -446,6 +511,11 @@ async function proxyLiveTsResponse(req, res) {
         console.error("[PROXY TS LIVE]", err?.response?.status || err.code || err.message);
         if (!res.headersSent) res.status(502).end();
     }
+}
+
+function queryNumber(value) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
 }
 
 async function proxySegmentResponse(req, res) {
@@ -598,7 +668,8 @@ function buildStats(configKey) {
             epgMaps: state.epgData.size,
             logos: state.logoData.size,
             hlsSegmentMaps: state.segmentMaps.size,
-            activeSegmentUpstreams: state.activeSegmentUpstreams.size
+            activeSegmentUpstreams: state.activeSegmentUpstreams.size,
+            transcodeSessions: state.transcodeSessions.size
         },
         playback: {
             mode: settings.PLAYBACK_MODE,
@@ -619,7 +690,12 @@ function buildStats(configKey) {
             hlsDiagnostics: settings.HLS_DIAGNOSTICS,
             hlsDiagnosticUrls: settings.HLS_DIAGNOSTIC_URLS,
             hlsDiagnosticHeaders: settings.HLS_DIAGNOSTIC_HEADERS,
-            segmentStrictNoCache: settings.SEGMENT_STRICT_NO_CACHE
+            segmentStrictNoCache: settings.SEGMENT_STRICT_NO_CACHE,
+            transcodeAutoEnabled: settings.TRANSCODE_AUTO_ENABLED,
+            transcodeHeight: settings.TRANSCODE_HEIGHT,
+            transcodeVideoBitrateK: settings.TRANSCODE_VIDEO_BITRATE_K,
+            transcodeAudioBitrateK: settings.TRANSCODE_AUDIO_BITRATE_K,
+            transcodeMaxSessions: settings.TRANSCODE_MAX_SESSIONS
         }
     };
 }

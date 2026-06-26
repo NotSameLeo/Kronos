@@ -23,6 +23,7 @@ module.exports = {
     playbackSessions: new Map(),
     tsDiagnosticSessions: new Map(),
     activeSegmentUpstreams: new Map(),
+    transcodeSessions: new Map(),
     shortConfigs: null,
     updatingCatalog: new Set()
 };
