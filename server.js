@@ -46,6 +46,7 @@ const {
 } = require("./src/proxy");
 const {
     adaptiveMasterManifest,
+    prewarmTranscode,
     serveTranscodeFile,
     transcodeManifest
 } = require("./src/transcode");
@@ -427,6 +428,7 @@ async function proxyAutoManifestResponse(req, res) {
         if (!settings.TRANSCODE_AUTO_ENABLED) {
             return res.redirect(302, `${routeBase(getPublicHost(req), routeKey)}/proxy/live.m3u8?${new URLSearchParams(req.query).toString()}`);
         }
+        prewarmTranscode(upstream, req.query.h);
         res.send(adaptiveMasterManifest(getPublicHost(req), routeKey, upstream, {
             blockOfflinePlaceholders: req.query.pg !== "0",
             liveEdgeDelaySeconds: queryNumber(req.query.d),

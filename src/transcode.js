@@ -72,6 +72,14 @@ async function transcodeManifest(host, routeKey, upstream, req) {
     return rewriteTranscodePlaylist(session, host, routeKey);
 }
 
+function prewarmTranscode(upstream, requestedHeight) {
+    if (!settings.TRANSCODE_AUTO_ENABLED || !isHttpUrl(upstream)) return;
+    startCleanupTimer();
+    getOrStartSession(upstream, Number(requestedHeight || settings.TRANSCODE_HEIGHT)).catch(err => {
+        if (settings.HLS_DIAGNOSTICS) console.warn(`[TRANSCODE PREWARM ERR] ${compact(err.message)}`);
+    });
+}
+
 async function serveTranscodeFile(sessionId, fileName, res) {
     const session = state.transcodeSessions.get(sessionId);
     if (!session || !isSafeHlsFile(fileName)) {
@@ -286,6 +294,7 @@ function logTranscode(label, session, fields = {}) {
 
 module.exports = {
     adaptiveMasterManifest,
+    prewarmTranscode,
     serveTranscodeFile,
     transcodeManifest
 };
