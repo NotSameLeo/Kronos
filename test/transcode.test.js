@@ -2,7 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { adaptiveMasterManifest } = require("../src/transcode");
 
-test("adaptiveMasterManifest advertises a low transcoded variant before original", () => {
+test("adaptiveMasterManifest advertises an ABR ladder before original", () => {
     const text = adaptiveMasterManifest("http://kronos.test", "abc", "http://upstream.example/live.m3u8", {
         blockOfflinePlaceholders: true,
         liveEdgeDelaySeconds: 60,
@@ -10,14 +10,17 @@ test("adaptiveMasterManifest advertises a low transcoded variant before original
         holdBackSeconds: 30
     });
     const lines = text.trim().split("\n");
-    const lowUrl = new URL(lines[4]);
-    const originalUrl = new URL(lines[6]);
+    const urls = lines.filter(line => line.startsWith("http://")).map(line => new URL(line));
 
-    assert.match(lines[3], /Kronos Low/);
-    assert.equal(lowUrl.pathname, "/abc/proxy/transcode.m3u8");
-    assert.equal(lowUrl.searchParams.get("h"), "480");
-    assert.equal(lowUrl.searchParams.get("d"), "60");
-    assert.equal(lowUrl.searchParams.get("st"), "30");
-    assert.equal(originalUrl.pathname, "/abc/proxy/live.m3u8");
-    assert.equal(originalUrl.searchParams.get("hb"), "30");
+    assert.match(text, /Kronos 240p/);
+    assert.match(text, /Kronos 360p/);
+    assert.match(text, /Kronos 480p/);
+    assert.equal(urls[0].pathname, "/abc/proxy/transcode.m3u8");
+    assert.equal(urls[0].searchParams.get("v"), "240p");
+    assert.equal(urls[1].searchParams.get("v"), "360p");
+    assert.equal(urls[2].searchParams.get("v"), "480p");
+    assert.equal(urls[0].searchParams.get("d"), "60");
+    assert.equal(urls[0].searchParams.get("st"), "30");
+    assert.equal(urls.at(-1).pathname, "/abc/proxy/live.m3u8");
+    assert.equal(urls.at(-1).searchParams.get("hb"), "30");
 });

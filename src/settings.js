@@ -15,10 +15,34 @@ function parseList(raw) {
         .filter(Boolean);
 }
 
+function parseTranscodeVariants(raw) {
+    const parsed = String(raw || "240:350:64,360:650:96,480:900:96")
+        .split(",")
+        .map(value => {
+            const [heightRaw, videoRaw, audioRaw] = value.split(":");
+            const height = Math.max(144, Math.min(1080, Number(heightRaw) || 0));
+            const videoK = Math.max(150, Math.min(8000, Number(videoRaw) || 0));
+            const audioK = Math.max(32, Math.min(320, Number(audioRaw) || 96));
+            if (!height || !videoK) return null;
+            return {
+                name: `${height}p`,
+                label: `Kronos ${height}p`,
+                height,
+                width: Math.round((height * 16) / 9 / 2) * 2,
+                videoK,
+                audioK
+            };
+        })
+        .filter(Boolean)
+        .sort((a, b) => a.height - b.height);
+    return parsed.length ? parsed : parseTranscodeVariants("240:350:64,360:650:96,480:900:96");
+}
+
 const FRONTEND_PRELOAD_FILE = String(process.env.FRONTEND_PRELOAD_FILE || "").trim();
+const TRANSCODE_VARIANTS = parseTranscodeVariants(process.env.TRANSCODE_VARIANTS);
 
 module.exports = {
-    RELEASE_VERSION: "5.7.0",
+    RELEASE_VERSION: "5.7.1",
     ADDON_TYPE: "tv",
     PLAYBACK_MODE: "plain-hls-relay",
     PORT: process.env.PORT || 7000,
@@ -65,9 +89,12 @@ module.exports = {
     TRANSCODE_INCLUDE_ORIGINAL_VARIANT: String(process.env.TRANSCODE_INCLUDE_ORIGINAL_VARIANT || "1") !== "0",
     TRANSCODE_FFMPEG_PATH: process.env.TRANSCODE_FFMPEG_PATH || "ffmpeg",
     TRANSCODE_WORK_DIR: process.env.TRANSCODE_WORK_DIR || "/tmp/kronos-transcode",
+    TRANSCODE_VARIANTS,
     TRANSCODE_HEIGHT: numberEnv("TRANSCODE_HEIGHT", 480, 144, 1080),
     TRANSCODE_VIDEO_BITRATE_K: numberEnv("TRANSCODE_VIDEO_BITRATE_K", 900, 150, 8000),
     TRANSCODE_AUDIO_BITRATE_K: numberEnv("TRANSCODE_AUDIO_BITRATE_K", 96, 32, 320),
+    TRANSCODE_ORIGINAL_BANDWIDTH: numberEnv("TRANSCODE_ORIGINAL_BANDWIDTH", 18000000, 1000000),
+    TRANSCODE_ORIGINAL_AVERAGE_BANDWIDTH: numberEnv("TRANSCODE_ORIGINAL_AVERAGE_BANDWIDTH", 12000000, 1000000),
     TRANSCODE_HLS_TIME: numberEnv("TRANSCODE_HLS_TIME", 4, 2, 10),
     TRANSCODE_HLS_LIST_SIZE: numberEnv("TRANSCODE_HLS_LIST_SIZE", 12, 4, 30),
     TRANSCODE_START_TIMEOUT_MS: numberEnv("TRANSCODE_START_TIMEOUT_MS", 20000, 1000),

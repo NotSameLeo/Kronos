@@ -31,22 +31,27 @@ function adaptiveMasterManifest(host, routeKey, upstream, options = {}) {
         params.set("hb", String(Math.round(options.holdBackSeconds)));
     }
 
-    const low = new URLSearchParams(params);
-    low.set("h", String(settings.TRANSCODE_HEIGHT));
     const base = routeBase(host, routeKey);
-    const lowBandwidth = Math.round((settings.TRANSCODE_VIDEO_BITRATE_K + settings.TRANSCODE_AUDIO_BITRATE_K) * 1000 * 1.25);
-    const lowAverage = Math.round((settings.TRANSCODE_VIDEO_BITRATE_K + settings.TRANSCODE_AUDIO_BITRATE_K) * 1000);
     const lines = [
         "#EXTM3U",
         "#EXT-X-VERSION:3",
-        "#EXT-X-INDEPENDENT-SEGMENTS",
-        `#EXT-X-STREAM-INF:BANDWIDTH=${lowBandwidth},AVERAGE-BANDWIDTH=${lowAverage},RESOLUTION=854x${settings.TRANSCODE_HEIGHT},CODECS="${MASTER_CODECS}",NAME="Kronos Low"`,
-        `${base}/proxy/transcode.m3u8?${low.toString()}`
+        "#EXT-X-INDEPENDENT-SEGMENTS"
     ];
+
+    for (const variant of settings.TRANSCODE_VARIANTS) {
+        const variantParams = new URLSearchParams(params);
+        variantParams.set("v", variant.name);
+        const peak = Math.round((variant.videoK + variant.audioK) * 1000 * 1.25);
+        const average = Math.round((variant.videoK + variant.audioK) * 1000);
+        lines.push(
+            `#EXT-X-STREAM-INF:BANDWIDTH=${peak},AVERAGE-BANDWIDTH=${average},RESOLUTION=${variant.width}x${variant.height},CODECS="${MASTER_CODECS}",NAME="${variant.label}"`,
+            `${base}/proxy/transcode.m3u8?${variantParams.toString()}`
+        );
+    }
 
     if (settings.TRANSCODE_INCLUDE_ORIGINAL_VARIANT) {
         lines.push(
-            "#EXT-X-STREAM-INF:BANDWIDTH=8000000,AVERAGE-BANDWIDTH=6000000,NAME=\"Original\"",
+            `#EXT-X-STREAM-INF:BANDWIDTH=${settings.TRANSCODE_ORIGINAL_BANDWIDTH},AVERAGE-BANDWIDTH=${settings.TRANSCODE_ORIGINAL_AVERAGE_BANDWIDTH},NAME="Original"`,
             `${base}/proxy/live.m3u8?${params.toString()}`
         );
     }
@@ -67,15 +72,16 @@ async function transcodeManifest(host, routeKey, upstream, req) {
     }
 
     startCleanupTimer();
-    const session = await getOrStartSession(upstream, Number(req?.query?.h || settings.TRANSCODE_HEIGHT));
-    await waitForManifest(session, settings.TRANSCODE_START_TIMEOUT_MS);
-    return rewriteTranscodePlaylist(session, host, routeKey);
+    const variant = selectVariant(req);
+    const session = await getOrStartSession(upstream);
+    await waitForManifest(session, variant, settings.TRANSCODE_START_TIMEOUT_MS);
+    return rewriteTranscodePlaylist(session, variant, host, routeKey);
 }
 
-function prewarmTranscode(upstream, requestedHeight) {
+function prewarmTranscode(upstream) {
     if (!settings.TRANSCODE_AUTO_ENABLED || !isHttpUrl(upstream)) return;
     startCleanupTimer();
-    getOrStartSession(upstream, Number(requestedHeight || settings.TRANSCODE_HEIGHT)).catch(err => {
+    getOrStartSession(upstream).catch(err => {
         if (settings.HLS_DIAGNOSTICS) console.warn(`[TRANSCODE PREWARM ERR] ${compact(err.message)}`);
     });
 }
@@ -110,9 +116,9 @@ async function serveTranscodeFile(sessionId, fileName, res) {
     res.sendFile(filePath);
 }
 
-async function getOrStartSession(upstream, requestedHeight) {
-    const height = normalizeHeight(requestedHeight);
-    const id = hashKey(`${upstream}|${height}|${settings.TRANSCODE_VIDEO_BITRATE_K}|${settings.TRANSCODE_AUDIO_BITRATE_K}`, 20);
+async function getOrStartSession(upstream) {
+    const variants = settings.TRANSCODE_VARIANTS;
+    const id = hashKey(`${upstream}|${variantSignature(variants)}`, 20);
     const existing = state.transcodeSessions.get(id);
     if (existing?.process && !existing.exitedAt) {
         existing.lastAccess = Date.now();
@@ -127,23 +133,22 @@ async function getOrStartSession(upstream, requestedHeight) {
     const session = {
         id,
         upstream,
-        height,
+        variants,
         dir,
-        manifestPath: path.join(dir, "index.m3u8"),
         startedAt: Date.now(),
         lastAccess: Date.now(),
-        ready: false,
+        ready: new Set(),
         stderr: ""
     };
     session.process = spawn(settings.TRANSCODE_FFMPEG_PATH, ffmpegArgs(upstream, session), {
         stdio: ["ignore", "ignore", "pipe"]
     });
     session.process.stderr.on("data", chunk => {
-        session.stderr = `${session.stderr}${chunk.toString()}`.slice(-2000);
+        session.stderr = `${session.stderr}${chunk.toString()}`.slice(-4000);
     });
     session.process.once("error", err => {
         session.exitedAt = Date.now();
-        session.stderr = `${session.stderr}\n${err.message}`.slice(-2000);
+        session.stderr = `${session.stderr}\n${err.message}`.slice(-4000);
     });
     session.process.once("exit", (code, signal) => {
         session.exitedAt = Date.now();
@@ -151,13 +156,13 @@ async function getOrStartSession(upstream, requestedHeight) {
         session.exitSignal = signal;
     });
     state.transcodeSessions.set(id, session);
-    logTranscode("START", session, { pid: session.process.pid });
+    logTranscode("START", session, { pid: session.process.pid, variants: variants.map(v => v.name).join(",") });
     return session;
 }
 
 function ffmpegArgs(upstream, session) {
-    const segmentPattern = path.join(session.dir, "seg_%06d.ts");
-    return [
+    const variants = session.variants;
+    const args = [
         "-hide_banner",
         "-loglevel", "warning",
         "-nostdin",
@@ -167,58 +172,79 @@ function ffmpegArgs(upstream, session) {
         "-user_agent", settings.UPSTREAM_UA,
         "-headers", "Cache-Control: no-cache\r\nPragma: no-cache\r\n",
         "-i", upstream,
-        "-map", "0:v:0",
-        "-map", "0:a:0?",
-        "-c:v", "libx264",
-        "-preset", settings.TRANSCODE_PRESET,
-        "-tune", "zerolatency",
-        "-vf", `scale=-2:${session.height}`,
-        "-b:v", `${settings.TRANSCODE_VIDEO_BITRATE_K}k`,
-        "-maxrate", `${Math.round(settings.TRANSCODE_VIDEO_BITRATE_K * 1.2)}k`,
-        "-bufsize", `${Math.round(settings.TRANSCODE_VIDEO_BITRATE_K * 2)}k`,
-        "-c:a", "aac",
-        "-b:a", `${settings.TRANSCODE_AUDIO_BITRATE_K}k`,
-        "-ac", "2",
-        "-f", "hls",
-        "-hls_time", String(settings.TRANSCODE_HLS_TIME),
-        "-hls_list_size", String(settings.TRANSCODE_HLS_LIST_SIZE),
-        "-hls_delete_threshold", "4",
-        "-hls_flags", "delete_segments+omit_endlist+program_date_time+independent_segments",
-        "-hls_segment_filename", segmentPattern,
-        session.manifestPath
+        "-filter_complex", filterComplex(variants)
     ];
+
+    for (let index = 0; index < variants.length; index++) {
+        const variant = variants[index];
+        args.push(
+            "-map", `[v${index}out]`,
+            "-map", "0:a:0?",
+            "-sn",
+            "-dn",
+            "-c:v", "libx264",
+            "-preset", settings.TRANSCODE_PRESET,
+            "-tune", "zerolatency",
+            "-sc_threshold", "0",
+            "-force_key_frames", `expr:gte(t,n_forced*${settings.TRANSCODE_HLS_TIME})`,
+            "-b:v", `${variant.videoK}k`,
+            "-maxrate", `${Math.round(variant.videoK * 1.2)}k`,
+            "-bufsize", `${Math.round(variant.videoK * 2)}k`,
+            "-c:a", "aac",
+            "-b:a", `${variant.audioK}k`,
+            "-ac", "2",
+            "-f", "hls",
+            "-hls_time", String(settings.TRANSCODE_HLS_TIME),
+            "-hls_list_size", String(settings.TRANSCODE_HLS_LIST_SIZE),
+            "-hls_delete_threshold", "4",
+            "-hls_flags", "delete_segments+omit_endlist+program_date_time+independent_segments",
+            "-hls_segment_filename", path.join(session.dir, `${variant.name}_seg_%06d.ts`),
+            variantManifestPath(session, variant)
+        );
+    }
+
+    return args;
 }
 
-async function waitForManifest(session, timeoutMs) {
+function filterComplex(variants) {
+    if (variants.length === 1) return `[0:v:0]scale=-2:${variants[0].height}[v0out]`;
+    const splitOutputs = variants.map((_variant, index) => `[v${index}]`).join("");
+    const scales = variants
+        .map((variant, index) => `[v${index}]scale=-2:${variant.height}[v${index}out]`)
+        .join(";");
+    return `[0:v:0]split=${variants.length}${splitOutputs};${scales}`;
+}
+
+async function waitForManifest(session, variant, timeoutMs) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
         session.lastAccess = Date.now();
-        if (await hasReadableManifest(session.manifestPath)) {
-            if (!session.ready) logTranscode("READY", session);
-            session.ready = true;
+        if (await hasReadableManifest(variantManifestPath(session, variant), variant)) {
+            if (!session.ready.has(variant.name)) logTranscode("READY", session, { variant: variant.name });
+            session.ready.add(variant.name);
             return;
         }
         if (session.exitedAt) break;
         await sleep(250);
     }
     stopSession(session, "start-timeout");
-    const err = new Error(`Transcode manifest not ready${session.stderr ? `: ${compact(session.stderr)}` : ""}`);
+    const err = new Error(`Transcode manifest not ready for ${variant.name}${session.stderr ? `: ${compact(session.stderr)}` : ""}`);
     err.statusCode = 503;
     throw err;
 }
 
-async function hasReadableManifest(manifestPath) {
+async function hasReadableManifest(manifestPath, variant) {
     try {
         const text = await fsp.readFile(manifestPath, "utf8");
-        return text.includes("#EXTM3U") && /seg_\d+\.ts/.test(text);
+        return text.includes("#EXTM3U") && text.includes(`${variant.name}_seg_`);
     } catch {
         return false;
     }
 }
 
-async function rewriteTranscodePlaylist(session, host, routeKey) {
+async function rewriteTranscodePlaylist(session, variant, host, routeKey) {
     session.lastAccess = Date.now();
-    const text = await fsp.readFile(session.manifestPath, "utf8");
+    const text = await fsp.readFile(variantManifestPath(session, variant), "utf8");
     const base = routeBase(host, routeKey);
     return text.split(/\r?\n/).map(line => {
         const trimmed = line.trim();
@@ -264,9 +290,19 @@ function stopSession(session, reason) {
     logTranscode("STOP", session, { reason });
 }
 
-function normalizeHeight(value) {
-    const height = Number.isFinite(value) ? value : settings.TRANSCODE_HEIGHT;
-    return Math.max(144, Math.min(1080, Math.round(height)));
+function selectVariant(req) {
+    const requested = String(req?.query?.v || req?.query?.h || "").toLowerCase();
+    return settings.TRANSCODE_VARIANTS.find(variant =>
+        variant.name === requested || String(variant.height) === requested || `${variant.height}p` === requested
+    ) || settings.TRANSCODE_VARIANTS[0];
+}
+
+function variantManifestPath(session, variant) {
+    return path.join(session.dir, `${variant.name}.m3u8`);
+}
+
+function variantSignature(variants) {
+    return variants.map(variant => `${variant.name}:${variant.height}:${variant.videoK}:${variant.audioK}`).join("|");
 }
 
 async function ensureWorkDir() {
@@ -285,7 +321,6 @@ function logTranscode(label, session, fields = {}) {
     if (!settings.HLS_DIAGNOSTICS) return;
     const parts = {
         sid: session?.id || "-",
-        h: session?.height || "-",
         src: session?.upstream ? hashKey(session.upstream, 12) : "-",
         ...fields
     };
