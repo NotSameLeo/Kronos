@@ -1,7 +1,7 @@
 const fs = require("fs");
 const fsp = require("fs/promises");
 const path = require("path");
-const { spawn } = require("child_process");
+const { execFile, spawn } = require("child_process");
 const settings = require("./settings");
 const state = require("./state");
 const {
@@ -220,6 +220,23 @@ async function waitForManifest(session, variant, timeoutMs) {
     while (Date.now() < deadline) {
         session.lastAccess = Date.now();
         if (await hasReadableManifest(variantManifestPath(session, variant), variant)) {
+            if (settings.TRANSCODE_BLACK_GUARD && !session.blackGuardChecked?.has(variant.name)) {
+                const result = await checkVariantBlack(session, variant);
+                session.blackGuardChecked ||= new Set();
+                session.blackGuardChecked.add(variant.name);
+                if (result.black) {
+                    logTranscode("BLACK", session, {
+                        variant: variant.name,
+                        blackSeconds: Math.round(result.blackSeconds * 1000) / 1000,
+                        durationSeconds: Math.round(result.durationSeconds * 1000) / 1000,
+                        file: path.basename(result.file || "")
+                    });
+                    stopSession(session, "black-output");
+                    const err = new Error(`Transcode output is black for ${variant.name}`);
+                    err.statusCode = 503;
+                    throw err;
+                }
+            }
             if (!session.ready.has(variant.name)) logTranscode("READY", session, { variant: variant.name });
             session.ready.add(variant.name);
             return;
@@ -240,6 +257,68 @@ async function hasReadableManifest(manifestPath, variant) {
     } catch {
         return false;
     }
+}
+
+async function checkVariantBlack(session, variant) {
+    const segment = await newestVariantSegment(session, variant);
+    if (!segment) return { black: false, blackSeconds: 0, durationSeconds: 0, file: "" };
+    const [durationSeconds, blackSeconds] = await Promise.all([
+        mediaDurationSeconds(segment),
+        blackDurationSeconds(segment)
+    ]);
+    if (!durationSeconds || !blackSeconds) {
+        return { black: false, blackSeconds, durationSeconds, file: segment };
+    }
+    return {
+        black: blackSeconds / durationSeconds >= settings.TRANSCODE_BLACK_GUARD_RATIO,
+        blackSeconds,
+        durationSeconds,
+        file: segment
+    };
+}
+
+async function newestVariantSegment(session, variant) {
+    const files = await fsp.readdir(session.dir).catch(() => []);
+    const prefix = `${variant.name}_seg_`;
+    const matches = files
+        .filter(file => file.startsWith(prefix) && file.endsWith(".ts"))
+        .sort();
+    return matches.length ? path.join(session.dir, matches.at(-1)) : "";
+}
+
+function mediaDurationSeconds(filePath) {
+    return new Promise(resolve => {
+        execFile("ffprobe", [
+            "-hide_banner",
+            "-loglevel", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=nw=1:nk=1",
+            filePath
+        ], { timeout: 5000 }, (_err, stdout) => {
+            const value = Number(String(stdout || "").trim());
+            resolve(Number.isFinite(value) && value > 0 ? value : 0);
+        });
+    });
+}
+
+function blackDurationSeconds(filePath) {
+    return new Promise(resolve => {
+        execFile(settings.TRANSCODE_FFMPEG_PATH, [
+            "-hide_banner",
+            "-loglevel", "info",
+            "-i", filePath,
+            "-vf", "blackdetect=d=0.5:pix_th=0.10",
+            "-an",
+            "-f", "null",
+            "-"
+        ], { timeout: 8000 }, (_err, _stdout, stderr) => {
+            let total = 0;
+            for (const match of String(stderr || "").matchAll(/black_duration:([0-9.]+)/g)) {
+                total += Number(match[1]) || 0;
+            }
+            resolve(total);
+        });
+    });
 }
 
 async function rewriteTranscodePlaylist(session, variant, host, routeKey) {
