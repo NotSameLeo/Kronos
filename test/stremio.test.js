@@ -38,6 +38,21 @@ test("buildStream disables offline placeholder blocking for vetrina channels", (
     assert.equal(new URL(buildStream(live, "http://kronos.test", "abc").url).searchParams.get("pg"), "1");
 });
 
+test("buildStream gives native HLS channels conservative live playback hints", () => {
+    const stream = buildStream({
+        id: "channel_hls",
+        name: "Live HLS",
+        group: "Sport",
+        url: "http://stream.example/live.m3u8"
+    }, "http://kronos.test", "abc");
+    const url = new URL(stream.url);
+
+    assert.equal(url.pathname, "/abc/proxy/live.m3u8");
+    assert.equal(url.searchParams.get("d"), "30");
+    assert.equal(url.searchParams.get("st"), "15");
+    assert.equal(url.searchParams.get("hb"), "30");
+});
+
 test("buildStream sends Xtream TS channels through delayed HLS fallback", () => {
     const stream = buildStream({
         id: "channel_ts",

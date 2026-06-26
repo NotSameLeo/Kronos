@@ -50,10 +50,7 @@ function buildStream(channel, host, routeKey) {
     const behaviorHints = { bingeGroup: `kronos-${channel.id}` };
 
     if (isHlsUrl(channel.url)) {
-        const params = new URLSearchParams({
-            u: encodeBase64Url(channel.url),
-            pg: shouldBlockOfflinePlaceholders(channel) ? "1" : "0"
-        });
+        const params = stableHlsParams(channel, channel.url);
         return {
             title: channel.name,
             name: "TV",
@@ -65,13 +62,7 @@ function buildStream(channel, host, routeKey) {
     if (isHttpUrl(channel.url)) {
         const hlsFallbackUrl = directXtreamTsToHlsUrl(channel);
         if (hlsFallbackUrl) {
-            const params = new URLSearchParams({
-                u: encodeBase64Url(hlsFallbackUrl),
-                pg: shouldBlockOfflinePlaceholders(channel) ? "1" : "0",
-                d: "60",
-                st: "30",
-                hb: String(Math.round(settings.HLS_PLAYER_HOLD_BACK_SECONDS))
-            });
+            const params = stableHlsParams(channel, hlsFallbackUrl, { delaySeconds: 60 });
             return {
                 title: channel.name,
                 name: "TV",
@@ -93,6 +84,21 @@ function buildStream(channel, host, routeKey) {
         name: "TV",
         externalUrl: channel.url
     };
+}
+
+function stableHlsParams(channel, url, options = {}) {
+    const delaySeconds = Number.isFinite(options.delaySeconds)
+        ? options.delaySeconds
+        : settings.HLS_LIVE_EDGE_DELAY_SECONDS;
+    const startOffsetSeconds = Math.min(60, Math.max(0, delaySeconds / 2));
+    const params = new URLSearchParams({
+        u: encodeBase64Url(url),
+        pg: shouldBlockOfflinePlaceholders(channel) ? "1" : "0",
+        d: String(Math.round(delaySeconds)),
+        st: String(Math.round(startOffsetSeconds)),
+        hb: String(Math.round(settings.HLS_PLAYER_HOLD_BACK_SECONDS))
+    });
+    return params;
 }
 
 function shouldBlockOfflinePlaceholders(channel) {
