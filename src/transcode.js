@@ -13,6 +13,7 @@ const {
 } = require("./utils");
 
 const MASTER_CODECS = "avc1.4d401f,mp4a.40.2";
+const SOURCE_VARIANT_NAME = "source";
 
 let cleanupTimerStarted = false;
 
@@ -38,15 +39,10 @@ function adaptiveMasterManifest(host, routeKey, upstream, options = {}) {
         "#EXT-X-INDEPENDENT-SEGMENTS"
     ];
 
-    for (const variant of settings.TRANSCODE_VARIANTS) {
+    for (const variant of playbackVariants()) {
         const variantParams = new URLSearchParams(params);
         variantParams.set("v", variant.name);
-        const peak = Math.round((variant.videoK + variant.audioK) * 1000 * 1.25);
-        const average = Math.round((variant.videoK + variant.audioK) * 1000);
-        lines.push(
-            `#EXT-X-STREAM-INF:BANDWIDTH=${peak},AVERAGE-BANDWIDTH=${average},RESOLUTION=${variant.width}x${variant.height},CODECS="${MASTER_CODECS}",NAME="${variant.label}"`,
-            `${base}/proxy/transcode.m3u8?${variantParams.toString()}`
-        );
+        lines.push(masterStreamInfo(variant), `${base}/proxy/transcode.m3u8?${variantParams.toString()}`);
     }
 
     if (settings.TRANSCODE_INCLUDE_ORIGINAL_VARIANT) {
@@ -117,7 +113,7 @@ async function serveTranscodeFile(sessionId, fileName, res) {
 }
 
 async function getOrStartSession(upstream) {
-    const variants = settings.TRANSCODE_VARIANTS;
+    const variants = playbackVariants();
     const id = hashKey(`${upstream}|${variantSignature(variants)}`, 20);
     const existing = state.transcodeSessions.get(id);
     if (existing?.process && !existing.exitedAt) {
@@ -171,39 +167,75 @@ function ffmpegArgs(upstream, session) {
         "-reconnect_delay_max", "4",
         "-user_agent", settings.UPSTREAM_UA,
         "-headers", "Cache-Control: no-cache\r\nPragma: no-cache\r\n",
-        "-i", upstream,
-        "-filter_complex", filterComplex(variants)
+        "-i", upstream
     ];
 
-    for (let index = 0; index < variants.length; index++) {
-        const variant = variants[index];
-        args.push(
-            "-map", `[v${index}out]`,
-            "-map", "0:a:0?",
-            "-sn",
-            "-dn",
-            "-c:v", "libx264",
-            "-preset", settings.TRANSCODE_PRESET,
-            "-tune", "zerolatency",
-            "-sc_threshold", "0",
-            "-force_key_frames", `expr:gte(t,n_forced*${settings.TRANSCODE_HLS_TIME})`,
-            "-b:v", `${variant.videoK}k`,
-            "-maxrate", `${Math.round(variant.videoK * 1.2)}k`,
-            "-bufsize", `${Math.round(variant.videoK * 2)}k`,
-            "-c:a", "aac",
-            "-b:a", `${variant.audioK}k`,
-            "-ac", "2",
-            "-f", "hls",
-            "-hls_time", String(settings.TRANSCODE_HLS_TIME),
-            "-hls_list_size", String(settings.TRANSCODE_HLS_LIST_SIZE),
-            "-hls_delete_threshold", "4",
-            "-hls_flags", "delete_segments+omit_endlist+program_date_time+independent_segments",
-            "-hls_segment_filename", path.join(session.dir, `${variant.name}_seg_%06d.ts`),
-            variantManifestPath(session, variant)
-        );
+    const scaledVariants = variants.filter(variant => !variant.source);
+    if (scaledVariants.length) {
+        args.push("-filter_complex", filterComplex(scaledVariants));
+    }
+
+    for (let index = 0; index < scaledVariants.length; index++) {
+        const variant = scaledVariants[index];
+        pushEncodedHlsOutput(args, `[v${index}out]`, variant, session);
+    }
+
+    const sourceVariant = variants.find(variant => variant.source);
+    if (sourceVariant) {
+        pushEncodedHlsOutput(args, "0:v:0", sourceVariant, session);
     }
 
     return args;
+}
+
+function pushEncodedHlsOutput(args, videoMap, variant, session) {
+    args.push(
+        "-map", videoMap,
+        "-map", "0:a:0?",
+        "-sn",
+        "-dn",
+        "-c:v", "libx264",
+        "-preset", settings.TRANSCODE_PRESET,
+        "-tune", "zerolatency",
+        "-sc_threshold", "0",
+        "-force_key_frames", `expr:gte(t,n_forced*${settings.TRANSCODE_HLS_TIME})`,
+        "-b:v", `${variant.videoK}k`,
+        "-maxrate", `${Math.round(variant.videoK * 1.2)}k`,
+        "-bufsize", `${Math.round(variant.videoK * 2)}k`,
+        "-c:a", "aac",
+        "-b:a", `${variant.audioK}k`,
+        "-ac", "2",
+        "-f", "hls",
+        "-hls_time", String(settings.TRANSCODE_HLS_TIME),
+        "-hls_list_size", String(settings.TRANSCODE_HLS_LIST_SIZE),
+        "-hls_delete_threshold", "4",
+        "-hls_flags", "delete_segments+omit_endlist+program_date_time+independent_segments",
+        "-hls_segment_filename", path.join(session.dir, `${variant.name}_seg_%06d.ts`),
+        variantManifestPath(session, variant)
+    );
+}
+
+function playbackVariants() {
+    const variants = [...settings.TRANSCODE_VARIANTS];
+    if (settings.TRANSCODE_INCLUDE_SOURCE_VARIANT) variants.push({
+        name: SOURCE_VARIANT_NAME,
+        label: settings.TRANSCODE_SOURCE_LABEL,
+        source: true,
+        videoK: settings.TRANSCODE_SOURCE_VIDEO_BITRATE_K,
+        audioK: settings.TRANSCODE_SOURCE_AUDIO_BITRATE_K,
+        bandwidth: settings.TRANSCODE_SOURCE_BANDWIDTH,
+        averageBandwidth: settings.TRANSCODE_SOURCE_AVERAGE_BANDWIDTH
+    });
+    return variants;
+}
+
+function masterStreamInfo(variant) {
+    if (variant.source) {
+        return `#EXT-X-STREAM-INF:BANDWIDTH=${variant.bandwidth},AVERAGE-BANDWIDTH=${variant.averageBandwidth},CODECS="${MASTER_CODECS}",NAME="${variant.label}"`;
+    }
+    const peak = Math.round((variant.videoK + variant.audioK) * 1000 * 1.25);
+    const average = Math.round((variant.videoK + variant.audioK) * 1000);
+    return `#EXT-X-STREAM-INF:BANDWIDTH=${peak},AVERAGE-BANDWIDTH=${average},RESOLUTION=${variant.width}x${variant.height},CODECS="${MASTER_CODECS}",NAME="${variant.label}"`;
 }
 
 function filterComplex(variants) {
@@ -371,9 +403,9 @@ function stopSession(session, reason) {
 
 function selectVariant(req) {
     const requested = String(req?.query?.v || req?.query?.h || "").toLowerCase();
-    return settings.TRANSCODE_VARIANTS.find(variant =>
-        variant.name === requested || String(variant.height) === requested || `${variant.height}p` === requested
-    ) || settings.TRANSCODE_VARIANTS[0];
+    return playbackVariants().find(variant =>
+        variant.name === requested || String(variant.height || "") === requested || `${variant.height}p` === requested
+    ) || playbackVariants()[0];
 }
 
 function variantManifestPath(session, variant) {
@@ -381,7 +413,9 @@ function variantManifestPath(session, variant) {
 }
 
 function variantSignature(variants) {
-    return variants.map(variant => `${variant.name}:${variant.height}:${variant.videoK}:${variant.audioK}`).join("|");
+    return variants
+        .map(variant => `${variant.name}:${variant.height || "native"}:${variant.videoK}:${variant.audioK}:${variant.bandwidth || ""}:${variant.averageBandwidth || ""}`)
+        .join("|");
 }
 
 async function ensureWorkDir() {
