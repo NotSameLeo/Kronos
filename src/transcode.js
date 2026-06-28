@@ -320,14 +320,17 @@ async function waitForManifest(session, variant, timeoutMs) {
                 if (result.black) {
                     logTranscode("BLACK", session, {
                         variant: variant.name,
+                        strict: settings.TRANSCODE_BLACK_GUARD_STRICT ? 1 : 0,
                         blackSeconds: Math.round(result.blackSeconds * 1000) / 1000,
                         durationSeconds: Math.round(result.durationSeconds * 1000) / 1000,
                         file: path.basename(result.file || "")
                     });
-                    stopSession(session, "black-output");
-                    const err = new Error(`Transcode output is black for ${variant.name}`);
-                    err.statusCode = 503;
-                    throw err;
+                    if (settings.TRANSCODE_BLACK_GUARD_STRICT) {
+                        stopSession(session, "black-output");
+                        const err = new Error(`Transcode output is black for ${variant.name}`);
+                        err.statusCode = 503;
+                        throw err;
+                    }
                 }
             }
             if (!session.ready.has(variant.name)) logTranscode("READY", session, { variant: variant.name });

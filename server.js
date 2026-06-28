@@ -704,6 +704,7 @@ function buildStats(configKey) {
             transcodeOriginalVariant: settings.TRANSCODE_INCLUDE_ORIGINAL_VARIANT,
             transcodeFileDiagnostics: settings.TRANSCODE_FILE_DIAGNOSTICS,
             transcodeFfmpegDiagnostics: settings.TRANSCODE_FFMPEG_DIAGNOSTICS,
+            transcodeBlackGuardStrict: settings.TRANSCODE_BLACK_GUARD_STRICT,
             transcodeBlackGuardMinSegments: settings.TRANSCODE_BLACK_GUARD_MIN_SEGMENTS,
             transcodeHeight: settings.TRANSCODE_HEIGHT,
             transcodeVideoBitrateK: settings.TRANSCODE_VIDEO_BITRATE_K,
