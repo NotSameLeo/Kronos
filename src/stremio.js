@@ -16,6 +16,7 @@ const {
     stripInitialCountryPrefix,
     toCatalogId
 } = require("./sources");
+const { streamMenuVariants } = require("./transcode");
 
 function manifestAddonId(configKey) {
     return `org.stremio.kronos.channel.${hashKey(configKey)}`;
@@ -54,7 +55,7 @@ function buildStream(channel, host, routeKey) {
         return {
             title: channel.name,
             name: "TV",
-            url: `${base}/${settings.TRANSCODE_AUTO_ENABLED ? "proxy/auto.m3u8" : "proxy/live.m3u8"}?${params.toString()}`,
+            url: `${base}/proxy/live.m3u8?${params.toString()}`,
             behaviorHints
         };
     }
@@ -66,7 +67,7 @@ function buildStream(channel, host, routeKey) {
             return {
                 title: channel.name,
                 name: "TV",
-                url: `${base}/${settings.TRANSCODE_AUTO_ENABLED ? "proxy/auto.m3u8" : "proxy/live.m3u8"}?${params.toString()}`,
+                url: `${base}/proxy/live.m3u8?${params.toString()}`,
                 behaviorHints
             };
         }
@@ -84,6 +85,42 @@ function buildStream(channel, host, routeKey) {
         name: "TV",
         externalUrl: channel.url
     };
+}
+
+function buildStreams(channel, host, routeKey) {
+    const base = routeBase(host, routeKey);
+    const hlsUrl = normalizedHlsPlaybackUrl(channel);
+    const source = {
+        ...buildStream(channel, host, routeKey),
+        title: channel.name,
+        name: "Sorgente"
+    };
+    if (!settings.TRANSCODE_AUTO_ENABLED || !hlsUrl) return [source];
+
+    const scaled = streamMenuVariants()
+        .filter(variant => !variant.source)
+        .map(variant => {
+            const params = stableHlsParams(channel, hlsUrl, { delaySeconds: 60 });
+            params.set("v", variant.name);
+            const label = streamVariantLabel(variant);
+            return {
+                title: channel.name,
+                name: label,
+                url: `${base}/proxy/transcode.m3u8?${params.toString()}`,
+                behaviorHints: { bingeGroup: `kronos-${channel.id}` }
+            };
+        });
+    return [source, ...scaled];
+}
+
+function normalizedHlsPlaybackUrl(channel) {
+    if (isHlsUrl(channel?.url)) return channel.url;
+    if (isHttpUrl(channel?.url)) return directXtreamTsToHlsUrl(channel);
+    return "";
+}
+
+function streamVariantLabel(variant) {
+    return variant.name || `${variant.height}p`;
 }
 
 function stableHlsParams(channel, url, options = {}) {
@@ -126,7 +163,7 @@ function toMeta(channel, host, routeKey = "", options = {}) {
         : routeKey
             ? `${routeBase(host, routeKey)}/poster/${channel.id}.svg?v=${encodeURIComponent(settings.RELEASE_VERSION)}`
             : channel.logo || fallbackLogo;
-    const stream = options.includeVideos !== false && routeKey ? buildStream(channel, host, routeKey) : null;
+    const streams = options.includeVideos !== false && routeKey ? buildStreams(channel, host, routeKey) : [];
     const meta = {
         id: channel.id,
         type: settings.ADDON_TYPE,
@@ -151,7 +188,7 @@ function toMeta(channel, host, routeKey = "", options = {}) {
             thumbnail: poster,
             overview: channel.description || "",
             available: true,
-            streams: stream ? [stream] : undefined
+            streams: streams.length ? streams : undefined
         }];
     }
 
@@ -245,6 +282,7 @@ function logoSvg() {
 module.exports = {
     buildManifest,
     buildStream,
+    buildStreams,
     logoSvg,
     sendPosterSvg,
     shouldBlockOfflinePlaceholders,

@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { buildStream, shouldBlockOfflinePlaceholders } = require("../src/stremio");
+const { buildStream, buildStreams, shouldBlockOfflinePlaceholders } = require("../src/stremio");
 
 test("buildStream disables offline placeholder blocking for vetrina channels", () => {
     const vetrina = {
@@ -47,7 +47,7 @@ test("buildStream gives native HLS channels conservative live playback hints", (
     }, "http://kronos.test", "abc");
     const url = new URL(stream.url);
 
-    assert.equal(url.pathname, "/abc/proxy/auto.m3u8");
+    assert.equal(url.pathname, "/abc/proxy/live.m3u8");
     assert.equal(url.searchParams.get("d"), "60");
     assert.equal(url.searchParams.get("st"), "30");
     assert.equal(url.searchParams.get("hb"), "30");
@@ -64,10 +64,29 @@ test("buildStream sends Xtream TS channels through delayed HLS fallback", () => 
     }, "http://kronos.test", "abc");
 
     const url = new URL(stream.url);
-    assert.equal(url.pathname, "/abc/proxy/auto.m3u8");
+    assert.equal(url.pathname, "/abc/proxy/live.m3u8");
     assert.equal(url.searchParams.get("d"), "60");
     assert.equal(url.searchParams.get("st"), "30");
     assert.equal(url.searchParams.get("hb"), "30");
     assert.ok(url.searchParams.get("u"));
     assert.match(Buffer.from(url.searchParams.get("u"), "base64url").toString(), /123\.m3u8$/);
+});
+
+test("buildStreams exposes transcode qualities as separate Stremio choices", () => {
+    const streams = buildStreams({
+        id: "channel_ts",
+        name: "DAZN WEB 1",
+        group: "DAZN",
+        url: "http://stream.example/live/user/pass/123.ts",
+        sourceType: "xtream",
+        streamFormat: "ts"
+    }, "http://kronos.test", "abc");
+
+    assert.deepEqual(streams.map(stream => stream.name), ["Sorgente", "720p", "480p", "360p"]);
+    assert.deepEqual(streams.map(stream => stream.title), ["DAZN WEB 1", "DAZN WEB 1", "DAZN WEB 1", "DAZN WEB 1"]);
+    assert.equal(new URL(streams[0].url).pathname, "/abc/proxy/live.m3u8");
+    assert.equal(new URL(streams[0].url).searchParams.get("v"), null);
+    assert.deepEqual(streams.slice(1).map(stream => new URL(stream.url).searchParams.get("v")), ["720p", "480p", "360p"]);
+    assert.ok(streams.slice(1).every(stream => new URL(stream.url).pathname === "/abc/proxy/transcode.m3u8"));
+    assert.ok(streams.every(stream => Buffer.from(new URL(stream.url).searchParams.get("u"), "base64url").toString().endsWith("/123.m3u8")));
 });

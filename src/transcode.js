@@ -214,7 +214,6 @@ function ffmpegArgs(upstream, session) {
         "-hide_banner",
         "-loglevel", "warning",
         "-nostdin",
-        "-vsync", "0",
         "-fflags", "+genpts+discardcorrupt",
         "-reconnect", "1",
         "-reconnect_streamed", "1",
@@ -226,19 +225,13 @@ function ffmpegArgs(upstream, session) {
         "-i", upstream
     ];
 
-    const scaledVariants = variants.filter(variant => !variant.source);
-    if (scaledVariants.length) {
-        args.push("-filter_complex", filterComplex(scaledVariants));
+    if (variants.length) {
+        args.push("-filter_complex", filterComplex(variants));
     }
 
-    for (let index = 0; index < scaledVariants.length; index++) {
-        const variant = scaledVariants[index];
+    for (let index = 0; index < variants.length; index++) {
+        const variant = variants[index];
         pushEncodedHlsOutput(args, `[v${index}out]`, variant, session);
-    }
-
-    const sourceVariant = variants.find(variant => variant.source);
-    if (sourceVariant) {
-        pushEncodedHlsOutput(args, "0:v:0", sourceVariant, session);
     }
 
     return args;
@@ -251,6 +244,7 @@ function pushEncodedHlsOutput(args, videoMap, variant, session) {
         "-sn",
         "-dn",
         "-c:v", "libx264",
+        "-fps_mode", "passthrough",
         "-preset", settings.TRANSCODE_PRESET,
         "-tune", "zerolatency",
         "-sc_threshold", "0",
@@ -272,23 +266,22 @@ function pushEncodedHlsOutput(args, videoMap, variant, session) {
 }
 
 function playbackVariants() {
-    const variants = [...settings.TRANSCODE_VARIANTS];
-    if (settings.TRANSCODE_INCLUDE_SOURCE_VARIANT) variants.push({
+    return [...settings.TRANSCODE_VARIANTS];
+}
+
+function sourceMenuVariant() {
+    return {
         name: SOURCE_VARIANT_NAME,
-        label: settings.TRANSCODE_SOURCE_LABEL,
-        source: true,
-        videoK: settings.TRANSCODE_SOURCE_VIDEO_BITRATE_K,
-        audioK: settings.TRANSCODE_SOURCE_AUDIO_BITRATE_K,
-        bandwidth: settings.TRANSCODE_SOURCE_BANDWIDTH,
-        averageBandwidth: settings.TRANSCODE_SOURCE_AVERAGE_BANDWIDTH
-    });
-    return variants;
+        source: true
+    };
+}
+
+function streamMenuVariants() {
+    const variants = playbackVariants().slice().sort((left, right) => (right.height || 0) - (left.height || 0));
+    return settings.TRANSCODE_INCLUDE_SOURCE_VARIANT ? [sourceMenuVariant(), ...variants] : variants;
 }
 
 function masterStreamInfo(variant) {
-    if (variant.source) {
-        return `#EXT-X-STREAM-INF:BANDWIDTH=${variant.bandwidth},AVERAGE-BANDWIDTH=${variant.averageBandwidth},CODECS="${MASTER_CODECS}",NAME="${variant.label}"`;
-    }
     const peak = Math.round((variant.videoK + variant.audioK) * 1000 * 1.25);
     const average = Math.round((variant.videoK + variant.audioK) * 1000);
     return `#EXT-X-STREAM-INF:BANDWIDTH=${peak},AVERAGE-BANDWIDTH=${average},RESOLUTION=${variant.width}x${variant.height},CODECS="${MASTER_CODECS}",NAME="${variant.label}"`;
@@ -613,6 +606,7 @@ function logFfmpegLines(session, text) {
 
 module.exports = {
     adaptiveMasterManifest,
+    streamMenuVariants,
     prewarmTranscode,
     serveTranscodeFile,
     transcodeManifest

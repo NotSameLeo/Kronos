@@ -52,7 +52,7 @@ const {
 } = require("./src/transcode");
 const {
     buildManifest,
-    buildStream,
+    buildStreams,
     logoSvg,
     sendPosterSvg,
     toMeta
@@ -130,7 +130,7 @@ app.listen(settings.PORT, "0.0.0.0", () => {
     console.log(`hlsTimeout=${settings.HLS_REQUEST_TIMEOUT / 1000}s segmentTimeout=${settings.SEG_REQUEST_TIMEOUT / 1000}s`);
     console.log(`manifestRetries=${settings.HLS_MANIFEST_RETRIES} manifestCoalesce=${settings.HLS_MANIFEST_COALESCE_MS}ms segmentRetries=${settings.SEGMENT_UPSTREAM_RETRIES}`);
     console.log(`tokenHealing=${settings.SEGMENT_TOKEN_HEALING ? 1 : 0} segmentCacheBust=${settings.HLS_CACHE_BUST_SEGMENTS ? 1 : 0} offlinePlaceholderBlock=${settings.HLS_BLOCK_OFFLINE_PLACEHOLDERS ? 1 : 0} liveEdgeDelay=${settings.HLS_LIVE_EDGE_DELAY_SECONDS}s playerHoldBack=${settings.HLS_PLAYER_HOLD_BACK_SECONDS}s segmentKeepAlive=${settings.HLS_SEGMENT_UPSTREAM_KEEPALIVE ? 1 : 0} rangeForward=1`);
-    console.log(`transcodeAuto=${settings.TRANSCODE_AUTO_ENABLED ? 1 : 0} ladder=${settings.TRANSCODE_VARIANTS.map(variant => `${variant.height}p:${variant.videoK}k`).join(",")} sourceVariant=${settings.TRANSCODE_INCLUDE_SOURCE_VARIANT ? 1 : 0}:${settings.TRANSCODE_SOURCE_VIDEO_BITRATE_K}k originalVariant=${settings.TRANSCODE_INCLUDE_ORIGINAL_VARIANT ? 1 : 0} fileDiagnostics=${settings.TRANSCODE_FILE_DIAGNOSTICS ? 1 : 0} ffmpegDiagnostics=${settings.TRANSCODE_FFMPEG_DIAGNOSTICS ? 1 : 0} maxSessions=${settings.TRANSCODE_MAX_SESSIONS}`);
+    console.log(`transcodeAuto=${settings.TRANSCODE_AUTO_ENABLED ? 1 : 0} ladder=${settings.TRANSCODE_VARIANTS.map(variant => `${variant.height}p:${variant.videoK}k`).join(",")} sourceMenu=${settings.TRANSCODE_INCLUDE_SOURCE_VARIANT ? 1 : 0} originalVariant=${settings.TRANSCODE_INCLUDE_ORIGINAL_VARIANT ? 1 : 0} fileDiagnostics=${settings.TRANSCODE_FILE_DIAGNOSTICS ? 1 : 0} ffmpegDiagnostics=${settings.TRANSCODE_FFMPEG_DIAGNOSTICS ? 1 : 0} maxSessions=${settings.TRANSCODE_MAX_SESSIONS}`);
     console.log(`catalogPageSize=${settings.CATALOG_PAGE_SIZE} catalogRefresh=${settings.CATALOG_REFRESH_INTERVAL_MS / 1000}s`);
     console.log(`epgPreload=${settings.EPG_PRELOAD_URLS.length} epgRefresh=${settings.EPG_REFRESH_INTERVAL_MS / 1000}s`);
     console.log("============================================================");
@@ -585,7 +585,7 @@ async function streamResponse(req, res) {
         const { configKey, config, routeKey } = getRequestConfig(req);
         const channel = await getChannelById(configKey, config, req.params.id);
         if (!channel) return res.status(404).json({ streams: [] });
-        res.json({ streams: [buildStream(channel, getPublicHost(req), routeKey)] });
+        res.json({ streams: buildStreams(channel, getPublicHost(req), routeKey) });
     } catch (err) {
         console.error("[STREAM ERROR]", err.message);
         res.status(500).json({ streams: [] });
@@ -695,10 +695,7 @@ function buildStats(configKey) {
             segmentStrictNoCache: settings.SEGMENT_STRICT_NO_CACHE,
             transcodeAutoEnabled: settings.TRANSCODE_AUTO_ENABLED,
             transcodeVariants: settings.TRANSCODE_VARIANTS,
-            transcodeSourceVariant: settings.TRANSCODE_INCLUDE_SOURCE_VARIANT,
-            transcodeSourceVideoBitrateK: settings.TRANSCODE_SOURCE_VIDEO_BITRATE_K,
-            transcodeSourceAudioBitrateK: settings.TRANSCODE_SOURCE_AUDIO_BITRATE_K,
-            transcodeSourceBandwidth: settings.TRANSCODE_SOURCE_BANDWIDTH,
+            transcodeSourceMenu: settings.TRANSCODE_INCLUDE_SOURCE_VARIANT,
             transcodeHlsInputLiveStartIndex: settings.TRANSCODE_HLS_INPUT_LIVE_START_INDEX,
             transcodeHlsDeleteThreshold: settings.TRANSCODE_HLS_DELETE_THRESHOLD,
             transcodeOriginalVariant: settings.TRANSCODE_INCLUDE_ORIGINAL_VARIANT,

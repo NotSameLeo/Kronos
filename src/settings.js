@@ -16,7 +16,7 @@ function parseList(raw) {
 }
 
 function parseTranscodeVariants(raw) {
-    const parsed = String(raw || "240:350:64,360:650:96,480:900:96")
+    const parsed = String(raw || "360:650:96,480:900:96,720:2500:128")
         .split(",")
         .map(value => {
             const [heightRaw, videoRaw, audioRaw] = value.split(":");
@@ -35,7 +35,7 @@ function parseTranscodeVariants(raw) {
         })
         .filter(Boolean)
         .sort((a, b) => a.height - b.height);
-    return parsed.length ? parsed : parseTranscodeVariants("240:350:64,360:650:96,480:900:96");
+    return parsed.length ? parsed : parseTranscodeVariants("360:650:96,480:900:96,720:2500:128");
 }
 
 const FRONTEND_PRELOAD_FILE = String(process.env.FRONTEND_PRELOAD_FILE || "").trim();
@@ -96,11 +96,6 @@ module.exports = {
     TRANSCODE_ORIGINAL_BANDWIDTH: numberEnv("TRANSCODE_ORIGINAL_BANDWIDTH", 18000000, 1000000),
     TRANSCODE_ORIGINAL_AVERAGE_BANDWIDTH: numberEnv("TRANSCODE_ORIGINAL_AVERAGE_BANDWIDTH", 12000000, 1000000),
     TRANSCODE_INCLUDE_SOURCE_VARIANT: String(process.env.TRANSCODE_INCLUDE_SOURCE_VARIANT || "1") !== "0",
-    TRANSCODE_SOURCE_VIDEO_BITRATE_K: numberEnv("TRANSCODE_SOURCE_VIDEO_BITRATE_K", 9000, 1000, 30000),
-    TRANSCODE_SOURCE_AUDIO_BITRATE_K: numberEnv("TRANSCODE_SOURCE_AUDIO_BITRATE_K", 128, 32, 320),
-    TRANSCODE_SOURCE_BANDWIDTH: numberEnv("TRANSCODE_SOURCE_BANDWIDTH", 12000000, 1000000),
-    TRANSCODE_SOURCE_AVERAGE_BANDWIDTH: numberEnv("TRANSCODE_SOURCE_AVERAGE_BANDWIDTH", 9128000, 1000000),
-    TRANSCODE_SOURCE_LABEL: process.env.TRANSCODE_SOURCE_LABEL || "Kronos Source",
     TRANSCODE_HLS_TIME: numberEnv("TRANSCODE_HLS_TIME", 4, 2, 10),
     TRANSCODE_HLS_LIST_SIZE: numberEnv("TRANSCODE_HLS_LIST_SIZE", 12, 4, 30),
     TRANSCODE_HLS_INPUT_LIVE_START_INDEX: numberEnv("TRANSCODE_HLS_INPUT_LIVE_START_INDEX", -6, -30, -1),
