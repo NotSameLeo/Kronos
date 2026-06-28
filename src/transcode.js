@@ -309,6 +309,11 @@ async function waitForManifest(session, variant, timeoutMs) {
         session.lastAccess = Date.now();
         if (await hasReadableManifest(variantManifestPath(session, variant), variant)) {
             if (settings.TRANSCODE_BLACK_GUARD && !session.blackGuardChecked?.has(variant.name)) {
+                const segmentCount = await variantSegmentCount(session, variant);
+                if (segmentCount < settings.TRANSCODE_BLACK_GUARD_MIN_SEGMENTS) {
+                    await sleep(250);
+                    continue;
+                }
                 const result = await checkVariantBlack(session, variant);
                 session.blackGuardChecked ||= new Set();
                 session.blackGuardChecked.add(variant.name);
@@ -366,12 +371,20 @@ async function checkVariantBlack(session, variant) {
 }
 
 async function newestVariantSegment(session, variant) {
+    const matches = await variantSegmentFiles(session, variant);
+    return matches.length ? path.join(session.dir, matches.at(-1)) : "";
+}
+
+async function variantSegmentCount(session, variant) {
+    return (await variantSegmentFiles(session, variant)).length;
+}
+
+async function variantSegmentFiles(session, variant) {
     const files = await fsp.readdir(session.dir).catch(() => []);
     const prefix = `${variant.name}_seg_`;
-    const matches = files
+    return files
         .filter(file => file.startsWith(prefix) && file.endsWith(".ts"))
         .sort();
-    return matches.length ? path.join(session.dir, matches.at(-1)) : "";
 }
 
 function mediaDurationSeconds(filePath) {
