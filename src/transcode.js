@@ -353,26 +353,41 @@ async function hasReadableManifest(manifestPath, variant) {
 }
 
 async function checkVariantBlack(session, variant) {
-    const segment = await newestVariantSegment(session, variant);
-    if (!segment) return { black: false, blackSeconds: 0, durationSeconds: 0, file: "" };
-    const [durationSeconds, blackSeconds] = await Promise.all([
-        mediaDurationSeconds(segment),
-        blackDurationSeconds(segment)
-    ]);
-    if (!durationSeconds || !blackSeconds) {
-        return { black: false, blackSeconds, durationSeconds, file: segment };
+    const segments = await newestVariantSegments(session, variant, settings.TRANSCODE_BLACK_GUARD_MIN_SEGMENTS);
+    if (!segments.length) return { black: false, blackSeconds: 0, durationSeconds: 0, file: "" };
+
+    let durationSeconds = 0;
+    let blackSeconds = 0;
+    for (const segment of segments) {
+        const [duration, black] = await Promise.all([
+            mediaDurationSeconds(segment),
+            blackDurationSeconds(segment)
+        ]);
+        durationSeconds += duration || 0;
+        blackSeconds += black || 0;
     }
+    if (!durationSeconds || !blackSeconds) return {
+        black: false,
+        blackSeconds,
+        durationSeconds,
+        file: segments.map(segment => path.basename(segment)).join(",")
+    };
     return {
         black: blackSeconds / durationSeconds >= settings.TRANSCODE_BLACK_GUARD_RATIO,
         blackSeconds,
         durationSeconds,
-        file: segment
+        file: segments.map(segment => path.basename(segment)).join(",")
     };
 }
 
 async function newestVariantSegment(session, variant) {
+    const segments = await newestVariantSegments(session, variant, 1);
+    return segments[0] || "";
+}
+
+async function newestVariantSegments(session, variant, count) {
     const matches = await variantSegmentFiles(session, variant);
-    return matches.length ? path.join(session.dir, matches.at(-1)) : "";
+    return matches.slice(-Math.max(1, count)).map(file => path.join(session.dir, file));
 }
 
 async function variantSegmentCount(session, variant) {
