@@ -72,6 +72,7 @@ async function transcodeManifest(host, routeKey, upstream, req) {
     const variant = selectVariant(req);
     const session = await getOrStartSession(upstream);
     await waitForManifest(session, variant, settings.TRANSCODE_START_TIMEOUT_MS);
+    await waitForTranscodeBuffer(session, variant, settings.TRANSCODE_START_TIMEOUT_MS);
     return rewriteTranscodePlaylist(session, variant, host, routeKey, {
         holdBackSeconds: queryNumber(req?.query?.hb),
         startOffsetSeconds: queryNumber(req?.query?.st)
@@ -435,7 +436,7 @@ function blackDurationSeconds(filePath) {
 
 async function rewriteTranscodePlaylist(session, variant, host, routeKey, options = {}) {
     session.lastAccess = Date.now();
-    const text = await fsp.readFile(variantManifestPath(session, variant), "utf8");
+    const text = await buildDelayedTranscodePlaylist(session, variant);
     const base = routeBase(host, routeKey);
     const rewritten = text.split(/\r?\n/).map(line => {
         const trimmed = line.trim();
@@ -444,6 +445,59 @@ async function rewriteTranscodePlaylist(session, variant, host, routeKey, option
         return `${base}/proxy/transcode/${session.id}/${encodeURIComponent(fileName)}`;
     }).join("\n");
     return applyTranscodeLiveHints(rewritten, options);
+}
+
+async function waitForTranscodeBuffer(session, variant, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        session.lastAccess = Date.now();
+        const files = await delayedVariantSegmentFiles(session, variant);
+        if (files.length >= Math.min(3, settings.TRANSCODE_PLAYLIST_WINDOW_SEGMENTS)) return;
+        if (session.exitedAt) break;
+        await sleep(500);
+    }
+    const err = new Error(`Transcode buffer not ready for ${variant.name}`);
+    err.statusCode = 503;
+    throw err;
+}
+
+async function buildDelayedTranscodePlaylist(session, variant) {
+    const files = await delayedVariantSegmentFiles(session, variant);
+    if (!files.length) {
+        const err = new Error(`No delayed transcode segments for ${variant.name}`);
+        err.statusCode = 503;
+        throw err;
+    }
+    const firstSeq = segmentFileSequence(files[0]) || 0;
+    const target = Math.max(1, Math.ceil(settings.TRANSCODE_HLS_TIME));
+    const lines = [
+        "#EXTM3U",
+        "#EXT-X-VERSION:3",
+        "#EXT-X-INDEPENDENT-SEGMENTS",
+        `#EXT-X-TARGETDURATION:${target}`,
+        `#EXT-X-MEDIA-SEQUENCE:${firstSeq}`
+    ];
+    for (const file of files) {
+        lines.push(`#EXTINF:${settings.TRANSCODE_HLS_TIME.toFixed(3)},`, file);
+    }
+    return `${lines.join("\n")}\n`;
+}
+
+async function delayedVariantSegmentFiles(session, variant) {
+    const files = await variantSegmentFiles(session, variant);
+    const delaySegments = transcodeDelaySegments();
+    const ready = delaySegments > 0 ? files.slice(0, -delaySegments) : files;
+    const window = Math.max(3, settings.TRANSCODE_PLAYLIST_WINDOW_SEGMENTS);
+    return ready.slice(-window);
+}
+
+function transcodeDelaySegments() {
+    return Math.max(0, Math.ceil(settings.TRANSCODE_PLAYBACK_DELAY_SECONDS / Math.max(1, settings.TRANSCODE_HLS_TIME)));
+}
+
+function segmentFileSequence(fileName) {
+    const match = String(fileName || "").match(/_seg_(\d+)\.ts$/i);
+    return match ? Number(match[1]) : 0;
 }
 
 function startCleanupTimer() {

@@ -100,7 +100,7 @@ function buildStreams(channel, host, routeKey) {
     const scaled = streamMenuVariants()
         .filter(variant => !variant.source)
         .map(variant => {
-            const params = stableHlsParams(channel, hlsUrl, { delaySeconds: 60 });
+            const params = stableHlsParams(channel, hlsUrl, { delaySeconds: settings.TRANSCODE_PLAYBACK_DELAY_SECONDS });
             params.set("v", variant.name);
             const label = streamVariantLabel(variant);
             return {
