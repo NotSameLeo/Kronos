@@ -1,6 +1,6 @@
 {
   "name": "kronos-channel-stremio",
-  "version": "5.7.2",
+  "version": "5.7.3",
   "description": "Kronos channel addon configurator for Stremio",
   "main": "server.js",
   "scripts": {

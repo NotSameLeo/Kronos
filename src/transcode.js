@@ -83,25 +83,31 @@ function prewarmTranscode(upstream) {
 }
 
 async function serveTranscodeFile(sessionId, fileName, res) {
+    const startedAt = Date.now();
     const session = state.transcodeSessions.get(sessionId);
     if (!session || !isSafeHlsFile(fileName)) {
+        logTranscodeFile("MISS", { sid: sessionId, file: fileName, reason: session ? "unsafe" : "no-session" });
         res.status(404).end();
         return;
     }
     session.lastAccess = Date.now();
+    const info = transcodeFileInfo(fileName);
     const filePath = path.join(session.dir, fileName);
     if (!filePath.startsWith(`${session.dir}${path.sep}`)) {
+        logTranscodeFile("MISS", { session, file: fileName, reason: "path" });
         res.status(404).end();
         return;
     }
+    let stat;
     try {
-        await fsp.access(filePath, fs.constants.R_OK);
+        stat = await fsp.stat(filePath);
     } catch {
+        logTranscodeFile("MISS", { session, file: fileName, variant: info.variant, seq: info.seq, reason: "missing" });
         res.status(404).end();
         return;
     }
 
-    if (/\.m3u8$/i.test(fileName)) {
+    if (info.kind === "manifest") {
         res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
         res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, no-transform");
     } else {
@@ -109,6 +115,42 @@ async function serveTranscodeFile(sessionId, fileName, res) {
         res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, no-transform");
     }
     res.setHeader("X-Kronos-Transcode", "1");
+    logTranscodeFile("REQ", {
+        session,
+        kind: info.kind,
+        variant: info.variant,
+        seq: info.seq,
+        file: fileName,
+        bytes: stat.size,
+        ua: compact(res.req?.get?.("user-agent") || "-")
+    });
+    let closed = false;
+    res.on("finish", () => {
+        closed = true;
+        logTranscodeFile("SENT", {
+            session,
+            kind: info.kind,
+            variant: info.variant,
+            seq: info.seq,
+            file: fileName,
+            status: res.statusCode,
+            bytes: stat.size,
+            ms: Date.now() - startedAt
+        });
+    });
+    res.on("close", () => {
+        if (closed) return;
+        logTranscodeFile("CLOSE", {
+            session,
+            kind: info.kind,
+            variant: info.variant,
+            seq: info.seq,
+            file: fileName,
+            status: res.statusCode,
+            bytes: stat.size,
+            ms: Date.now() - startedAt
+        });
+    });
     res.sendFile(filePath);
 }
 
@@ -134,13 +176,16 @@ async function getOrStartSession(upstream) {
         startedAt: Date.now(),
         lastAccess: Date.now(),
         ready: new Set(),
+        ffmpegLogLine: "",
         stderr: ""
     };
     session.process = spawn(settings.TRANSCODE_FFMPEG_PATH, ffmpegArgs(upstream, session), {
         stdio: ["ignore", "ignore", "pipe"]
     });
     session.process.stderr.on("data", chunk => {
-        session.stderr = `${session.stderr}${chunk.toString()}`.slice(-4000);
+        const text = chunk.toString();
+        session.stderr = `${session.stderr}${text}`.slice(-4000);
+        logFfmpegLines(session, text);
     });
     session.process.once("error", err => {
         session.exitedAt = Date.now();
@@ -426,6 +471,15 @@ function isSafeHlsFile(fileName) {
     return /^[A-Za-z0-9_.-]+\.(?:m3u8|ts)$/.test(String(fileName || ""));
 }
 
+function transcodeFileInfo(fileName) {
+    const value = String(fileName || "");
+    const segment = value.match(/^(.+)_seg_(\d+)\.ts$/i);
+    if (segment) return { kind: "segment", variant: segment[1], seq: Number(segment[2]) };
+    const manifest = value.match(/^(.+)\.m3u8$/i);
+    if (manifest) return { kind: "manifest", variant: manifest[1], seq: "-" };
+    return { kind: "file", variant: "-", seq: "-" };
+}
+
 function compact(value) {
     return String(value || "").replace(/\s+/g, " ").slice(0, 220);
 }
@@ -438,6 +492,37 @@ function logTranscode(label, session, fields = {}) {
         ...fields
     };
     console.log(`[TRANSCODE ${label}] ${Object.entries(parts).map(([key, value]) => `${key}=${value ?? "-"}`).join(" ")}`);
+}
+
+function logTranscodeFile(label, fields = {}) {
+    if (!settings.HLS_DIAGNOSTICS || !settings.TRANSCODE_FILE_DIAGNOSTICS) return;
+    const session = fields.session;
+    const parts = {
+        sid: session?.id || fields.sid || "-",
+        src: session?.upstream ? hashKey(session.upstream, 12) : "-",
+        kind: fields.kind || "-",
+        variant: fields.variant || "-",
+        seq: fields.seq ?? "-",
+        status: fields.status || "-",
+        bytes: fields.bytes ?? "-",
+        ms: fields.ms ?? "-",
+        file: fields.file || "-",
+        reason: fields.reason || "-",
+        ua: fields.ua || "-"
+    };
+    console.log(`[TRANSCODE FILE ${label}] ${Object.entries(parts).map(([key, value]) => `${key}=${value ?? "-"}`).join(" ")}`);
+}
+
+function logFfmpegLines(session, text) {
+    if (!settings.HLS_DIAGNOSTICS || !settings.TRANSCODE_FFMPEG_DIAGNOSTICS) return;
+    const combined = `${session.ffmpegLogLine || ""}${text}`;
+    const lines = combined.split(/\r?\n/);
+    session.ffmpegLogLine = lines.pop() || "";
+    for (const line of lines) {
+        const message = compact(line);
+        if (!message) continue;
+        logTranscode("FFMPEG", session, { msg: message });
+    }
 }
 
 module.exports = {

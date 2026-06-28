@@ -42,7 +42,7 @@ const FRONTEND_PRELOAD_FILE = String(process.env.FRONTEND_PRELOAD_FILE || "").tr
 const TRANSCODE_VARIANTS = parseTranscodeVariants(process.env.TRANSCODE_VARIANTS);
 
 module.exports = {
-    RELEASE_VERSION: "5.7.2",
+    RELEASE_VERSION: "5.7.3",
     ADDON_TYPE: "tv",
     PLAYBACK_MODE: "plain-hls-relay",
     PORT: process.env.PORT || 7000,
@@ -107,6 +107,8 @@ module.exports = {
     TRANSCODE_IDLE_TIMEOUT_MS: numberEnv("TRANSCODE_IDLE_TIMEOUT_MS", 90000, 10000),
     TRANSCODE_MAX_SESSIONS: numberEnv("TRANSCODE_MAX_SESSIONS", 3, 1, 12),
     TRANSCODE_PRESET: process.env.TRANSCODE_PRESET || "veryfast",
+    TRANSCODE_FILE_DIAGNOSTICS: String(process.env.TRANSCODE_FILE_DIAGNOSTICS || "1") !== "0",
+    TRANSCODE_FFMPEG_DIAGNOSTICS: String(process.env.TRANSCODE_FFMPEG_DIAGNOSTICS || "1") !== "0",
     TRANSCODE_BLACK_GUARD: String(process.env.TRANSCODE_BLACK_GUARD || "1") !== "0",
     TRANSCODE_BLACK_GUARD_RATIO: numberEnv("TRANSCODE_BLACK_GUARD_RATIO", 0.85, 0.1, 1),
     TS_LIVE_RECONNECT_DELAY_MS: numberEnv("TS_LIVE_RECONNECT_DELAY_MS", 250, 0),
