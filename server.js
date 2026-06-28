@@ -699,6 +699,8 @@ function buildStats(configKey) {
             transcodeSourceVideoBitrateK: settings.TRANSCODE_SOURCE_VIDEO_BITRATE_K,
             transcodeSourceAudioBitrateK: settings.TRANSCODE_SOURCE_AUDIO_BITRATE_K,
             transcodeSourceBandwidth: settings.TRANSCODE_SOURCE_BANDWIDTH,
+            transcodeHlsInputLiveStartIndex: settings.TRANSCODE_HLS_INPUT_LIVE_START_INDEX,
+            transcodeHlsDeleteThreshold: settings.TRANSCODE_HLS_DELETE_THRESHOLD,
             transcodeOriginalVariant: settings.TRANSCODE_INCLUDE_ORIGINAL_VARIANT,
             transcodeFileDiagnostics: settings.TRANSCODE_FILE_DIAGNOSTICS,
             transcodeFfmpegDiagnostics: settings.TRANSCODE_FFMPEG_DIAGNOSTICS,

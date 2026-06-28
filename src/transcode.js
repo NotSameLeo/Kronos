@@ -7,6 +7,7 @@ const state = require("./state");
 const {
     encodeBase64Url,
     hashKey,
+    isHlsUrl,
     isHttpUrl,
     routeBase,
     sleep
@@ -71,7 +72,10 @@ async function transcodeManifest(host, routeKey, upstream, req) {
     const variant = selectVariant(req);
     const session = await getOrStartSession(upstream);
     await waitForManifest(session, variant, settings.TRANSCODE_START_TIMEOUT_MS);
-    return rewriteTranscodePlaylist(session, variant, host, routeKey);
+    return rewriteTranscodePlaylist(session, variant, host, routeKey, {
+        holdBackSeconds: queryNumber(req?.query?.hb),
+        startOffsetSeconds: queryNumber(req?.query?.st)
+    });
 }
 
 function prewarmTranscode(upstream) {
@@ -203,15 +207,22 @@ async function getOrStartSession(upstream) {
 
 function ffmpegArgs(upstream, session) {
     const variants = session.variants;
+    const hlsInputArgs = isHlsUrl(upstream)
+        ? ["-live_start_index", String(settings.TRANSCODE_HLS_INPUT_LIVE_START_INDEX)]
+        : [];
     const args = [
         "-hide_banner",
         "-loglevel", "warning",
         "-nostdin",
+        "-vsync", "0",
+        "-fflags", "+genpts+discardcorrupt",
         "-reconnect", "1",
         "-reconnect_streamed", "1",
+        "-reconnect_on_network_error", "1",
         "-reconnect_delay_max", "4",
         "-user_agent", settings.UPSTREAM_UA,
         "-headers", "Cache-Control: no-cache\r\nPragma: no-cache\r\n",
+        ...hlsInputArgs,
         "-i", upstream
     ];
 
@@ -253,8 +264,8 @@ function pushEncodedHlsOutput(args, videoMap, variant, session) {
         "-f", "hls",
         "-hls_time", String(settings.TRANSCODE_HLS_TIME),
         "-hls_list_size", String(settings.TRANSCODE_HLS_LIST_SIZE),
-        "-hls_delete_threshold", "4",
-        "-hls_flags", "delete_segments+omit_endlist+program_date_time+independent_segments",
+        "-hls_delete_threshold", String(settings.TRANSCODE_HLS_DELETE_THRESHOLD),
+        "-hls_flags", "delete_segments+omit_endlist+program_date_time+independent_segments+temp_file",
         "-hls_segment_filename", path.join(session.dir, `${variant.name}_seg_%06d.ts`),
         variantManifestPath(session, variant)
     );
@@ -398,16 +409,17 @@ function blackDurationSeconds(filePath) {
     });
 }
 
-async function rewriteTranscodePlaylist(session, variant, host, routeKey) {
+async function rewriteTranscodePlaylist(session, variant, host, routeKey, options = {}) {
     session.lastAccess = Date.now();
     const text = await fsp.readFile(variantManifestPath(session, variant), "utf8");
     const base = routeBase(host, routeKey);
-    return text.split(/\r?\n/).map(line => {
+    const rewritten = text.split(/\r?\n/).map(line => {
         const trimmed = line.trim();
         if (!trimmed || trimmed.startsWith("#")) return line;
         const fileName = path.basename(trimmed);
         return `${base}/proxy/transcode/${session.id}/${encodeURIComponent(fileName)}`;
     }).join("\n");
+    return applyTranscodeLiveHints(rewritten, options);
 }
 
 function startCleanupTimer() {
@@ -451,6 +463,49 @@ function selectVariant(req) {
     return playbackVariants().find(variant =>
         variant.name === requested || String(variant.height || "") === requested || `${variant.height}p` === requested
     ) || playbackVariants()[0];
+}
+
+function applyTranscodeLiveHints(text, options = {}) {
+    let next = applyServerControlHoldBack(text, options.holdBackSeconds);
+    next = applyStartOffset(next, options.startOffsetSeconds);
+    return next;
+}
+
+function applyStartOffset(text, offsetSeconds) {
+    const offset = Number(offsetSeconds || 0);
+    if (offset <= 0 || /#EXT-X-START:/i.test(text)) return text;
+    const lines = String(text || "").split(/\r?\n/);
+    lines.splice(playlistHeaderInsertIndex(lines), 0, `#EXT-X-START:TIME-OFFSET=-${Math.round(offset)},PRECISE=NO`);
+    return lines.join("\n");
+}
+
+function applyServerControlHoldBack(text, holdBackSeconds) {
+    const holdBack = Number(holdBackSeconds || 0);
+    if (holdBack <= 0) return text;
+    const rounded = Math.round(holdBack * 1000) / 1000;
+    const lines = String(text || "").split(/\r?\n/);
+    const existing = lines.findIndex(line => /^#EXT-X-SERVER-CONTROL:/i.test(line.trim()));
+    if (existing >= 0) {
+        if (/HOLD-BACK=/i.test(lines[existing])) return text;
+        lines[existing] = `${lines[existing]},HOLD-BACK=${rounded}`;
+        return lines.join("\n");
+    }
+    const versionIndex = lines.findIndex(line => /^#EXT-X-VERSION:/i.test(line.trim()));
+    lines.splice(versionIndex >= 0 ? versionIndex + 1 : playlistHeaderInsertIndex(lines), 0, `#EXT-X-SERVER-CONTROL:HOLD-BACK=${rounded}`);
+    return lines.join("\n");
+}
+
+function playlistHeaderInsertIndex(lines) {
+    let index = lines[0]?.trim() === "#EXTM3U" ? 1 : 0;
+    while (index < lines.length && /^#EXT-X-(VERSION|SERVER-CONTROL|INDEPENDENT-SEGMENTS):/i.test(lines[index].trim())) {
+        index++;
+    }
+    return index;
+}
+
+function queryNumber(value) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
 }
 
 function variantManifestPath(session, variant) {
