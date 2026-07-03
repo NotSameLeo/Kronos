@@ -403,18 +403,20 @@ const channelNameCollator = new Intl.Collator("it", {
 });
 
 const QUALITY_ORDER = new Map([
-    ["", 0],
-    ["hd", 1],
-    ["fhd", 2],
-    ["fullhd", 2],
-    ["uhd", 3],
-    ["4k", 3],
-    ["8k", 4]
+    ["hevc", 0],
+    ["4k", 1],
+    ["uhd", 2],
+    ["fhd", 3],
+    ["fullhd", 3],
+    ["hd", 4],
+    ["sd", 5],
+    ["8k", 6],
+    ["", 7]
 ]);
 
 function channelSortParts(name) {
     const text = String(name || "").trim();
-    const qualityMatch = text.match(/\b(8K|4K|UHD|FULL\s*HD|FHD|HD)\b\s*$/i);
+    const qualityMatch = text.match(/\b(HEVC|4K|UHD|FULL\s*HD|FHD|HD|SD|8K)\b\s*$/i);
     const quality = qualityMatch ? qualityMatch[1].toLowerCase().replace(/\s+/g, "") : "";
     const base = qualityMatch ? text.slice(0, qualityMatch.index).trim() : text;
     return {

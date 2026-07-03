@@ -70,18 +70,26 @@ test("sortChannelsByName uses natural channel ordering and quality variants", ()
     const channels = [
         { name: "DAZN WEB 10" },
         { name: "DAZN WEB 1 4K" },
+        { name: "DAZN WEB 1 UHD" },
+        { name: "DAZN WEB 1 FHD" },
         { name: "DAZN WEB 2" },
+        { name: "DAZN WEB 1 HEVC" },
         { name: "DAZN WEB 1 HD" },
+        { name: "DAZN WEB 1 SD" },
         { name: "DAZN WEB 1" },
         { name: "DAZN WEB 10 HD" }
     ];
 
     assert.deepEqual(sortChannelsByName(channels).map(channel => channel.name), [
-        "DAZN WEB 1",
-        "DAZN WEB 1 HD",
+        "DAZN WEB 1 HEVC",
         "DAZN WEB 1 4K",
+        "DAZN WEB 1 UHD",
+        "DAZN WEB 1 FHD",
+        "DAZN WEB 1 HD",
+        "DAZN WEB 1 SD",
+        "DAZN WEB 1",
         "DAZN WEB 2",
-        "DAZN WEB 10",
-        "DAZN WEB 10 HD"
+        "DAZN WEB 10 HD",
+        "DAZN WEB 10"
     ]);
 });
