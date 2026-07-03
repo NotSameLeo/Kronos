@@ -531,6 +531,7 @@
             border: 1px solid rgba(56, 223, 244, 0.2);
             cursor: grab;
             user-select: none;
+            touch-action: none;
             font-weight: 900;
         }
 
@@ -1128,8 +1129,8 @@
                 </div>
 
                 <div class="field">
-                    <label for="groups">Gruppi canali <small>separati da virgola</small></label>
-                    <input type="text" id="groups" placeholder="Cinema, Sport, Documentari" autocomplete="off">
+                    <label for="groups">Categorie configurate <small>originale - rinominata, separate da virgola</small></label>
+                    <input type="text" id="groups" placeholder="GENERALE HD/4K - Generale, SPORT HD/4K - Sport" autocomplete="off">
                 </div>
 
                 <div id="groupAssistant" class="group-assistant" aria-live="polite">
@@ -1254,9 +1255,58 @@
         let analysisSignature = '';
         let groupsInsertedFromAnalysis = false;
         let categoryConfig = [];
+        let syncingGroupsField = false;
 
         function parseGroups() {
             return groups.value.split(',').map(item => item.trim()).filter(Boolean);
+        }
+
+        function parseConfiguredCategories(value) {
+            const parts = String(value || '').split(',').map(item => item.trim()).filter(Boolean);
+            if (!parts.length || !parts.some(item => /\s+-\s+/.test(item))) return [];
+            return parts.map(item => {
+                const match = item.match(/^(.+?)\s+-\s+(.+)$/);
+                const id = (match ? match[1] : item).trim();
+                const name = cleanGroupName(match ? match[2] : item) || id;
+                return id ? { id, name } : null;
+            }).filter(Boolean);
+        }
+
+        function categoryConfigToFieldValue(config) {
+            return (config || [])
+                .map(item => {
+                    const id = String(item.id || '').trim();
+                    const name = cleanGroupName(item.name || id) || id;
+                    return id ? `${id} - ${name}` : '';
+                })
+                .filter(Boolean)
+                .join(', ');
+        }
+
+        function syncGroupsFieldFromCategories(config = getCategoryConfig()) {
+            syncingGroupsField = true;
+            groups.value = categoryConfigToFieldValue(config);
+            syncingGroupsField = false;
+        }
+
+        function applyCategoriesFromGroupsField() {
+            if (syncingGroupsField) return false;
+            const parsed = parseConfiguredCategories(groups.value);
+            if (!parsed.length) {
+                categoryConfig = [];
+                groupsInsertedFromAnalysis = false;
+                updatePreview();
+                return false;
+            }
+
+            categoryConfig = parsed;
+            groupsInsertedFromAnalysis = true;
+            analysisSignature = '';
+            groupOptions.innerHTML = '';
+            renderSavedCategoryConfig();
+            syncGroupsFieldFromCategories(categoryConfig);
+            updatePreview();
+            return true;
         }
 
         function normalizeGroupName(group) {
@@ -1301,6 +1351,7 @@
         function syncCategoryOrderFromDom() {
             categoryConfig = getCategoryConfig();
             groupsInsertedFromAnalysis = true;
+            syncGroupsFieldFromCategories(categoryConfig);
             updatePreview();
         }
 
@@ -1326,6 +1377,27 @@
                 row.classList.remove('is-dragging');
                 syncCategoryOrderFromDom();
             });
+            handle.addEventListener('pointerdown', function(event) {
+                if (event.pointerType === 'mouse') return;
+                event.preventDefault();
+                row.classList.add('is-dragging');
+                handle.setPointerCapture?.(event.pointerId);
+            });
+            handle.addEventListener('pointermove', function(event) {
+                if (event.pointerType === 'mouse' || !row.classList.contains('is-dragging')) return;
+                event.preventDefault();
+                const after = getDragAfterElement(groupOptions, event.clientY);
+                if (after) groupOptions.insertBefore(row, after);
+                else groupOptions.appendChild(row);
+            });
+            function finishPointerDrag(event) {
+                if (event.pointerType === 'mouse' || !row.classList.contains('is-dragging')) return;
+                row.classList.remove('is-dragging');
+                handle.releasePointerCapture?.(event.pointerId);
+                syncCategoryOrderFromDom();
+            }
+            handle.addEventListener('pointerup', finishPointerDrag);
+            handle.addEventListener('pointercancel', finishPointerDrag);
 
             const input = document.createElement('input');
             input.type = 'checkbox';
@@ -1349,11 +1421,13 @@
                 element.addEventListener('input', function() {
                     categoryConfig = getCategoryConfig();
                     groupsInsertedFromAnalysis = true;
+                    syncGroupsFieldFromCategories(categoryConfig);
                     updatePreview();
                 });
                 element.addEventListener('change', function() {
                     categoryConfig = getCategoryConfig();
                     groupsInsertedFromAnalysis = true;
+                    syncGroupsFieldFromCategories(categoryConfig);
                     updatePreview();
                 });
             });
@@ -1376,6 +1450,7 @@
             }));
             groupAssistant.classList.add('is-visible');
             categoryConfig = getCategoryConfig();
+            syncGroupsFieldFromCategories(categoryConfig);
             return true;
         }
 
@@ -1598,6 +1673,7 @@
 
             groupAssistant.classList.add('is-visible');
             categoryConfig = getCategoryConfig();
+            syncGroupsFieldFromCategories(categoryConfig);
             updatePreview();
         }
 
@@ -1612,7 +1688,7 @@
                 return;
             }
 
-            groups.value = categoryConfig.map(item => item.id).join(', ');
+            syncGroupsFieldFromCategories(categoryConfig);
             groupsInsertedFromAnalysis = true;
             updatePreview();
             showToast('Categorie applicate');
@@ -1763,7 +1839,7 @@
             categoryConfig = Array.isArray(config.cg)
                 ? config.cg.map(item => ({ id: item.id || item.name, name: item.name || item.id })).filter(item => item.id)
                 : [];
-            groups.value = categoryConfig.length ? categoryConfig.map(item => item.id).join(', ') : (Array.isArray(config.g) ? config.g.join(', ') : '');
+            groups.value = categoryConfig.length ? categoryConfigToFieldValue(categoryConfig) : (Array.isArray(config.g) ? config.g.join(', ') : '');
             groupsInsertedFromAnalysis = config.gm === 'filter';
             analysisSignature = groupsInsertedFromAnalysis ? getListSignature(lists) : '';
             groupAssistant.classList.remove('is-visible');
@@ -1915,12 +1991,17 @@
             groupOptions.querySelectorAll('[data-group-enabled]').forEach(input => input.checked = true);
             categoryConfig = getCategoryConfig();
             groupsInsertedFromAnalysis = true;
+            syncGroupsFieldFromCategories(categoryConfig);
             updatePreview();
         });
 
         groups.addEventListener('input', function() {
+            if (applyCategoriesFromGroupsField()) return;
             groupsInsertedFromAnalysis = false;
             categoryConfig = [];
+            groupOptions.innerHTML = '';
+            groupAssistant.classList.remove('is-visible');
+            updatePreview();
         });
 
         [epgUrl, groups].forEach(element => {
