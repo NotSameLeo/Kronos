@@ -560,6 +560,15 @@
             font-size: 0.86rem;
         }
 
+        .field.is-invalid {
+            border-color: rgba(251, 113, 133, 0.88);
+            box-shadow: 0 0 0 1px rgba(251, 113, 133, 0.35), 0 0 24px rgba(251, 113, 133, 0.14);
+        }
+
+        .field.is-invalid input {
+            color: #fecdd3;
+        }
+
         .group-option small {
             color: var(--muted);
             white-space: nowrap;
@@ -1286,20 +1295,56 @@
         function syncGroupsFieldFromCategories(config = getCategoryConfig()) {
             syncingGroupsField = true;
             groups.value = categoryConfigToFieldValue(config);
+            setGroupsFieldInvalid(false);
             syncingGroupsField = false;
+        }
+
+        function setGroupsFieldInvalid(invalid) {
+            groups.closest('.field')?.classList.toggle('is-invalid', Boolean(invalid));
+        }
+
+        function knownCategoryIdMap() {
+            const map = new Map();
+            const add = id => {
+                const key = normalizeGroupName(id);
+                if (key && !map.has(key)) map.set(key, id);
+            };
+            getCategoryRows().forEach(row => add(row.dataset.groupId));
+            categoryConfig.forEach(item => add(item.id));
+            (analysisData?.groups || []).forEach(group => add(group.name));
+            return map;
+        }
+
+        function reconcileConfiguredCategories(parsed) {
+            const known = knownCategoryIdMap();
+            if (!known.size) return parsed;
+            const reconciled = [];
+            for (const item of parsed) {
+                const original = known.get(normalizeGroupName(item.id));
+                if (!original) return null;
+                reconciled.push({ id: original, name: item.name });
+            }
+            return reconciled;
         }
 
         function applyCategoriesFromGroupsField() {
             if (syncingGroupsField) return false;
             const parsed = parseConfiguredCategories(groups.value);
             if (!parsed.length) {
+                setGroupsFieldInvalid(false);
                 categoryConfig = [];
                 groupsInsertedFromAnalysis = false;
                 updatePreview();
                 return false;
             }
+            const reconciled = reconcileConfiguredCategories(parsed);
+            if (!reconciled) {
+                setGroupsFieldInvalid(true);
+                return true;
+            }
 
-            categoryConfig = parsed;
+            setGroupsFieldInvalid(false);
+            categoryConfig = reconciled;
             groupsInsertedFromAnalysis = true;
             analysisSignature = '';
             groupOptions.innerHTML = '';
