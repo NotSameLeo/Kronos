@@ -93,7 +93,7 @@ function buildStreams(channel, host, routeKey) {
     const source = {
         ...buildStream(channel, host, routeKey),
         title: channel.name,
-        name: "Sorgente"
+        name: "🖥 Sorgente"
     };
     if (!settings.TRANSCODE_AUTO_ENABLED || !hlsUrl) return [source];
 
@@ -120,7 +120,13 @@ function normalizedHlsPlaybackUrl(channel) {
 }
 
 function streamVariantLabel(variant) {
-    return variant.name || `${variant.height}p`;
+    const label = variant.name || `${variant.height}p`;
+    const icons = {
+        "720p": "💿",
+        "480p": "📼",
+        "360p": "💾"
+    };
+    return `${icons[label] || "📺"} ${label}`;
 }
 
 function stableHlsParams(channel, url, options = {}) {
