@@ -31,6 +31,8 @@ test("rende stabili i nomi degli slot evento e corregge i marchi obsoleti", () =
     assert.equal(normalizeChannelName("Champions League Infinity 3 HD"), "MEDIASET INFINITY CHAMPIONS 3 HD");
     assert.equal(normalizeChannelName("Adriano Celentano Channel RAW"), "ADRIANO CELENTANO 24/7 RAW");
     assert.equal(normalizeChannelName("American Dad 24H RAW"), "AMERICAN DAD 24/7 RAW");
+    assert.equal(normalizeChannelName("20thCenturyFox 4K"), "20TH CENTURY STUDIOS 4K");
+    assert.equal(normalizeChannelName("Brickleberry 4K 24H"), "BRICKLEBERRY 24/7 4K");
 });
 
 test("rimuove solo i feed obsoleti concordati dal manifest Kronos", () => {
@@ -66,4 +68,6 @@ test("uniforma i fallback Cinema 24/7 senza coprire i loghi specifici", () => {
     assert.match(generic.logo, /cinema-24-7-it\.svg$/);
     const specific = applyChannelBranding("d2bc70d5ec70", { name: "Adriano Celentano Channel RAW", group: "Cinema 24/7" });
     assert.match(specific.logo, /adriano-celentano-24-7-it\.svg$/);
+    const cinema = applyChannelBranding("d2bc70d5ec70", { name: "Avengers Grimm Channel 4K", group: "Cinema 1" });
+    assert.equal(cinema.name, "AVENGERS GRIMM 24/7 4K");
 });

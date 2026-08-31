@@ -52,6 +52,8 @@ const NAME_REPLACEMENTS = [
     [/^ALICE(?=\s|$)/i, "ALMA TV"],
     [/^EURONEWS(?:\s+(?:ITA|ITALIAN))?(?=\s|$)/i, "EURONEWS ITALIANO"],
     [/^MOTOGP ON BBOARD(?=\s|$)/i, "MOTOGP ON BOARD"],
+    [/^20(?:TH)?\s*CENTURY\s*FOX(?=\s|$)/i, "20TH CENTURY STUDIOS"],
+    [/^(.+?)\s+(8K|4K|UHD|FHD|HD|HEVC|SD|RAW)\s+24H$/i, "$1 24/7 $2"],
     [/^(ADRIANO CELENTANO|ALBERTO SORDI|ALDO GIOVANNI E GIACOMO|ALESSANDRO SIANI)\s+CHANNEL(?=\s|$)/i, "$1 24/7"],
     [/^AMERICAN DAD\s+24H(?=\s|$)/i, "AMERICAN DAD 24/7"],
     [/^SKY CINEMA DUE\s*24(?=\s|$)/i, "SKY CINEMA STORIES"],
@@ -105,6 +107,7 @@ const NAME_REPLACEMENTS = [
 
 const LOGO_RULES = [
     [/^ALMA TV(?:\s|$)/, "alma-tv-it.svg"],
+    [/^20TH CENTURY STUDIOS(?:\s|$)/, "20th-century-studios-it.svg"],
     [/^MEDIASET INFINITY CHAMPIONS(?:\s|$)/, "mediaset-infinity-it.svg"],
     [/^PRIME VIDEO EVENTO(?:\s|$)/, "prime-video-it.svg"],
     [/^MEZZO(?:\s|$)/, "mezzo-it.svg"],
@@ -318,7 +321,7 @@ function applyChannelBranding(configKey, channel) {
     if (!brandingEnabled(configKey)) return channel;
     let name = normalizeChannelName(channel?.name);
     const group = String(channel?.group || "").toLocaleUpperCase("it-IT");
-    if (/^CINEMA 24\/7(?:\s|$)/.test(group)) {
+    if (/^CINEMA(?:\s|$)/.test(group)) {
         name = name.replace(/\s+CHANNEL(?=\s|$)/, " 24/7").replace(/\s+24H(?=\s|$)/, " 24/7");
     }
     const ruleLogo = ruleLogoForName(name);
