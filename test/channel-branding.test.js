@@ -9,6 +9,7 @@ const {
     applyChannelBranding,
     logoForName,
     normalizeChannelName,
+    shouldExcludeChannel,
     withoutQualitySuffix
 } = require("../src/channel-branding");
 
@@ -19,6 +20,25 @@ test("normalizza i nomi obsoleti senza falsi prefissi Sky", () => {
     assert.equal(normalizeChannelName("Sky Crime Investigation 4k"), "SKY CRIME 4K");
     assert.equal(normalizeChannelName("Sky Cinema Due 24 UHD"), "SKY CINEMA STORIES UHD");
     assert.equal(normalizeChannelName("MotorTrend HD"), "DISCOVERY TURBO HD");
+});
+
+test("rende stabili i nomi degli slot evento e corregge i marchi obsoleti", () => {
+    assert.equal(normalizeChannelName("No event streaming now - | 8K exclusive | IT: DAZN PPV 12"), "DAZN EXCLUSIVE 12 8K");
+    assert.equal(normalizeChannelName("Next | evento | IT: DAZN PPV 7"), "DAZN EXCLUSIVE 7 8K");
+    assert.equal(normalizeChannelName("PRIM 1 4K [LIVE-EVENT]"), "PRIME VIDEO EVENTO 1 4K");
+    assert.equal(normalizeChannelName("Prime: Inter TV RAW"), "INTER TV RAW");
+    assert.equal(normalizeChannelName("Alice"), "ALMA TV");
+    assert.equal(normalizeChannelName("Champions League Infinity 3 HD"), "MEDIASET INFINITY CHAMPIONS 3 HD");
+    assert.equal(normalizeChannelName("Adriano Celentano Channel RAW"), "ADRIANO CELENTANO 24/7 RAW");
+    assert.equal(normalizeChannelName("American Dad 24H RAW"), "AMERICAN DAD 24/7 RAW");
+});
+
+test("rimuove solo i feed obsoleti concordati dal manifest Kronos", () => {
+    assert.equal(shouldExcludeChannel("d2bc70d5ec70", { name: "Eleven Sport ciclismo live + replica" }), true);
+    assert.equal(shouldExcludeChannel("d2bc70d5ec70", { name: "A3Series" }), true);
+    assert.equal(shouldExcludeChannel("d2bc70d5ec70", { name: "Feralpi Salo Girone A" }), true);
+    assert.equal(shouldExcludeChannel("d2bc70d5ec70", { name: "DAZN PPV 1" }), false);
+    assert.equal(shouldExcludeChannel("un-altro-manifest", { name: "A3Series" }), false);
 });
 
 test("porta ogni nome in maiuscolo e conserva le varianti speciali", () => {

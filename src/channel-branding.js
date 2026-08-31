@@ -5,7 +5,7 @@ const { hashKey } = require("./utils");
 
 const LOGO_ROOT = path.join(__dirname, "..", "public", "channel-logos", "italy");
 const LOGO_PUBLIC_ROOT = "/channel-logos/italy";
-const QUALITY_SUFFIX = /\s+(?:4K|UHD|FHD|FULL\s*HD|HD|HEVC|SD|RAW|1080P|720P|576P|480P|HDR|HLG)$/i;
+const QUALITY_SUFFIX = /\s+(?:8K|4K|UHD|FHD|FULL\s*HD|HD|HEVC|SD|RAW|1080P|720P|576P|480P|HDR|HLG)$/i;
 
 const FALSE_SKY_PREFIX = new RegExp(
     "^SKY\\s+(?=" + [
@@ -42,8 +42,21 @@ const FALSE_SKY_PREFIX = new RegExp(
 );
 
 const NAME_REPLACEMENTS = [
+    [/^NO EVENT STREAMING NOW.*?DAZN PPV\s+(\d+).*$/i, "DAZN EXCLUSIVE $1 8K"],
+    [/^NEXT\s*\|.*?DAZN PPV\s+(\d+).*$/i, "DAZN EXCLUSIVE $1 8K"],
+    [/^PRIM(?:E)?\s*1\s+(4K|HD)\s*\[LIVE-EVENT\]$/i, "PRIME VIDEO EVENTO 1 $1"],
+    [/^PRIME:\s*INTER TV(?=\s|$)/i, "INTER TV"],
+    [/^PRIME:\s*MILAN TV(?=\s|$)/i, "MILAN TV"],
+    [/^PRIME:\s*MEZZO(?=\s|$)/i, "MEZZO"],
+    [/^CHAMPIONS LEAGUE INFINITY\s+(\d+)(?=\s|$)/i, "MEDIASET INFINITY CHAMPIONS $1"],
+    [/^ALICE(?=\s|$)/i, "ALMA TV"],
+    [/^EURONEWS(?:\s+(?:ITA|ITALIAN))?(?=\s|$)/i, "EURONEWS ITALIANO"],
+    [/^MOTOGP ON BBOARD(?=\s|$)/i, "MOTOGP ON BOARD"],
+    [/^(ADRIANO CELENTANO|ALBERTO SORDI|ALDO GIOVANNI E GIACOMO|ALESSANDRO SIANI)\s+CHANNEL(?=\s|$)/i, "$1 24/7"],
+    [/^AMERICAN DAD\s+24H(?=\s|$)/i, "AMERICAN DAD 24/7"],
     [/^SKY CINEMA DUE\s*24(?=\s|$)/i, "SKY CINEMA STORIES"],
     [/^SKY CINEMA DUE(?=\s|$)/i, "SKY CINEMA STORIES"],
+    [/^SKY CINEMA UNO24(?=\s|$)/i, "SKY CINEMA UNO 24"],
     [/^SKY CRIME INVEST(?:IGATION)?(?=\s|$)/i, "SKY CRIME"],
     [/^CRIME INVESTIGATION(?=\s|$)/i, "CRIME + INVESTIGATION"],
     [/^DISCOVERY CHANNEL(?=\s|$)/i, "DISCOVERY"],
@@ -91,6 +104,17 @@ const NAME_REPLACEMENTS = [
 ];
 
 const LOGO_RULES = [
+    [/^ALMA TV(?:\s|$)/, "alma-tv-it.svg"],
+    [/^MEDIASET INFINITY CHAMPIONS(?:\s|$)/, "mediaset-infinity-it.svg"],
+    [/^PRIME VIDEO EVENTO(?:\s|$)/, "prime-video-it.svg"],
+    [/^MEZZO(?:\s|$)/, "mezzo-it.svg"],
+    [/^MOTOGP(?:\s|$)/, "motogp-it.svg"],
+    [/^EURONEWS ITALIANO(?:\s|$)/, "euronews-it.svg"],
+    [/^ADRIANO CELENTANO(?:\s|$)/, "adriano-celentano-24-7-it.svg"],
+    [/^ALBERTO SORDI(?:\s|$)/, "alberto-sordi-24-7-it.svg"],
+    [/^ALDO GIOVANNI E GIACOMO(?:\s|$)/, "aldo-giovanni-giacomo-24-7-it.svg"],
+    [/^ALESSANDRO SIANI(?:\s|$)/, "alessandro-siani-24-7-it.svg"],
+    [/^AMERICAN DAD(?:\s|$)/, "american-dad-24-7-it.svg"],
     [/^RAI 1(?:\s|$)/, "rai-1-it.png"],
     [/^RAI 2(?:\s|$)/, "rai-2-it.png"],
     [/^RAI 3(?:\s|$)/, "rai-3-it.png"],
@@ -141,16 +165,17 @@ const LOGO_RULES = [
     [/^NICK JR(?:\s|$)/, "nick-jr-it.png"],
     [/^DEAKIDS(?:\s|$)/, "dea-kids-it.png"],
     [/^DEAJUNIOR(?:\s|$)/, "dea-junior-it.png"],
-    [/^SKY CINEMA STORIES(?:\s|$)/, "sky-cinema-stories-it.svg"],
-    [/^SKY CINEMA UNO 24(?:\s|$)/, "sky-cinema-uno-plus24-it.png"],
-    [/^SKY CINEMA UNO(?:\s|$)/, "sky-cinema-uno-it.png"],
-    [/^SKY CINEMA ACTION(?:\s|$)/, "sky-cinema-action-it.png"],
-    [/^SKY CINEMA COLLECTION(?:\s|$)/, "sky-cinema-collection-it.png"],
-    [/^SKY CINEMA COMEDY(?:\s|$)/, "sky-cinema-comedy-it.png"],
-    [/^SKY CINEMA DRAMA(?:\s|$)/, "sky-cinema-drama-it.png"],
-    [/^SKY CINEMA FAMILY(?:\s|$)/, "sky-cinema-family-it.png"],
-    [/^SKY CINEMA ROMANCE(?:\s|$)/, "sky-cinema-romance-it.png"],
-    [/^SKY CINEMA SUSPENSE(?:\s|$)/, "sky-cinema-suspense-it.png"],
+    [/^SKY CINEMA STORIES(?:\s|$)/, "sky-cinema-stories-kronos-it.svg"],
+    [/^SKY CINEMA UNO 24(?:\s|$)/, "sky-cinema-uno-plus24-kronos-it.svg"],
+    [/^SKY CINEMA UNO24(?:\s|$)/, "sky-cinema-uno-plus24-kronos-it.svg"],
+    [/^SKY CINEMA UNO(?:\s|$)/, "sky-cinema-uno-kronos-it.svg"],
+    [/^SKY CINEMA ACTION(?:\s|$)/, "sky-cinema-action-kronos-it.svg"],
+    [/^SKY CINEMA COLLECTION(?:\s|$)/, "sky-cinema-collection-kronos-it.svg"],
+    [/^SKY CINEMA COMEDY(?:\s|$)/, "sky-cinema-comedy-kronos-it.svg"],
+    [/^SKY CINEMA DRAMA(?:\s|$)/, "sky-cinema-drama-kronos-it.svg"],
+    [/^SKY CINEMA FAMILY(?:\s|$)/, "sky-cinema-family-kronos-it.svg"],
+    [/^SKY CINEMA ROMANCE(?:\s|$)/, "sky-cinema-romance-kronos-it.svg"],
+    [/^SKY CINEMA SUSPENSE(?:\s|$)/, "sky-cinema-suspense-kronos-it.svg"],
     [/^SKY CINEMA(?:\s|$)/, "sky-cinema-it.png"],
     [/^(?:VETRINA )?SKY PRIMAFILA(?:\s|$)/, "sky-primafila-it.png"],
     [/^SKY ATLANTIC(?:\s|$)/, "sky-atlantic-it.png"],
@@ -185,7 +210,7 @@ const LOGO_RULES = [
     [/^EUROSPORT PLAYER(?:\s|$)/, "eurosport-1-it.png"],
     [/^DAZN(?:\s|$)/, "dazn-it.svg"],
     [/^ZONA DAZN(?:\s|$)/, "zona-dazn-it.png"],
-    [/^COMEDY CENTRAL(?:\s|$)/, "comedy-central-it.svg"],
+    [/^COMEDY CENTRAL(?:\s|$)/, "comedy-central-kronos-it.svg"],
     [/^CACCIA E PESCA(?:\s|$)/, "caccia-pesca-it.png"],
     [/^CACCIA(?:\s|$)/, "caccia-it.png"],
     [/^PESCA(?:\s|$)/, "pesca-it.png"],
@@ -195,7 +220,7 @@ const LOGO_RULES = [
     [/^INTER TV(?:\s|$)/, "inter-tv-it.png"],
     [/^MILAN TV(?:\s|$)/, "milan-tv-it.png"],
     [/^LAZIO STYLE CHANNEL(?:\s|$)/, "lazio-style-channel-it.png"],
-    [/^ACI SPORT(?: TV)?(?:\s|$)/, "aci-sport-tv-it.png"],
+    [/^ACI SPORT(?: TV)?(?:\s|$)/, "aci-sport-tv-it.svg"],
     [/^HORSE TV(?:\s|$)/, "horse-tv-it.png"],
     [/^GAMBERO ROSSO(?:\s|$)/, "gambero-rosso-it.png"],
     [/^MTV MUSIC(?:\s|$)/, "mtv-music-it.png"],
@@ -263,6 +288,28 @@ function logoForName(name) {
     return localLogo(directLogoFilename(normalized));
 }
 
+const EXCLUDED_CHANNELS = [
+    /^A3SERIES(?:\s|$)/,
+    /^AMUSE ANIMATION(?:\s|$)/,
+    /^BABY TV(?:\s|$)/,
+    /^BIKE SMART MOBILITY(?:\s|$)/,
+    /^CANALE 10(?:\s|$)/,
+    /^DISNEY PLUS NATURE(?:\s|$)/,
+    /^DONNA SHOPPING(?:\s|$)/,
+    /^LAF(?:\s|$)/,
+    /^SKY SPORT SOLO (?:CALCIO|MOTORI)(?:\s|$)/,
+    /^DIRETTA PRO ELEVEN SPORTS(?:\s|$)/,
+    /^ELEVEN SPORT(?:\s|$)/,
+    /\sGIRONE [ABC](?:\s|$)/,
+    /SUPERLEGA SERIE A MASCHILE/
+];
+
+function shouldExcludeChannel(configKey, channel) {
+    if (!brandingEnabled(configKey)) return false;
+    const name = normalizeChannelName(channel?.name);
+    return EXCLUDED_CHANNELS.some(pattern => pattern.test(name));
+}
+
 function applyChannelBranding(configKey, channel) {
     if (!brandingEnabled(configKey)) return channel;
     const name = normalizeChannelName(channel?.name);
@@ -281,5 +328,6 @@ module.exports = {
     brandingEnabled,
     logoForName,
     normalizeChannelName,
+    shouldExcludeChannel,
     withoutQualitySuffix
 };

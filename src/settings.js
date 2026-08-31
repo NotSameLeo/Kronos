@@ -46,7 +46,7 @@ const FRONTEND_PRELOAD_FILE = String(process.env.FRONTEND_PRELOAD_FILE || "").tr
 const TRANSCODE_VARIANTS = parseTranscodeVariants(process.env.TRANSCODE_VARIANTS);
 
 module.exports = {
-    RELEASE_VERSION: "5.8.0",
+    RELEASE_VERSION: "5.9.0",
     ADDON_TYPE: "tv",
     PLAYBACK_MODE: "plain-hls-relay",
     PORT: process.env.PORT || 7000,

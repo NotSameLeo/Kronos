@@ -260,7 +260,7 @@ function publicLogoUrl(logoUrl, host) {
 
 function posterLabels(channelName) {
     const name = stripInitialCountryPrefix(channelName || "KRONOS").trim();
-    const qualityMatch = name.match(/\s+(4K|UHD|FHD|FULL HD|HD|HEVC|SD|RAW|1080P|720P|HDR|HLG)$/i);
+    const qualityMatch = name.match(/\s+(8K|4K|UHD|FHD|FULL HD|HD|HEVC|SD|RAW|1080P|720P|HDR|HLG)$/i);
     const quality = qualityMatch ? qualityMatch[1].toUpperCase() : "";
     const base = qualityMatch ? name.slice(0, qualityMatch.index).trim() : name;
     const words = base.split(/\s+/).filter(Boolean);
@@ -286,15 +286,11 @@ async function sendPosterSvg(res, channel) {
         .join("")
         .toUpperCase() || "TV";
     const logoMarkup = logoUri
-        ? `<image href="${escapeXml(logoUri)}" x="54" y="68" width="404" height="242" preserveAspectRatio="xMidYMid meet"/>`
-        : `<text x="256" y="242" text-anchor="middle" fill="#f5f7fb" font-family="Arial, sans-serif" font-size="86" font-weight="800">${escapeXml(initials)}</text>`;
+        ? `<image href="${escapeXml(logoUri)}" x="42" y="52" width="428" height="338" preserveAspectRatio="xMidYMid meet" filter="url(#logoContrast)"/>`
+        : `<text x="256" y="252" text-anchor="middle" fill="#f5f7fb" font-family="Arial, sans-serif" font-size="112" font-weight="800">${escapeXml(initials)}</text>`;
     const labels = posterLabels(name);
-    const lineY = labels.lines.length > 1 ? [370, 410] : [392];
-    const titleMarkup = labels.lines.map((line, index) =>
-        `<text x="256" y="${lineY[index]}" text-anchor="middle" fill="#f5f7fb" font-family="Arial, sans-serif" font-size="${labels.lines.length > 1 ? 27 : 31}" font-weight="750">${escapeXml(line)}</text>`
-    ).join("");
     const qualityMarkup = labels.quality
-        ? `<rect x="206" y="438" width="100" height="36" rx="18" fill="#38dff4" opacity="0.17"/><text x="256" y="464" text-anchor="middle" fill="#8cefff" font-family="Arial, sans-serif" font-size="21" font-weight="800">${escapeXml(labels.quality)}</text>`
+        ? `<rect x="166" y="414" width="180" height="66" rx="33" fill="url(#quality)"/><text x="256" y="458" text-anchor="middle" fill="#03121a" font-family="Arial, sans-serif" font-size="30" font-weight="900" letter-spacing="1">${escapeXml(labels.quality)}</text>`
         : "";
 
     res.setHeader("Content-Type", "image/svg+xml");
@@ -307,12 +303,19 @@ async function sendPosterSvg(res, channel) {
                     <stop offset="0.55" stop-color="#0b1120"/>
                     <stop offset="1" stop-color="#050814"/>
                 </linearGradient>
+                <linearGradient id="quality" x1="0" x2="1">
+                    <stop offset="0" stop-color="#55e6f4"/>
+                    <stop offset="1" stop-color="#9cf7dd"/>
+                </linearGradient>
+                <filter id="logoContrast" x="-12%" y="-12%" width="124%" height="124%">
+                    <feDropShadow dx="0" dy="2" stdDeviation="2.5" flood-color="#ffffff" flood-opacity="0.48"/>
+                    <feDropShadow dx="0" dy="7" stdDeviation="6" flood-color="#000000" flood-opacity="0.72"/>
+                </filter>
             </defs>
             <rect width="512" height="512" rx="56" fill="url(#bg)"/>
             <rect x="28" y="28" width="456" height="456" rx="44" fill="#ffffff" opacity="0.035" stroke="#ffffff" stroke-opacity="0.16"/>
-            <rect x="42" y="48" width="428" height="278" rx="34" fill="#ffffff" opacity="0.035"/>
+            <rect x="38" y="42" width="436" height="356" rx="38" fill="#ffffff" opacity="0.055"/>
             ${logoMarkup}
-            ${titleMarkup}
             ${qualityMarkup}
         </svg>
     `);

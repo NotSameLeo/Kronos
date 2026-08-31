@@ -19,7 +19,7 @@ const {
 } = require("./sources");
 const { cleanGroupName, normalizeGroupName } = require("./utils");
 const { decodeConfig, getStartupPreloadConfigs } = require("./config-store");
-const { applyChannelBranding } = require("./channel-branding");
+const { applyChannelBranding, shouldExcludeChannel } = require("./channel-branding");
 
 function buildChannelIndex(channels) {
     const index = new Map();
@@ -51,6 +51,7 @@ async function fetchAndProcessChannels(configKey, config, options = {}) {
 
         const rawChannels = parsedGroups.flat()
             .filter(channel => !isDividerChannelName(channel.name))
+            .filter(channel => !shouldExcludeChannel(configKey, channel))
             .filter(channel => {
                 if (config.gm === "list" || config.gm === "bucket") return true;
                 if (selectedSet.size === 0) return true;
