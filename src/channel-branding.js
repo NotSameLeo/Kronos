@@ -282,10 +282,14 @@ function directLogoFilename(name) {
 
 function logoForName(name) {
     const normalized = normalizeChannelName(name);
+    return ruleLogoForName(normalized) || localLogo(directLogoFilename(normalized));
+}
+
+function ruleLogoForName(normalized) {
     for (const [pattern, filename] of LOGO_RULES) {
         if (pattern.test(normalized)) return localLogo(filename);
     }
-    return localLogo(directLogoFilename(normalized));
+    return "";
 }
 
 const EXCLUDED_CHANNELS = [
@@ -312,13 +316,21 @@ function shouldExcludeChannel(configKey, channel) {
 
 function applyChannelBranding(configKey, channel) {
     if (!brandingEnabled(configKey)) return channel;
-    const name = normalizeChannelName(channel?.name);
+    let name = normalizeChannelName(channel?.name);
     const group = String(channel?.group || "").toLocaleUpperCase("it-IT");
-    const groupLogo = /^DAZN(?:\s|$)/.test(group) ? localLogo("dazn-it.svg") : "";
+    if (/^CINEMA 24\/7(?:\s|$)/.test(group)) {
+        name = name.replace(/\s+CHANNEL(?=\s|$)/, " 24/7").replace(/\s+24H(?=\s|$)/, " 24/7");
+    }
+    const ruleLogo = ruleLogoForName(name);
+    const groupLogo = /^DAZN(?:\s|$)/.test(group)
+        ? localLogo("dazn-it.svg")
+        : /^CINEMA 24\/7(?:\s|$)/.test(group)
+            ? localLogo("cinema-24-7-it.svg")
+            : "";
     return {
         ...channel,
         name,
-        logo: logoForName(name) || groupLogo || channel.logo
+        logo: ruleLogo || groupLogo || logoForName(name) || channel.logo
     };
 }
 

@@ -59,3 +59,11 @@ test("applica la cura soltanto al manifest autorizzato", () => {
     assert.equal(branded.name, "DMAX 4K");
     assert.match(branded.logo, /^\/channel-logos\/italy\/dmax-it\.svg$/);
 });
+
+test("uniforma i fallback Cinema 24/7 senza coprire i loghi specifici", () => {
+    const generic = applyChannelBranding("d2bc70d5ec70", { name: "Carlo Verdone Channel RAW", group: "Cinema 24/7", logo: "https://example.test/old.png" });
+    assert.equal(generic.name, "CARLO VERDONE 24/7 RAW");
+    assert.match(generic.logo, /cinema-24-7-it\.svg$/);
+    const specific = applyChannelBranding("d2bc70d5ec70", { name: "Adriano Celentano Channel RAW", group: "Cinema 24/7" });
+    assert.match(specific.logo, /adriano-celentano-24-7-it\.svg$/);
+});

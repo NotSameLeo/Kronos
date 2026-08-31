@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 360">
+  <defs><linearGradient id="c" x2="1" y2="1"><stop stop-color="#8a5cff"/><stop offset="1" stop-color="#e7409f"/></linearGradient></defs>
+  <path d="M70 115h270v185H70z" fill="none" stroke="#fff" stroke-width="22"/><path d="m70 115 49-65h270l-49 65z" fill="url(#c)"/><path d="m145 50-49 65m135-65-49 65m135-65-49 65" stroke="#fff" stroke-width="18"/>
+  <text x="605" y="170" fill="#fff" font-family="Arial,sans-serif" font-size="116" font-weight="900" text-anchor="middle">CINEMA</text><text x="605" y="280" fill="#ff71bd" font-family="Arial,sans-serif" font-size="116" font-weight="900" text-anchor="middle">24/7</text>
+</svg>
