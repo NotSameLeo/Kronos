@@ -82,7 +82,7 @@ test("buildStreams exposes transcode qualities as separate Stremio choices", () 
         streamFormat: "ts"
     }, "http://kronos.test", "abc");
 
-    assert.deepEqual(streams.map(stream => stream.name), ["Sorgente", "720p", "480p", "360p"]);
+    assert.deepEqual(streams.map(stream => stream.name), ["🖥 Sorgente", "💿 720p", "📼 480p", "💾 360p"]);
     assert.deepEqual(streams.map(stream => stream.title), ["DAZN WEB 1", "DAZN WEB 1", "DAZN WEB 1", "DAZN WEB 1"]);
     assert.equal(new URL(streams[0].url).pathname, "/abc/proxy/live.m3u8");
     assert.equal(new URL(streams[0].url).searchParams.get("v"), null);

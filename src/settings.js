@@ -46,7 +46,7 @@ const FRONTEND_PRELOAD_FILE = String(process.env.FRONTEND_PRELOAD_FILE || "").tr
 const TRANSCODE_VARIANTS = parseTranscodeVariants(process.env.TRANSCODE_VARIANTS);
 
 module.exports = {
-    RELEASE_VERSION: "5.7.7",
+    RELEASE_VERSION: "5.8.0",
     ADDON_TYPE: "tv",
     PLAYBACK_MODE: "plain-hls-relay",
     PORT: process.env.PORT || 7000,
@@ -57,6 +57,7 @@ module.exports = {
     CATALOG_PAGE_SIZE: numberEnv("CATALOG_PAGE_SIZE", 100, 24, 300),
     CATALOG_REFRESH_INTERVAL_MS: numberEnv("CATALOG_REFRESH_INTERVAL_MS", 30 * 60 * 1000, 0),
     CATALOG_PRELOAD_CONFIGS: parseList(process.env.CATALOG_PRELOAD_CONFIGS || process.env.KRONOS_PRELOAD_CONFIGS || ""),
+    CHANNEL_BRANDING_CONFIGS: new Set(parseList(process.env.KRONOS_CHANNEL_BRANDING_CONFIGS || "")),
 
     EPG_CACHE_TTL: numberEnv("EPG_CACHE_TTL", 6 * 60 * 60 * 1000, 0),
     EPG_REQUEST_TIMEOUT: numberEnv("EPG_REQUEST_TIMEOUT", 20000, 1),

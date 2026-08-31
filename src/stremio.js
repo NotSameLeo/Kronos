@@ -1,4 +1,6 @@
 const axios = require("axios");
+const fs = require("fs/promises");
+const path = require("path");
 const settings = require("./settings");
 const state = require("./state");
 const {
@@ -164,11 +166,12 @@ function directXtreamTsToHlsUrl(channel) {
 
 function toMeta(channel, host, routeKey = "", options = {}) {
     const fallbackLogo = `${host}/logo.svg`;
+    const channelLogo = publicLogoUrl(channel?.logo, host) || fallbackLogo;
     const poster = options.shortPoster
         ? `${host}/poster/${channel.id}.svg?v=${encodeURIComponent(settings.RELEASE_VERSION)}`
         : routeKey
             ? `${routeBase(host, routeKey)}/poster/${channel.id}.svg?v=${encodeURIComponent(settings.RELEASE_VERSION)}`
-            : channel.logo || fallbackLogo;
+            : channelLogo;
     const streams = options.includeVideos !== false && routeKey ? buildStreams(channel, host, routeKey) : [];
     const meta = {
         id: channel.id,
@@ -180,7 +183,7 @@ function toMeta(channel, host, routeKey = "", options = {}) {
 
     if (channel.group) meta.genres = [channel.group];
     if (!options.catalogLite) {
-        meta.logo = channel.logo || poster || fallbackLogo;
+        meta.logo = channelLogo || poster || fallbackLogo;
         meta.description = channel.description || "";
         meta.background = poster;
         meta.behaviorHints = { defaultVideoId: channel.id, hasScheduledVideos: false };
@@ -202,13 +205,21 @@ function toMeta(channel, host, routeKey = "", options = {}) {
 }
 
 async function getLogoDataUri(logoUrl) {
-    if (!isHttpUrl(logoUrl)) return "";
+    const localLogoPath = resolveLocalLogoPath(logoUrl);
+    if (!isHttpUrl(logoUrl) && !localLogoPath) return "";
     if (state.logoData.has(logoUrl)) return state.logoData.get(logoUrl);
 
     const failedAt = state.logoFailures.get(logoUrl) || 0;
     if (failedAt && Date.now() - failedAt < settings.LOGO_FAILURE_TTL_MS) return "";
 
     try {
+        if (localLogoPath) {
+            const data = await fs.readFile(localLogoPath);
+            const contentType = path.extname(localLogoPath).toLowerCase() === ".svg" ? "image/svg+xml" : "image/png";
+            const dataUri = `data:${contentType};base64,${data.toString("base64")}`;
+            state.logoData.set(logoUrl, dataUri);
+            return dataUri;
+        }
         const response = await axios.get(logoUrl, {
             responseType: "arraybuffer",
             timeout: settings.LOGO_REQUEST_TIMEOUT,
@@ -233,6 +244,36 @@ async function getLogoDataUri(logoUrl) {
     }
 }
 
+function resolveLocalLogoPath(logoUrl) {
+    const value = String(logoUrl || "");
+    if (!value.startsWith("/channel-logos/")) return "";
+    const publicRoot = path.resolve(__dirname, "..", "public");
+    const candidate = path.resolve(publicRoot, `.${value}`);
+    return candidate.startsWith(`${publicRoot}${path.sep}`) ? candidate : "";
+}
+
+function publicLogoUrl(logoUrl, host) {
+    const value = String(logoUrl || "");
+    if (value.startsWith("/channel-logos/")) return `${host}${value}`;
+    return value;
+}
+
+function posterLabels(channelName) {
+    const name = stripInitialCountryPrefix(channelName || "KRONOS").trim();
+    const qualityMatch = name.match(/\s+(4K|UHD|FHD|FULL HD|HD|HEVC|SD|RAW|1080P|720P|HDR|HLG)$/i);
+    const quality = qualityMatch ? qualityMatch[1].toUpperCase() : "";
+    const base = qualityMatch ? name.slice(0, qualityMatch.index).trim() : name;
+    const words = base.split(/\s+/).filter(Boolean);
+    if (base.length <= 24 || words.length < 2) return { lines: [base], quality };
+    let first = "";
+    let second = "";
+    for (const word of words) {
+        if (!second && `${first} ${word}`.trim().length <= 22) first = `${first} ${word}`.trim();
+        else second = `${second} ${word}`.trim();
+    }
+    return { lines: [first, second.slice(0, 28)].filter(Boolean), quality };
+}
+
 async function sendPosterSvg(res, channel) {
     const logoUri = await getLogoDataUri(channel?.logo || "");
     const name = stripInitialCountryPrefix(channel?.name || "Kronos");
@@ -245,8 +286,16 @@ async function sendPosterSvg(res, channel) {
         .join("")
         .toUpperCase() || "TV";
     const logoMarkup = logoUri
-        ? `<image href="${escapeXml(logoUri)}" x="58" y="74" width="396" height="286" preserveAspectRatio="xMidYMid meet"/>`
-        : `<text x="256" y="274" text-anchor="middle" fill="#111827" font-family="Arial, sans-serif" font-size="86" font-weight="800">${escapeXml(initials)}</text>`;
+        ? `<image href="${escapeXml(logoUri)}" x="54" y="68" width="404" height="242" preserveAspectRatio="xMidYMid meet"/>`
+        : `<text x="256" y="242" text-anchor="middle" fill="#f5f7fb" font-family="Arial, sans-serif" font-size="86" font-weight="800">${escapeXml(initials)}</text>`;
+    const labels = posterLabels(name);
+    const lineY = labels.lines.length > 1 ? [370, 410] : [392];
+    const titleMarkup = labels.lines.map((line, index) =>
+        `<text x="256" y="${lineY[index]}" text-anchor="middle" fill="#f5f7fb" font-family="Arial, sans-serif" font-size="${labels.lines.length > 1 ? 27 : 31}" font-weight="750">${escapeXml(line)}</text>`
+    ).join("");
+    const qualityMarkup = labels.quality
+        ? `<rect x="206" y="438" width="100" height="36" rx="18" fill="#38dff4" opacity="0.17"/><text x="256" y="464" text-anchor="middle" fill="#8cefff" font-family="Arial, sans-serif" font-size="21" font-weight="800">${escapeXml(labels.quality)}</text>`
+        : "";
 
     res.setHeader("Content-Type", "image/svg+xml");
     res.setHeader("Cache-Control", "public, max-age=3600");
@@ -254,15 +303,17 @@ async function sendPosterSvg(res, channel) {
         <svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
             <defs>
                 <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
-                    <stop offset="0" stop-color="#111827"/>
+                    <stop offset="0" stop-color="#182236"/>
+                    <stop offset="0.55" stop-color="#0b1120"/>
                     <stop offset="1" stop-color="#050814"/>
                 </linearGradient>
             </defs>
             <rect width="512" height="512" rx="56" fill="url(#bg)"/>
-            <rect x="28" y="28" width="456" height="456" rx="44" fill="#ffffff" opacity="0.05" stroke="#ffffff" stroke-opacity="0.16"/>
-            <rect x="46" y="58" width="420" height="318" rx="32" fill="#d9dee7"/>
+            <rect x="28" y="28" width="456" height="456" rx="44" fill="#ffffff" opacity="0.035" stroke="#ffffff" stroke-opacity="0.16"/>
+            <rect x="42" y="48" width="428" height="278" rx="34" fill="#ffffff" opacity="0.035"/>
             ${logoMarkup}
-            <text x="256" y="424" text-anchor="middle" fill="#f5f7fb" font-family="Arial, sans-serif" font-size="30" font-weight="700">${escapeXml(name.slice(0, 34))}</text>
+            ${titleMarkup}
+            ${qualityMarkup}
         </svg>
     `);
 }

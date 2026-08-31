@@ -19,6 +19,7 @@ const {
 } = require("./sources");
 const { cleanGroupName, normalizeGroupName } = require("./utils");
 const { decodeConfig, getStartupPreloadConfigs } = require("./config-store");
+const { applyChannelBranding } = require("./channel-branding");
 
 function buildChannelIndex(channels) {
     const index = new Map();
@@ -55,7 +56,7 @@ async function fetchAndProcessChannels(configKey, config, options = {}) {
                 if (selectedSet.size === 0) return true;
                 return selectedSet.has(normalizeGroupName(channel.group));
             })
-            .map(channel => ({
+            .map(channel => applyChannelBranding(configKey, {
                 ...channel,
                 name: decorateChannelName(channel, lists.length, config.gm),
                 group: config.gm === "bucket"
