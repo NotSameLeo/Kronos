@@ -286,11 +286,11 @@ async function sendPosterSvg(res, channel) {
         .join("")
         .toUpperCase() || "TV";
     const logoMarkup = logoUri
-        ? `<image href="${escapeXml(logoUri)}" x="42" y="52" width="428" height="338" preserveAspectRatio="xMidYMid meet" filter="url(#logoContrast)"/>`
+        ? `<image href="${escapeXml(logoUri)}" x="32" y="38" width="448" height="356" preserveAspectRatio="xMidYMid meet"/>`
         : `<text x="256" y="252" text-anchor="middle" fill="#f5f7fb" font-family="Arial, sans-serif" font-size="112" font-weight="800">${escapeXml(initials)}</text>`;
     const labels = posterLabels(name);
     const qualityMarkup = labels.quality
-        ? `<rect x="166" y="414" width="180" height="66" rx="33" fill="url(#quality)"/><text x="256" y="458" text-anchor="middle" fill="#03121a" font-family="Arial, sans-serif" font-size="30" font-weight="900" letter-spacing="1">${escapeXml(labels.quality)}</text>`
+        ? `<rect x="154" y="408" width="204" height="74" rx="37" fill="url(#quality)"/><text x="256" y="457" text-anchor="middle" fill="#03121a" font-family="Arial, sans-serif" font-size="32" font-weight="900" letter-spacing="1">${escapeXml(labels.quality)}</text>`
         : "";
 
     res.setHeader("Content-Type", "image/svg+xml");
@@ -307,10 +307,6 @@ async function sendPosterSvg(res, channel) {
                     <stop offset="0" stop-color="#55e6f4"/>
                     <stop offset="1" stop-color="#9cf7dd"/>
                 </linearGradient>
-                <filter id="logoContrast" x="-12%" y="-12%" width="124%" height="124%">
-                    <feDropShadow dx="0" dy="2" stdDeviation="2.5" flood-color="#ffffff" flood-opacity="0.48"/>
-                    <feDropShadow dx="0" dy="7" stdDeviation="6" flood-color="#000000" flood-opacity="0.72"/>
-                </filter>
             </defs>
             <rect width="512" height="512" rx="56" fill="url(#bg)"/>
             <rect x="28" y="28" width="456" height="456" rx="44" fill="#ffffff" opacity="0.035" stroke="#ffffff" stroke-opacity="0.16"/>

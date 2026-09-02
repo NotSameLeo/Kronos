@@ -1,5 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 360">
-  <defs><linearGradient id="i" x2="1"><stop stop-color="#7f55ff"/><stop offset=".5" stop-color="#e93cbe"/><stop offset="1" stop-color="#ff7254"/></linearGradient></defs>
-  <path d="M116 181c54-104 140-104 215 0 76 104 162 104 216 0 54-104 140-104 216 0-76 104-162 104-216 0-54-104-140-104-216 0-75 104-161 104-215 0Z" fill="none" stroke="url(#i)" stroke-width="34" stroke-linecap="round"/>
-  <text x="450" y="320" fill="#fff" font-family="Arial,sans-serif" font-size="67" font-weight="800" text-anchor="middle">MEDIASET INFINITY</text>
-</svg>
