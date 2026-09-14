@@ -17,6 +17,7 @@ const MASTER_CODECS = "avc1.4d401f,mp4a.40.2";
 const SOURCE_VARIANT_NAME = "source";
 
 let cleanupTimerStarted = false;
+const pendingSessions = new Map();
 
 function adaptiveMasterManifest(host, routeKey, upstream, options = {}) {
     const params = new URLSearchParams({
@@ -70,7 +71,10 @@ async function transcodeManifest(host, routeKey, upstream, req) {
 
     startCleanupTimer();
     const variant = selectVariant(req);
-    const session = await getOrStartSession(upstream);
+    const session = await getOrStartSession(upstream, {
+        normalizeAudio: req?.query?.av === "1",
+        sourceOnly: variant.source === true
+    });
     await waitForManifest(session, variant, settings.TRANSCODE_START_TIMEOUT_MS);
     await waitForTranscodeBuffer(session, variant, settings.TRANSCODE_START_TIMEOUT_MS);
     return rewriteTranscodePlaylist(session, variant, host, routeKey, {
@@ -159,15 +163,23 @@ async function serveTranscodeFile(sessionId, fileName, res) {
     res.sendFile(filePath);
 }
 
-async function getOrStartSession(upstream) {
-    const variants = playbackVariants();
-    const id = hashKey(`${upstream}|${variantSignature(variants)}`, 20);
+async function getOrStartSession(upstream, options = {}) {
+    const variants = options.sourceOnly ? [sourceMenuVariant()] : playbackVariants();
+    const id = hashKey(`${upstream}|${variantSignature(variants)}|av=${options.normalizeAudio ? 1 : 0}`, 20);
     const existing = state.transcodeSessions.get(id);
     if (existing?.process && !existing.exitedAt) {
         existing.lastAccess = Date.now();
         return existing;
     }
+    if (pendingSessions.has(id)) return pendingSessions.get(id);
+    const pending = startSession(upstream, variants, id, options);
+    pendingSessions.set(id, pending);
+    try { return await pending; }
+    finally { pendingSessions.delete(id); }
+}
 
+async function startSession(upstream, variants, id, options) {
+    const clock = options.normalizeAudio ? await probeAudioClock(upstream) : { repair: false };
     await ensureWorkDir();
     trimTranscodeSessions(settings.TRANSCODE_MAX_SESSIONS - 1);
     const dir = path.join(settings.TRANSCODE_WORK_DIR, id);
@@ -177,6 +189,8 @@ async function getOrStartSession(upstream) {
         id,
         upstream,
         variants,
+        repairClock: clock.repair,
+        normalizeAudio: options.normalizeAudio,
         dir,
         startedAt: Date.now(),
         lastAccess: Date.now(),
@@ -202,8 +216,26 @@ async function getOrStartSession(upstream) {
         session.exitSignal = signal;
     });
     state.transcodeSessions.set(id, session);
-    logTranscode("START", session, { pid: session.process.pid, variants: variants.map(v => v.name).join(",") });
+    logTranscode("START", session, { pid: session.process.pid, variants: variants.map(v => v.name).join(","), repairClock: clock.repair ? 1 : 0, audioSkew: clock.skew ?? "-" });
     return session;
+}
+
+function probeAudioClock(upstream) {
+    return new Promise((resolve, reject) => {
+        execFile("ffprobe", ["-v", "error", "-rw_timeout", "10000000", "-user_agent", settings.UPSTREAM_UA,
+            "-show_entries", "stream=codec_type,start_time", "-of", "json", upstream],
+        { timeout: 12000, maxBuffer: 256 * 1024 }, (error, stdout) => {
+            try {
+                if (error) throw new Error("HEVC audio clock probe unavailable");
+                const streams = JSON.parse(stdout).streams || [];
+                const audio = streams.find(s => s.codec_type === "audio");
+                const video = streams.find(s => s.codec_type === "video");
+                const skew = Number(audio?.start_time) - Number(video?.start_time);
+                if (!Number.isFinite(skew)) throw new Error("HEVC audio/video timestamps unavailable");
+                resolve({ skew, repair: Math.abs(skew) > 2 });
+            } catch (err) { reject(err); }
+        });
+    });
 }
 
 function ffmpegArgs(upstream, session) {
@@ -216,6 +248,8 @@ function ffmpegArgs(upstream, session) {
         "-loglevel", "warning",
         "-nostdin",
         "-fflags", "+genpts+discardcorrupt",
+        // Broken upstream audio clocks must not drive FFmpeg's global DTS healing.
+        ...(session.repairClock ? ["-copyts"] : []),
         "-reconnect", "1",
         "-reconnect_streamed", "1",
         "-reconnect_on_network_error", "1",
@@ -226,8 +260,8 @@ function ffmpegArgs(upstream, session) {
         "-i", upstream
     ];
 
-    if (variants.length) {
-        args.push("-filter_complex", filterComplex(variants));
+    if (!variants[0]?.source && variants.length) {
+        args.push("-filter_complex", filterComplex(variants, session.repairClock));
     }
 
     for (let index = 0; index < variants.length; index++) {
@@ -240,11 +274,15 @@ function ffmpegArgs(upstream, session) {
 
 function pushEncodedHlsOutput(args, videoMap, variant, session) {
     args.push(
-        "-map", videoMap,
+        "-map", variant.source ? "0:v:0" : videoMap,
         "-map", "0:a:0?",
         "-sn",
         "-dn",
-        "-c:v", "libx264",
+        "-c:v", variant.source ? "copy" : "libx264"
+    );
+    if (variant.source) {
+        if (session.repairClock) args.push("-bsf:v", "setts=ts=TS-STARTPTS");
+    } else args.push(
         "-fps_mode", "passthrough",
         "-preset", settings.TRANSCODE_PRESET,
         "-tune", "zerolatency",
@@ -252,10 +290,16 @@ function pushEncodedHlsOutput(args, videoMap, variant, session) {
         "-force_key_frames", `expr:gte(t,n_forced*${settings.TRANSCODE_HLS_TIME})`,
         "-b:v", `${variant.videoK}k`,
         "-maxrate", `${Math.round(variant.videoK * 1.2)}k`,
-        "-bufsize", `${Math.round(variant.videoK * 2)}k`,
+        "-bufsize", `${Math.round(variant.videoK * 2)}k`
+    );
+    args.push(
         "-c:a", "aac",
-        "-b:a", `${variant.audioK}k`,
+        "-b:a", `${variant.audioK || 192}k`,
         "-ac", "2",
+        "-ar", "48000",
+        "-af", session.repairClock
+            ? "asetpts=PTS-STARTPTS,aresample=async=1000:first_pts=0"
+            : "aresample=async=1000",
         "-f", "hls",
         "-hls_time", String(settings.TRANSCODE_HLS_TIME),
         "-hls_list_size", String(settings.TRANSCODE_HLS_LIST_SIZE),
@@ -288,13 +332,14 @@ function masterStreamInfo(variant) {
     return `#EXT-X-STREAM-INF:BANDWIDTH=${peak},AVERAGE-BANDWIDTH=${average},RESOLUTION=${variant.width}x${variant.height},CODECS="${MASTER_CODECS}",NAME="${variant.label}"`;
 }
 
-function filterComplex(variants) {
-    if (variants.length === 1) return `[0:v:0]scale=-2:${variants[0].height}[v0out]`;
+function filterComplex(variants, repairClock = false) {
+    const clock = repairClock ? "setpts=PTS-STARTPTS," : "";
+    if (variants.length === 1) return `[0:v:0]${clock}scale=-2:${variants[0].height}[v0out]`;
     const splitOutputs = variants.map((_variant, index) => `[v${index}]`).join("");
     const scales = variants
         .map((variant, index) => `[v${index}]scale=-2:${variant.height}[v${index}out]`)
         .join(";");
-    return `[0:v:0]split=${variants.length}${splitOutputs};${scales}`;
+    return `[0:v:0]${clock}split=${variants.length}${splitOutputs};${scales}`;
 }
 
 async function waitForManifest(session, variant, timeoutMs) {
@@ -462,14 +507,35 @@ async function waitForTranscodeBuffer(session, variant, timeoutMs) {
 }
 
 async function buildDelayedTranscodePlaylist(session, variant) {
-    const files = await delayedVariantSegmentFiles(session, variant);
-    if (!files.length) {
+    const text = await fsp.readFile(variantManifestPath(session, variant), "utf8");
+    return delayedPlaylist(text);
+}
+
+function delayedPlaylist(text) {
+    // The muxer's EXTINF values are authoritative. A copied HEVC GOP may last
+    // 10 seconds even when hls_time is 4; inventing durations breaks seeking/live sync.
+    const entries = [];
+    let duration = 0;
+    let tags = [];
+    for (const line of text.split(/\r?\n/)) {
+        if (line.startsWith("#EXTINF:")) duration = Number(line.slice(8).split(",")[0]);
+        if (/^#EXT(?:INF:|-X-(?:PROGRAM-DATE-TIME:|DISCONTINUITY$))/.test(line)) tags.push(line);
+        if (line && !line.startsWith("#") && isSafeHlsFile(line)) {
+            entries.push({ file: line, duration, tags });
+            tags = [];
+        }
+    }
+    let keep = entries.length;
+    let delayedSeconds = 0;
+    while (keep > 0 && delayedSeconds < settings.TRANSCODE_PLAYBACK_DELAY_SECONDS) delayedSeconds += entries[--keep].duration;
+    const ready = entries.slice(0, keep).slice(-settings.TRANSCODE_PLAYLIST_WINDOW_SEGMENTS);
+    if (!ready.length) {
         const err = new Error(`No delayed transcode segments for ${variant.name}`);
         err.statusCode = 503;
         throw err;
     }
-    const firstSeq = segmentFileSequence(files[0]) || 0;
-    const target = Math.max(1, Math.ceil(settings.TRANSCODE_HLS_TIME));
+    const firstSeq = segmentFileSequence(ready[0].file) || 0;
+    const target = Math.max(1, ...entries.map(e => Math.ceil(e.duration)));
     const lines = [
         "#EXTM3U",
         "#EXT-X-VERSION:3",
@@ -477,22 +543,17 @@ async function buildDelayedTranscodePlaylist(session, variant) {
         `#EXT-X-TARGETDURATION:${target}`,
         `#EXT-X-MEDIA-SEQUENCE:${firstSeq}`
     ];
-    for (const file of files) {
-        lines.push(`#EXTINF:${settings.TRANSCODE_HLS_TIME.toFixed(3)},`, file);
+    for (const entry of ready) {
+        lines.push(...entry.tags, entry.file);
     }
     return `${lines.join("\n")}\n`;
 }
 
 async function delayedVariantSegmentFiles(session, variant) {
-    const files = await variantSegmentFiles(session, variant);
-    const delaySegments = transcodeDelaySegments();
-    const ready = delaySegments > 0 ? files.slice(0, -delaySegments) : files;
-    const window = Math.max(3, settings.TRANSCODE_PLAYLIST_WINDOW_SEGMENTS);
-    return ready.slice(-window);
-}
-
-function transcodeDelaySegments() {
-    return Math.max(0, Math.ceil(settings.TRANSCODE_PLAYBACK_DELAY_SECONDS / Math.max(1, settings.TRANSCODE_HLS_TIME)));
+    try {
+        const text = await buildDelayedTranscodePlaylist(session, variant);
+        return text.split(/\r?\n/).filter(line => line && !line.startsWith("#"));
+    } catch { return []; }
 }
 
 function segmentFileSequence(fileName) {
@@ -538,6 +599,7 @@ function stopSession(session, reason) {
 
 function selectVariant(req) {
     const requested = String(req?.query?.v || req?.query?.h || "").toLowerCase();
+    if (requested === "source" && req?.query?.av === "1") return sourceMenuVariant();
     return playbackVariants().find(variant =>
         variant.name === requested || String(variant.height || "") === requested || `${variant.height}p` === requested
     ) || playbackVariants()[0];
@@ -663,5 +725,8 @@ module.exports = {
     streamMenuVariants,
     prewarmTranscode,
     serveTranscodeFile,
-    transcodeManifest
+    transcodeManifest,
+    ffmpegArgs,
+    delayedPlaylist,
+    probeAudioClock
 };

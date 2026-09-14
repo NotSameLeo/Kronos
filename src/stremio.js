@@ -98,12 +98,20 @@ function buildStreams(channel, host, routeKey) {
         name: "🖥 Sorgente"
     };
     if (!settings.TRANSCODE_AUTO_ENABLED || !hlsUrl) return [source];
+    const normalizeAudio = /\b(?:HEVC|H[ .]?265)\b/i.test(`${channel.name || ""} ${channel.group || ""}`);
+    if (normalizeAudio) {
+        const params = stableHlsParams(channel, hlsUrl, { delaySeconds: settings.TRANSCODE_PLAYBACK_DELAY_SECONDS });
+        params.set("av", "1");
+        params.set("v", "source");
+        source.url = `${base}/proxy/transcode.m3u8?${params}`;
+    }
 
     const scaled = streamMenuVariants()
         .filter(variant => !variant.source)
         .map(variant => {
             const params = stableHlsParams(channel, hlsUrl, { delaySeconds: settings.TRANSCODE_PLAYBACK_DELAY_SECONDS });
             params.set("v", variant.name);
+            if (normalizeAudio) params.set("av", "1");
             const label = streamVariantLabel(variant);
             return {
                 title: channel.name,

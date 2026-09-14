@@ -3,6 +3,17 @@ const assert = require("node:assert/strict");
 const { buildStream, buildStreams, shouldBlockOfflinePlaceholders } = require("../src/stremio");
 const { toMeta, sendPosterPng } = require("../src/stremio");
 
+test("HEVC source and scaled streams use the audio compatibility path", () => {
+    const streams = buildStreams({id:"hevc",name:"SKY CINEMA ACTION HEVC",url:"https://upstream.test/live.m3u8"}, "https://kronos.test", "abc");
+    assert.equal(streams.length, 4);
+    assert.deepEqual(streams.map(s => new URL(s.url).searchParams.get("v")), ["source", "720p", "480p", "360p"]);
+    for (const stream of streams) {
+        const url = new URL(stream.url);
+        assert.equal(url.pathname, "/abc/proxy/transcode.m3u8");
+        assert.equal(url.searchParams.get("av"), "1");
+    }
+});
+
 test("live TV metadata uses direct selection and native PNG artwork, never fake episodes", () => {
     const channel = { id: "tv_test", name: "TEST HD", logo: "/channel-logos/test.svg" };
     for (const options of [{}, { catalogLite: true, shortPoster: true, includeVideos: false }]) {
