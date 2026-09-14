@@ -20,6 +20,18 @@ test("healthy source clock retains its original relative AV timing", () => {
     assert.doesNotMatch(args[args.indexOf("-af")+1], /asetpts/);
 });
 
+test("HEVC source and scaled outputs share a single FFmpeg input", () => {
+    const variants=[{name:"source",source:true},...[360,480,720].map(height=>({name:`${height}p`,height,videoK:900,audioK:96}))];
+    const args=ffmpegArgs("https://upstream.test/live.m3u8",{dir:"/tmp/test",repairClock:true,variants});
+    assert.equal(args.filter(x=>x==="-i").length,1);
+    assert.match(args[args.indexOf("-filter_complex")+1], /split=3/);
+    assert.ok(args.includes("[v0out]"));
+    assert.ok(args.includes("[v2out]"));
+    assert.equal(args.includes("[v3out]"),false);
+    assert.equal(args.filter(x=>x==="libx264").length,3);
+    assert.equal(args.filter(x=>x==="copy").length,1);
+});
+
 test("scaled broken-clock variants rebase video and audio together", () => {
     const variants=[360,480,720].map(height=>({name:`${height}p`,height,videoK:900,audioK:96}));
     const args=ffmpegArgs("https://upstream.test/live.m3u8",{dir:"/tmp/test",repairClock:true,variants});

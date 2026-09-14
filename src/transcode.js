@@ -72,8 +72,7 @@ async function transcodeManifest(host, routeKey, upstream, req) {
     startCleanupTimer();
     const variant = selectVariant(req);
     const session = await getOrStartSession(upstream, {
-        normalizeAudio: req?.query?.av === "1",
-        sourceOnly: variant.source === true
+        normalizeAudio: req?.query?.av === "1"
     });
     await waitForManifest(session, variant, settings.TRANSCODE_START_TIMEOUT_MS);
     await waitForTranscodeBuffer(session, variant, settings.TRANSCODE_START_TIMEOUT_MS);
@@ -164,7 +163,9 @@ async function serveTranscodeFile(sessionId, fileName, res) {
 }
 
 async function getOrStartSession(upstream, options = {}) {
-    const variants = options.sourceOnly ? [sourceMenuVariant()] : playbackVariants();
+    // All HEVC choices share one upstream connection and one session, including
+    // source. Otherwise a one-session deployment evicts source when opening 720p.
+    const variants = options.normalizeAudio ? [sourceMenuVariant(), ...playbackVariants()] : playbackVariants();
     const id = hashKey(`${upstream}|${variantSignature(variants)}|av=${options.normalizeAudio ? 1 : 0}`, 20);
     const existing = state.transcodeSessions.get(id);
     if (existing?.process && !existing.exitedAt) {
@@ -260,13 +261,15 @@ function ffmpegArgs(upstream, session) {
         "-i", upstream
     ];
 
-    if (!variants[0]?.source && variants.length) {
-        args.push("-filter_complex", filterComplex(variants, session.repairClock));
+    const encoded = variants.filter(variant => !variant.source);
+    if (encoded.length) {
+        args.push("-filter_complex", filterComplex(encoded, session.repairClock));
     }
 
+    let encodedIndex = 0;
     for (let index = 0; index < variants.length; index++) {
         const variant = variants[index];
-        pushEncodedHlsOutput(args, `[v${index}out]`, variant, session);
+        pushEncodedHlsOutput(args, variant.source ? "0:v:0" : `[v${encodedIndex++}out]`, variant, session);
     }
 
     return args;
