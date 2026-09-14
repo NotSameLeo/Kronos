@@ -165,14 +165,11 @@ function directXtreamTsToHlsUrl(channel) {
 }
 
 function toMeta(channel, host, routeKey = "", options = {}) {
-    const fallbackLogo = `${host}/logo.svg`;
-    const channelLogo = publicLogoUrl(channel?.logo, host) || fallbackLogo;
     const poster = options.shortPoster
-        ? `${host}/poster/${channel.id}.svg?v=${encodeURIComponent(settings.RELEASE_VERSION)}`
+        ? `${host}/poster/${channel.id}.png?v=${encodeURIComponent(settings.RELEASE_VERSION)}`
         : routeKey
-            ? `${routeBase(host, routeKey)}/poster/${channel.id}.svg?v=${encodeURIComponent(settings.RELEASE_VERSION)}`
-            : channelLogo;
-    const streams = options.includeVideos !== false && routeKey ? buildStreams(channel, host, routeKey) : [];
+            ? `${routeBase(host, routeKey)}/poster/${channel.id}.png?v=${encodeURIComponent(settings.RELEASE_VERSION)}`
+            : `${host}/poster/${channel.id}.png?v=${encodeURIComponent(settings.RELEASE_VERSION)}`;
     const meta = {
         id: channel.id,
         type: settings.ADDON_TYPE,
@@ -183,23 +180,14 @@ function toMeta(channel, host, routeKey = "", options = {}) {
 
     if (channel.group) meta.genres = [channel.group];
     if (!options.catalogLite) {
-        meta.logo = channelLogo || poster || fallbackLogo;
+        meta.logo = poster;
         meta.description = channel.description || "";
         meta.background = poster;
         meta.behaviorHints = { defaultVideoId: channel.id, hasScheduledVideos: false };
     }
 
-    if (options.includeVideos !== false) {
-        meta.videos = [{
-            id: channel.id,
-            title: channel.name,
-            released: new Date(0).toISOString(),
-            thumbnail: poster,
-            overview: channel.description || "",
-            available: true,
-            streams: streams.length ? streams : undefined
-        }];
-    }
+    // A live TV channel is one video with the meta ID, not a series episode.
+    // Native clients can otherwise create a synthetic season 0 and lose selection.
 
     return meta;
 }
@@ -274,7 +262,7 @@ function posterLabels(channelName) {
     return { lines: [first, second.slice(0, 28)].filter(Boolean), quality };
 }
 
-async function sendPosterSvg(res, channel) {
+async function buildPosterSvg(channel) {
     const logoUri = await getLogoDataUri(channel?.logo || "");
     const name = stripInitialCountryPrefix(channel?.name || "Kronos");
     const initials = name
@@ -293,9 +281,7 @@ async function sendPosterSvg(res, channel) {
         ? `<rect x="154" y="408" width="204" height="74" rx="37" fill="url(#quality)"/><text x="256" y="457" text-anchor="middle" fill="#03121a" font-family="Arial, sans-serif" font-size="32" font-weight="900" letter-spacing="1">${escapeXml(labels.quality)}</text>`
         : "";
 
-    res.setHeader("Content-Type", "image/svg+xml");
-    res.setHeader("Cache-Control", "public, max-age=3600");
-    res.send(`
+    return `
         <svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
             <defs>
                 <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
@@ -314,7 +300,38 @@ async function sendPosterSvg(res, channel) {
             ${logoMarkup}
             ${qualityMarkup}
         </svg>
-    `);
+    `;
+}
+
+async function sendPosterSvg(res, channel) {
+    res.setHeader("Content-Type", "image/svg+xml");
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    res.send(await buildPosterSvg(channel));
+}
+
+// Keep the same artwork, but deliver raster images supported by native TV clients.
+const posterPngCache = new Map();
+async function sendPosterPng(res, channel) {
+    if (!channel) throw new Error("Unknown channel");
+    const key = JSON.stringify([channel.id, channel.name, channel.logo]);
+    let entry = posterPngCache.get(key);
+    if (!entry || entry.expires < Date.now()) {
+        if (posterPngCache.size >= 256) posterPngCache.delete(posterPngCache.keys().next().value);
+        entry = {
+            expires: Date.now() + 300000,
+            data: buildPosterSvg(channel).then(svg => require("sharp")(Buffer.from(svg)).png().toBuffer())
+        };
+        posterPngCache.set(key, entry);
+    }
+    try {
+        const png = await entry.data;
+        res.setHeader("Content-Type", "image/png");
+        res.setHeader("Cache-Control", "public, max-age=300");
+        res.send(png);
+    } catch (error) {
+        if (posterPngCache.get(key) === entry) posterPngCache.delete(key);
+        throw error;
+    }
 }
 
 function logoSvg() {
@@ -341,6 +358,7 @@ module.exports = {
     buildStreams,
     logoSvg,
     sendPosterSvg,
+    sendPosterPng,
     shouldBlockOfflinePlaceholders,
     toMeta
 };

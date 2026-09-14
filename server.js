@@ -55,6 +55,7 @@ const {
     buildStreams,
     logoSvg,
     sendPosterSvg,
+    sendPosterPng,
     toMeta
 } = require("./src/stremio");
 const {
@@ -367,24 +368,24 @@ async function metaResponse(req, res) {
 }
 
 function registerPosterRoutes() {
-    app.get("/poster/:id.svg", async (req, res) => {
+    app.get("/poster/:id.:format(svg|png)", async (req, res) => {
         try {
-            await sendPosterSvg(res, findCachedChannelById(req.params.id));
+            await (req.params.format === "png" ? sendPosterPng : sendPosterSvg)(res, findCachedChannelById(req.params.id));
         } catch {
             res.status(404).send("");
         }
     });
-    app.get("/poster-config/:id.svg", attachDefaultConfig, configPosterResponse);
-    app.get("/:shortConfig([a-f0-9]{8,20})/poster/:id.svg", attachShortConfig, configPosterResponse);
-    app.get("/c/:shortConfig/poster/:id.svg", attachShortConfig, configPosterResponse);
-    app.get("/:base64Config/poster/:id.svg", configPosterResponse);
+    app.get("/poster-config/:id.:format(svg|png)", attachDefaultConfig, configPosterResponse);
+    app.get("/:shortConfig([a-f0-9]{8,20})/poster/:id.:format(svg|png)", attachShortConfig, configPosterResponse);
+    app.get("/c/:shortConfig/poster/:id.:format(svg|png)", attachShortConfig, configPosterResponse);
+    app.get("/:base64Config/poster/:id.:format(svg|png)", configPosterResponse);
 }
 
 async function configPosterResponse(req, res) {
     try {
         const { configKey, config } = getRequestConfig(req);
         const channel = await getChannelById(configKey, config, req.params.id);
-        await sendPosterSvg(res, channel);
+        await (req.params.format === "png" ? sendPosterPng : sendPosterSvg)(res, channel);
     } catch {
         res.status(404).send("");
     }

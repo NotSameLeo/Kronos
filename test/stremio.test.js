@@ -1,6 +1,40 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { buildStream, buildStreams, shouldBlockOfflinePlaceholders } = require("../src/stremio");
+const { toMeta, sendPosterPng } = require("../src/stremio");
+
+test("live TV metadata uses direct selection and native PNG artwork, never fake episodes", () => {
+    const channel = { id: "tv_test", name: "TEST HD", logo: "/channel-logos/test.svg" };
+    for (const options of [{}, { catalogLite: true, shortPoster: true, includeVideos: false }]) {
+        const meta = toMeta(channel, "https://kronos.test", "abcdef123456", options);
+        assert.equal(meta.type, "tv");
+        assert.equal(meta.id, channel.id);
+        assert.equal(Object.hasOwn(meta, "videos"), false);
+        assert.match(meta.poster, /\/poster\/tv_test\.png\?v=/);
+        if (!options.catalogLite) {
+            assert.equal(meta.behaviorHints.defaultVideoId, channel.id);
+            assert.equal(meta.logo, meta.poster);
+            assert.equal(meta.background, meta.poster);
+        }
+    }
+});
+
+test("native posters are real 512px PNGs and concurrent requests share rendering", async () => {
+    const channel = { id: "png_test", name: "TEST HD", logo: "" };
+    const render = async () => {
+        let body;
+        const headers = {};
+        await sendPosterPng({ setHeader: (k, v) => headers[k] = v, send: b => body = b }, channel);
+        assert.equal(headers["Content-Type"], "image/png");
+        assert.equal(body.subarray(1, 4).toString(), "PNG");
+        const info = await require("sharp")(body).metadata();
+        assert.equal(info.width, 512);
+        assert.equal(info.height, 512);
+        return body;
+    };
+    const [a, b] = await Promise.all([render(), render()]);
+    assert.equal(a, b);
+});
 
 test("buildStream disables offline placeholder blocking for vetrina channels", () => {
     const vetrina = {
