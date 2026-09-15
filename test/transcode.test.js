@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { adaptiveMasterManifest } = require("../src/transcode");
-const { ffmpegArgs, delayedPlaylist } = require("../src/transcode");
+const { ffmpegArgs, delayedPlaylist, stopSession } = require("../src/transcode");
 
 test("broken source clock is repaired without reencoding HEVC video", () => {
     const args = ffmpegArgs("https://upstream.test/live.m3u8", {dir:"/tmp/test",repairClock:true,variants:[{name:"source",source:true}]});
@@ -30,6 +30,16 @@ test("HEVC source and scaled outputs share a single FFmpeg input", () => {
     assert.equal(args.includes("[v3out]"),false);
     assert.equal(args.filter(x=>x==="libx264").length,3);
     assert.equal(args.filter(x=>x==="copy").length,1);
+    assert.equal(args[args.indexOf("-hls_start_number_source")+1], "epoch_us");
+});
+
+test("a stale request cannot stop a replacement session", () => {
+    const state=require("../src/state");
+    const active={id:"stale-test"};
+    state.transcodeSessions.set(active.id,active);
+    stopSession({id:active.id},"test-stale");
+    assert.equal(state.transcodeSessions.get(active.id),active);
+    state.transcodeSessions.delete(active.id);
 });
 
 test("scaled broken-clock variants rebase video and audio together", () => {
@@ -41,7 +51,8 @@ test("scaled broken-clock variants rebase video and audio together", () => {
 
 test("delayed HLS keeps actual GOP durations instead of fabricating four-second segments", () => {
     const text="#EXTM3U\n#EXT-X-TARGETDURATION:11\n#EXT-X-MEDIA-SEQUENCE:4\n" + [10,10.08,9.92,10,10].map((d,i)=>`#EXTINF:${d},\nsource_seg_${String(i+4).padStart(6,"0")}.ts\n`).join("");
-    const result=delayedPlaylist(text);
+    const result=delayedPlaylist(text, 1234567890);
+    assert.match(result, /#EXT-X-DISCONTINUITY-SEQUENCE:1234567890/);
     assert.match(result, /#EXT-X-TARGETDURATION:11/);
     assert.match(result, /#EXT-X-MEDIA-SEQUENCE:4/);
     assert.match(result, /#EXTINF:10.08,/);

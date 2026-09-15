@@ -2,6 +2,7 @@ const fs = require("fs");
 const fsp = require("fs/promises");
 const path = require("path");
 const { execFile, spawn } = require("child_process");
+const { randomUUID } = require("crypto");
 const settings = require("./settings");
 const state = require("./state");
 const {
@@ -167,7 +168,7 @@ async function getOrStartSession(upstream, options = {}) {
     // source. Otherwise a one-session deployment evicts source when opening 720p.
     const variants = options.normalizeAudio ? [sourceMenuVariant(), ...playbackVariants()] : playbackVariants();
     const id = hashKey(`${upstream}|${variantSignature(variants)}|av=${options.normalizeAudio ? 1 : 0}`, 20);
-    const existing = state.transcodeSessions.get(id);
+    const existing = [...state.transcodeSessions.values()].find(session => session.key === id);
     if (existing?.process && !existing.exitedAt) {
         existing.lastAccess = Date.now();
         return existing;
@@ -179,7 +180,9 @@ async function getOrStartSession(upstream, options = {}) {
     finally { pendingSessions.delete(id); }
 }
 
-async function startSession(upstream, variants, id, options) {
+async function startSession(upstream, variants, key, options) {
+    // New files/URLs on restart: never reuse a previous player's segment numbers.
+    const id = hashKey(`${key}|${randomUUID()}`, 20);
     const clock = options.normalizeAudio ? await probeAudioClock(upstream) : { repair: false };
     await ensureWorkDir();
     trimTranscodeSessions(settings.TRANSCODE_MAX_SESSIONS - 1);
@@ -188,6 +191,7 @@ async function startSession(upstream, variants, id, options) {
     await fsp.mkdir(dir, { recursive: true });
     const session = {
         id,
+        key,
         upstream,
         variants,
         repairClock: clock.repair,
@@ -307,6 +311,7 @@ function pushEncodedHlsOutput(args, videoMap, variant, session) {
         "-hls_time", String(settings.TRANSCODE_HLS_TIME),
         "-hls_list_size", String(settings.TRANSCODE_HLS_LIST_SIZE),
         "-hls_delete_threshold", String(settings.TRANSCODE_HLS_DELETE_THRESHOLD),
+        "-hls_start_number_source", "epoch_us",
         "-hls_flags", "delete_segments+omit_endlist+program_date_time+independent_segments+temp_file",
         "-hls_segment_filename", path.join(session.dir, `${variant.name}_seg_%06d.ts`),
         variantManifestPath(session, variant)
@@ -511,10 +516,10 @@ async function waitForTranscodeBuffer(session, variant, timeoutMs) {
 
 async function buildDelayedTranscodePlaylist(session, variant) {
     const text = await fsp.readFile(variantManifestPath(session, variant), "utf8");
-    return delayedPlaylist(text);
+    return delayedPlaylist(text, Math.floor(session.startedAt / 1000));
 }
 
-function delayedPlaylist(text) {
+function delayedPlaylist(text, generation = 0) {
     // The muxer's EXTINF values are authoritative. A copied HEVC GOP may last
     // 10 seconds even when hls_time is 4; inventing durations breaks seeking/live sync.
     const entries = [];
@@ -543,6 +548,7 @@ function delayedPlaylist(text) {
         "#EXTM3U",
         "#EXT-X-VERSION:3",
         "#EXT-X-INDEPENDENT-SEGMENTS",
+        `#EXT-X-DISCONTINUITY-SEQUENCE:${generation}`,
         `#EXT-X-TARGETDURATION:${target}`,
         `#EXT-X-MEDIA-SEQUENCE:${firstSeq}`
     ];
@@ -588,7 +594,7 @@ function trimTranscodeSessions(maxSessions) {
 }
 
 function stopSession(session, reason) {
-    if (!session || !state.transcodeSessions.has(session.id)) return;
+    if (!session || state.transcodeSessions.get(session.id) !== session) return;
     state.transcodeSessions.delete(session.id);
     try { session.process?.kill?.("SIGTERM"); } catch {}
     setTimeout(() => {
@@ -731,5 +737,6 @@ module.exports = {
     transcodeManifest,
     ffmpegArgs,
     delayedPlaylist,
-    probeAudioClock
+    probeAudioClock,
+    stopSession
 };
