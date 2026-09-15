@@ -73,8 +73,10 @@ async function transcodeManifest(host, routeKey, upstream, req) {
     startCleanupTimer();
     const variant = selectVariant(req);
     const session = await getOrStartSession(upstream, {
-        normalizeAudio: req?.query?.av === "1"
+        normalizeAudio: req?.query?.av === "1",
+        audioDelay: Math.max(0, Math.min(30, Number(req?.query?.ad) || 0))
     });
+    if (session.normalizeAudio && !variant.source) await ensureScaledSession(session);
     await waitForManifest(session, variant, settings.TRANSCODE_START_TIMEOUT_MS);
     await waitForTranscodeBuffer(session, variant, settings.TRANSCODE_START_TIMEOUT_MS);
     return rewriteTranscodePlaylist(session, variant, host, routeKey, {
@@ -167,7 +169,7 @@ async function getOrStartSession(upstream, options = {}) {
     // All HEVC choices share one upstream connection and one session, including
     // source. Otherwise a one-session deployment evicts source when opening 720p.
     const variants = options.normalizeAudio ? [sourceMenuVariant(), ...playbackVariants()] : playbackVariants();
-    const id = hashKey(`${upstream}|${variantSignature(variants)}|av=${options.normalizeAudio ? 1 : 0}`, 20);
+    const id = hashKey(`${upstream}|${variantSignature(variants)}|av=${options.normalizeAudio ? 1 : 0}|ad=${options.audioDelay || 0}`, 20);
     const existing = [...state.transcodeSessions.values()].find(session => session.key === id);
     if (existing?.process && !existing.exitedAt) {
         existing.lastAccess = Date.now();
@@ -195,6 +197,7 @@ async function startSession(upstream, variants, key, options) {
         upstream,
         variants,
         repairClock: clock.repair,
+        audioDelay: clock.repair ? options.audioDelay || 0 : 0,
         normalizeAudio: options.normalizeAudio,
         dir,
         startedAt: Date.now(),
@@ -203,7 +206,8 @@ async function startSession(upstream, variants, key, options) {
         ffmpegLogLine: "",
         stderr: ""
     };
-    session.process = spawn(settings.TRANSCODE_FFMPEG_PATH, ffmpegArgs(upstream, session), {
+    const sourceJob = session.normalizeAudio ? { ...session, variants: [sourceMenuVariant()] } : session;
+    session.process = spawn(settings.TRANSCODE_FFMPEG_PATH, ffmpegArgs(upstream, sourceJob), {
         stdio: ["ignore", "ignore", "pipe"]
     });
     session.process.stderr.on("data", chunk => {
@@ -223,6 +227,32 @@ async function startSession(upstream, variants, key, options) {
     state.transcodeSessions.set(id, session);
     logTranscode("START", session, { pid: session.process.pid, variants: variants.map(v => v.name).join(","), repairClock: clock.repair ? 1 : 0, audioSkew: clock.skew ?? "-" });
     return session;
+}
+
+async function ensureScaledSession(session) {
+    if (session.scaledProcess && !session.scaledExited) return;
+    if (session.scaledStarting) return session.scaledStarting;
+    session.scaledStarting = (async () => {
+        const source = sourceMenuVariant();
+        await waitForManifest(session, source, settings.TRANSCODE_START_TIMEOUT_MS);
+        await waitForTranscodeBuffer(session, source, settings.TRANSCODE_START_TIMEOUT_MS);
+        if (session.exitedAt || state.transcodeSessions.get(session.id) !== session)
+            throw new Error("Source session ended before starting lower qualities");
+        // Consume the already corrected local source, never a second provider connection.
+        const args = ffmpegArgs(variantManifestPath(session, source), {
+            dir: session.dir, variants: playbackVariants(), repairClock: false, liveStartIndex: -3
+        });
+        session.scaledExited = false;
+        session.scaledProcess = spawn(settings.TRANSCODE_FFMPEG_PATH, args, { stdio: ["ignore", "ignore", "pipe"] });
+        session.scaledProcess.stderr.on("data", chunk => {
+            session.stderr = `${session.stderr}${chunk}`.slice(-4000);
+            logFfmpegLines(session, chunk.toString());
+        });
+        session.scaledProcess.once("error", () => { session.scaledExited = true; });
+        session.scaledProcess.once("exit", () => { session.scaledExited = true; });
+    })();
+    try { await session.scaledStarting; }
+    finally { session.scaledStarting = null; }
 }
 
 function probeAudioClock(upstream) {
@@ -246,7 +276,7 @@ function probeAudioClock(upstream) {
 function ffmpegArgs(upstream, session) {
     const variants = session.variants;
     const hlsInputArgs = isHlsUrl(upstream)
-        ? ["-live_start_index", String(settings.TRANSCODE_HLS_INPUT_LIVE_START_INDEX)]
+        ? ["-live_start_index", String(session.liveStartIndex ?? settings.TRANSCODE_HLS_INPUT_LIVE_START_INDEX)]
         : [];
     const args = [
         "-hide_banner",
@@ -255,12 +285,12 @@ function ffmpegArgs(upstream, session) {
         "-fflags", "+genpts+discardcorrupt",
         // Broken upstream audio clocks must not drive FFmpeg's global DTS healing.
         ...(session.repairClock ? ["-copyts"] : []),
-        "-reconnect", "1",
+        ...(isHttpUrl(upstream) ? ["-reconnect", "1",
         "-reconnect_streamed", "1",
         "-reconnect_on_network_error", "1",
         "-reconnect_delay_max", "4",
         "-user_agent", settings.UPSTREAM_UA,
-        "-headers", "Cache-Control: no-cache\r\nPragma: no-cache\r\n",
+        "-headers", "Cache-Control: no-cache\r\nPragma: no-cache\r\n"] : []),
         ...hlsInputArgs,
         "-i", upstream
     ];
@@ -305,7 +335,7 @@ function pushEncodedHlsOutput(args, videoMap, variant, session) {
         "-ac", "2",
         "-ar", "48000",
         "-af", session.repairClock
-            ? "asetpts=PTS-STARTPTS,aresample=async=1000:first_pts=0"
+            ? `asetpts=PTS-STARTPTS${session.audioDelay ? `+${session.audioDelay}/TB` : ""},aresample=async=1000:first_pts=0`
             : "aresample=async=1000",
         "-f", "hls",
         "-hls_time", String(settings.TRANSCODE_HLS_TIME),
@@ -516,10 +546,25 @@ async function waitForTranscodeBuffer(session, variant, timeoutMs) {
 
 async function buildDelayedTranscodePlaylist(session, variant) {
     const text = await fsp.readFile(variantManifestPath(session, variant), "utf8");
-    return delayedPlaylist(text, Math.floor(session.startedAt / 1000));
+    if (variant.source && session.audioDelay > 0 && session.audioReadySequence === undefined) {
+        session.audioReadySequence = audibleStartSequence(text, session.audioDelay);
+        if (session.audioReadySequence === undefined) throw new Error("Waiting for audible source segments");
+    }
+    return delayedPlaylist(text, Math.floor(session.startedAt / 1000), variant.source ? session.audioReadySequence || 0 : 0);
 }
 
-function delayedPlaylist(text, generation = 0) {
+function audibleStartSequence(text, delay) {
+    let elapsed = 0, duration = 0;
+    for (const line of text.split(/\r?\n/)) {
+        if (line.startsWith("#EXTINF:")) duration = Number(line.slice(8).split(",")[0]);
+        if (line && !line.startsWith("#") && isSafeHlsFile(line)) {
+            if (elapsed >= delay) return segmentFileSequence(line);
+            elapsed += duration;
+        }
+    }
+}
+
+function delayedPlaylist(text, generation = 0, minSequence = 0) {
     // The muxer's EXTINF values are authoritative. A copied HEVC GOP may last
     // 10 seconds even when hls_time is 4; inventing durations breaks seeking/live sync.
     const entries = [];
@@ -536,9 +581,9 @@ function delayedPlaylist(text, generation = 0) {
     let keep = entries.length;
     let delayedSeconds = 0;
     while (keep > 0 && delayedSeconds < settings.TRANSCODE_PLAYBACK_DELAY_SECONDS) delayedSeconds += entries[--keep].duration;
-    const ready = entries.slice(0, keep).slice(-settings.TRANSCODE_PLAYLIST_WINDOW_SEGMENTS);
+    const ready = entries.slice(0, keep).filter(entry => segmentFileSequence(entry.file) >= minSequence).slice(-settings.TRANSCODE_PLAYLIST_WINDOW_SEGMENTS);
     if (!ready.length) {
-        const err = new Error(`No delayed transcode segments for ${variant.name}`);
+        const err = new Error("No delayed transcode segments ready");
         err.statusCode = 503;
         throw err;
     }
@@ -597,9 +642,12 @@ function stopSession(session, reason) {
     if (!session || state.transcodeSessions.get(session.id) !== session) return;
     state.transcodeSessions.delete(session.id);
     try { session.process?.kill?.("SIGTERM"); } catch {}
+    try { session.scaledProcess?.kill?.("SIGTERM"); } catch {}
     setTimeout(() => {
         try {
-            if (session.process && !session.process.killed) session.process.kill("SIGKILL");
+            for (const process of [session.process, session.scaledProcess]) {
+                if (process && process.exitCode === null && process.signalCode === null) process.kill("SIGKILL");
+            }
         } catch {}
     }, 3000).unref?.();
     fsp.rm(session.dir, { recursive: true, force: true }).catch(() => {});
@@ -738,5 +786,6 @@ module.exports = {
     ffmpegArgs,
     delayedPlaylist,
     probeAudioClock,
-    stopSession
+    stopSession,
+    audibleStartSequence
 };

@@ -2,6 +2,7 @@ const axios = require("axios");
 const fs = require("fs/promises");
 const path = require("path");
 const settings = require("./settings");
+const audioCalibration = require("./hevc-audio-calibration.json");
 const state = require("./state");
 const {
     encodeBase64Url,
@@ -102,6 +103,7 @@ function buildStreams(channel, host, routeKey) {
     if (normalizeAudio) {
         const params = stableHlsParams(channel, hlsUrl, { delaySeconds: settings.TRANSCODE_PLAYBACK_DELAY_SECONDS });
         params.set("av", "1");
+        if (audioCalibration[channel.id]) params.set("ad", String(audioCalibration[channel.id]));
         params.set("v", "source");
         source.url = `${base}/proxy/transcode.m3u8?${params}`;
     }
@@ -112,6 +114,7 @@ function buildStreams(channel, host, routeKey) {
             const params = stableHlsParams(channel, hlsUrl, { delaySeconds: settings.TRANSCODE_PLAYBACK_DELAY_SECONDS });
             params.set("v", variant.name);
             if (normalizeAudio) params.set("av", "1");
+            if (normalizeAudio && audioCalibration[channel.id]) params.set("ad", String(audioCalibration[channel.id]));
             const label = streamVariantLabel(variant);
             return {
                 title: channel.name,

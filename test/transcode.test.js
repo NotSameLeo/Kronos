@@ -2,6 +2,30 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { adaptiveMasterManifest } = require("../src/transcode");
 const { ffmpegArgs, delayedPlaylist, stopSession } = require("../src/transcode");
+const { audibleStartSequence } = require("../src/transcode");
+
+test("calibrated content delay applies only to broken clocks", () => {
+    for (const repairClock of [true, false]) {
+        const args = ffmpegArgs("https://upstream.test/live.m3u8", {dir:"/tmp/test",repairClock,audioDelay:10.11,variants:[{name:"source",source:true}]});
+        assert.equal(args[args.indexOf("-af")+1].includes("+10.11/TB"), repairClock);
+    }
+});
+
+test("bootstrap audio silence is excluded from served segments", () => {
+    const text = '#EXTM3U\n' + Array.from({length:12}, (_,i)=>`#EXTINF:4,\nsource_seg_${String(i+100).padStart(6,'0')}.ts\n`).join('');
+    assert.equal(audibleStartSequence(text,10.11),103);
+    const result = delayedPlaylist(text,1,103);
+    assert.doesNotMatch(result,/source_seg_00010[012]\.ts/);
+    assert.match(result,/#EXT-X-MEDIA-SEQUENCE:103/);
+});
+
+test("lazy lower qualities read local corrected HLS without HTTP-only options", () => {
+    const args = ffmpegArgs('/tmp/test/source.m3u8',{dir:'/tmp/test',repairClock:false,liveStartIndex:-3,variants:[{name:'720p',height:720,videoK:2500,audioK:128}]});
+    assert.equal(args[args.indexOf('-i')+1],'/tmp/test/source.m3u8');
+    assert.equal(args.includes('-reconnect'),false);
+    assert.equal(args.includes('-user_agent'),false);
+    assert.equal(args[args.indexOf('-live_start_index')+1],'-3');
+});
 
 test("broken source clock is repaired without reencoding HEVC video", () => {
     const args = ffmpegArgs("https://upstream.test/live.m3u8", {dir:"/tmp/test",repairClock:true,variants:[{name:"source",source:true}]});
