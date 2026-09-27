@@ -4,6 +4,7 @@ const path = require("path");
 const settings = require("./settings");
 const audioCalibration = require("./hevc-audio-calibration.json");
 const state = require("./state");
+const { schedule } = require('./native-epg');
 const {
     encodeBase64Url,
     escapeXml,
@@ -32,6 +33,7 @@ function buildManifest(configKey, config, channels, host) {
             .filter(group => group && group.trim()));
         const extra = [{ name: "search", isRequired: false }, { name: "skip", isRequired: false }];
         if (groups.length) extra.push({ name: "genre", options: groups, isRequired: false });
+        if (channels.some(c => c.epgProgrammes?.length)) extra.push({ name: 'date' });
         return { id: toCatalogId(list.name), type: settings.ADDON_TYPE, name: list.name, extra };
     });
 
@@ -44,7 +46,7 @@ function buildManifest(configKey, config, channels, host) {
         resources: ["catalog", "meta", "stream"],
         types: [settings.ADDON_TYPE],
         idPrefixes: ["channel_"],
-        behaviorHints: { configurable: true, configurationRequired: false },
+        behaviorHints: { configurable: true, configurationRequired: false, epgProvider: channels.some(c => c.epgProgrammes?.length) },
         catalogs
     };
 }
@@ -200,7 +202,7 @@ function toMeta(channel, host, routeKey = "", options = {}) {
     // A live TV channel is one video with the meta ID, not a series episode.
     // Native clients can otherwise create a synthetic season 0 and lose selection.
 
-    return meta;
+    return !options.catalogLite ? schedule(meta, channel.epgProgrammes, options.date) : meta;
 }
 
 async function getLogoDataUri(logoUrl) {

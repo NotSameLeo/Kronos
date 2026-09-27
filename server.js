@@ -336,9 +336,10 @@ async function catalogResponse(req, res) {
         res.setHeader("X-Kronos-Skip", String(skip));
         res.setHeader("X-Kronos-Limit", String(settings.CATALOG_PAGE_SIZE));
         res.json({
-            metas: page.map(channel => toMeta(channel, getPublicHost(req), routeKey, {
+            [params.date ? 'metasDetailed' : 'metas']: page.map(channel => toMeta(channel, getPublicHost(req), routeKey, {
                 includeVideos: false,
-                catalogLite: true,
+                catalogLite: !params.date,
+                date: params.date,
                 shortPoster: true
             }))
         });
