@@ -12,7 +12,8 @@ test('guide selections resolve to the identical live channel and stream menu', a
   state.channelIndex.set('epg-test',new Map([[channel.id,channel]]));
   try {
     const meta=toMeta(channel,'https://addon.test');
-    assert.equal(Object.hasOwn(meta,'description'),false);
+    assert.match(meta.description, /In Onda: SHOW .* \| Trama: Synopsis/);
+    assert.equal(toMeta(channel,'https://addon.test','',{catalogLite:true}).description,meta.description);
     assert.equal(meta.behaviorHints.hasScheduledVideos,true);
     assert.equal(meta.videos[0].overview,'Synopsis');
     const selected=await getChannelById('epg-test',{},meta.videos[0].id);

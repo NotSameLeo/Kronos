@@ -191,6 +191,9 @@ function toMeta(channel, host, routeKey = "", options = {}) {
         posterShape: "square"
     };
 
+    meta.description = channel.epgProgrammes?.length
+        ? require('./epg').formatEpgDescription(channel.epgProgrammes)
+        : channel.description || "";
     if (channel.group) meta.genres = [channel.group];
     if (!options.catalogLite) {
         meta.logo = poster;
