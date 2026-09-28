@@ -16,4 +16,8 @@ function schedule(meta, programmes, date) {
   if (videos.length) delete behaviorHints.defaultVideoId;
   return { ...meta, behaviorHints, ...(videos.length ? { videos } : {}) };
 }
-module.exports = { schedule };
+// EPG entries select the channel's live stream; they are not catch-up assets.
+function channelIdFromVideoId(id) {
+  return typeof id === 'string' ? id.replace(/:epg:\d+$/, '') : id;
+}
+module.exports = { schedule, channelIdFromVideoId };

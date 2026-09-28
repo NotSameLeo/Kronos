@@ -106,6 +106,7 @@ async function getChannelsFromCache(configKey, config) {
 }
 
 async function getChannelById(configKey, config, id) {
+    id = require('./native-epg').channelIdFromVideoId(id);
     let channel = state.channelIndex.get(configKey)?.get(id);
     if (channel) return channel;
 

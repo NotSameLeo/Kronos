@@ -194,7 +194,6 @@ function toMeta(channel, host, routeKey = "", options = {}) {
     if (channel.group) meta.genres = [channel.group];
     if (!options.catalogLite) {
         meta.logo = poster;
-        meta.description = channel.description || "";
         meta.background = poster;
         meta.behaviorHints = { defaultVideoId: channel.id, hasScheduledVideos: false };
     }
